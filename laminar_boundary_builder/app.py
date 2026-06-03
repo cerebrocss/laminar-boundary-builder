@@ -83,41 +83,6 @@ QLabel#status[state="failed"] {
     background: #fae1dc;
     color: #8b2e24;
 }
-QLabel#flowCaption {
-    color: #60716e;
-    font-size: 12px;
-    font-weight: 650;
-}
-QLabel#flowStep {
-    border: 1px solid #c4d4d0;
-    border-radius: 13px;
-    padding: 5px 12px;
-    font-weight: 750;
-}
-QLabel#flowStep[state="active"] {
-    background: #2f6e62;
-    border-color: #2f6e62;
-    color: #ffffff;
-}
-QLabel#flowStep[state="done"] {
-    background: #dfeee9;
-    border-color: #b8d0c9;
-    color: #285f55;
-}
-QLabel#flowStep[state="pending"] {
-    background: #ffffff;
-    border-color: #c4d4d0;
-    color: #516864;
-}
-QLabel#flowStep[state="test"] {
-    background: #f5f7f7;
-    border-color: #d2ddda;
-    color: #667773;
-}
-QLabel#flowArrow {
-    color: #7f9691;
-    font-weight: 750;
-}
 QFrame#hint {
     background: #f4f8f7;
     border: 1px solid #d4e2de;
@@ -147,6 +112,72 @@ QLabel#nextPointText {
     color: #24413c;
     font-weight: 750;
     padding: 7px 9px;
+}
+QLabel#readinessText {
+    background: #f8fbfa;
+    border: 1px solid #ccdcd8;
+    border-radius: 7px;
+    color: #304946;
+    padding: 7px 9px;
+}
+QLabel#readinessText[state="ready"] {
+    background: #edf8f1;
+    border-color: #a7cdb7;
+    color: #24563c;
+}
+QLabel#readinessText[state="warning"] {
+    background: #fff8e5;
+    border-color: #dfc77b;
+    color: #6c5219;
+}
+QLabel#readinessText[state="missing"] {
+    background: #fff6f3;
+    border-color: #e2b8af;
+    color: #7c342b;
+}
+QLabel#buildReadyText {
+    background: #fff8e5;
+    border: 1px solid #dfc77b;
+    border-radius: 7px;
+    color: #6c5219;
+    padding: 7px 9px;
+}
+QLabel#buildReadyText[state="ready"] {
+    background: #edf8f1;
+    border-color: #a7cdb7;
+    color: #24563c;
+}
+QLabel#buildReadyText[state="warning"] {
+    background: #fff8e5;
+    border-color: #dfc77b;
+    color: #6c5219;
+}
+QLabel#buildReadyText[state="missing"] {
+    background: #fff6f3;
+    border-color: #e2b8af;
+    color: #7c342b;
+}
+QLabel#buildResultText {
+    background: #f8fbfa;
+    border: 1px solid #ccdcd8;
+    border-radius: 7px;
+    color: #304946;
+    padding: 8px 10px;
+}
+QLabel#buildResultText[state="running"] {
+    background: #eef4ff;
+    border-color: #b9cbea;
+    color: #294e82;
+}
+QLabel#buildResultText[state="ready"] {
+    background: #edf8f1;
+    border-color: #a7cdb7;
+    color: #24563c;
+}
+QLabel#buildResultText[state="failed"] {
+    background: #fff6f3;
+    border-color: #e2b8af;
+    color: #7c342b;
 }
 QWidget#parameterHelpRow {
     background: transparent;
@@ -286,6 +317,11 @@ QPushButton:hover {
 }
 QPushButton:pressed {
     background: #dfe9e6;
+}
+QPushButton:disabled, QPushButton[role="primary"]:disabled, QPushButton[role="secondary"]:disabled {
+    background: #e5ebe9;
+    border-color: #cbd6d3;
+    color: #879894;
 }
 QPushButton[role="primary"] {
     background: #2f6e62;
@@ -919,6 +955,7 @@ class SliceCanvas(QWidget):
         self._pan_x = 0.0
         self._pan_y = 0.0
         self.show_overlays = True
+        self.show_shortcuts = False
         self._drag_landmark: Optional[str] = None
         self._drag_pan = False
         self._drag_moved = False
@@ -1026,8 +1063,8 @@ class SliceCanvas(QWidget):
         self._pan_y = 0.0
         self.update()
 
-    def toggle_overlays(self) -> None:
-        self.show_overlays = not self.show_overlays
+    def toggle_shortcut_help(self) -> None:
+        self.show_shortcuts = not self.show_shortcuts
         self.update()
 
     def plane_to_screen(self, point) -> QPointF:
@@ -1310,17 +1347,6 @@ class SliceCanvas(QWidget):
             if self.show_overlays:
                 self._draw_boundary_preview_label(painter, boundary_preview)
 
-        if not self.show_overlays:
-            hint = "H show info"
-            metrics = painter.fontMetrics()
-            hint_rect = QRectF(10, 10, metrics.horizontalAdvance(hint) + 18, 26)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(18, 24, 23, 120))
-            painter.drawRoundedRect(hint_rect, 7, 7)
-            painter.setPen(QColor("#cbd9d6"))
-            painter.drawText(hint_rect.adjusted(8, 0, 0, 0), Qt.AlignVCenter, hint)
-            return
-
         label = f"Next point: {self.mode.replace('_', ' ')}"
         if not self.picking_enabled:
             label = "Load mask to start point picking"
@@ -1333,8 +1359,8 @@ class SliceCanvas(QWidget):
         painter.setPen(QColor("#e8eeee"))
         painter.drawText(label_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, label)
 
-        if self.picking_enabled:
-            keys = "Drag pan   S outer only   A inner only   H info   N suggest   O/I flip   Wheel/+/- zoom   0 reset   X undo"
+        if self.picking_enabled and self.show_shortcuts:
+            keys = "Drag pan   S outer only   A inner only   H shortcuts   N suggest   O/I flip   Wheel/+/- zoom   0 reset   X undo"
             metrics = painter.fontMetrics()
             keys_width = min(max(560, metrics.horizontalAdvance(keys) + 24), max(120, self.width() - 20))
             keys_rect = QRectF(10, 46, keys_width, 26)
@@ -1351,7 +1377,8 @@ class SliceCanvas(QWidget):
                 text_width = max(metrics.horizontalAdvance(line) for line in lines)
                 rect_width = min(max(380, text_width + 24), max(120, self.width() - 20))
                 rect_height = 18 + len(lines) * 20
-                progress_rect = QRectF(10, 82 if self.picking_enabled else 46, rect_width, rect_height)
+                progress_top = 82 if self.picking_enabled and self.show_shortcuts else 46
+                progress_rect = QRectF(10, progress_top, rect_width, rect_height)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor(18, 24, 23, 150))
                 painter.drawRoundedRect(progress_rect, 8, 8)
@@ -1855,17 +1882,14 @@ class LaminarBoundaryWindow(QMainWindow):
         )
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._make_annotate_tab(), "1 Annotate")
-        self.tabs.addTab(self._make_build_tab(), "2 Build")
-        self.tabs.addTab(self._make_demo_tab(), "Demo test")
+        self.tabs.addTab(self._make_annotate_tab(), "Annotate")
+        self.tabs.addTab(self._make_build_tab(), "Build")
 
         body = QWidget()
         layout = QVBoxLayout(body)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
         header = self._make_header()
-        self.tabs.currentChanged.connect(self._update_flow_state)
-        self._update_flow_state(self.tabs.currentIndex())
         layout.addWidget(header)
         layout.addWidget(self.tabs, 1)
         self.setCentralWidget(body)
@@ -1881,8 +1905,8 @@ class LaminarBoundaryWindow(QMainWindow):
         title = QLabel("Laminar Boundary Builder")
         title.setObjectName("title")
         layout = QVBoxLayout(box)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(9)
+        layout.setContentsMargins(16, 10, 16, 10)
+        layout.setSpacing(0)
 
         title_row = QHBoxLayout()
         title_row.setContentsMargins(0, 0, 0, 0)
@@ -1890,52 +1914,19 @@ class LaminarBoundaryWindow(QMainWindow):
         title_row.addStretch(1)
         title_row.addWidget(self.status_label)
 
-        flow_row = QHBoxLayout()
-        flow_row.setContentsMargins(0, 0, 0, 0)
-        flow_row.setSpacing(8)
-        flow_caption = QLabel("Workflow")
-        flow_caption.setObjectName("flowCaption")
-        self.flow_annotate = self._make_flow_step("1 Annotate")
-        self.flow_build = self._make_flow_step("2 Build")
-        self.flow_demo = self._make_flow_step("Demo test")
-        arrow = QLabel("->")
-        arrow.setObjectName("flowArrow")
-        flow_row.addWidget(flow_caption)
-        flow_row.addSpacing(4)
-        flow_row.addWidget(self.flow_annotate)
-        flow_row.addWidget(arrow)
-        flow_row.addWidget(self.flow_build)
-        flow_row.addStretch(1)
-        flow_row.addWidget(self.flow_demo)
-
         layout.addLayout(title_row)
-        layout.addLayout(flow_row)
         return box
-
-    def _make_flow_step(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setObjectName("flowStep")
-        label.setProperty("state", "pending")
-        return label
-
-    def _update_flow_state(self, index: int) -> None:
-        if not hasattr(self, "flow_annotate"):
-            return
-        states = {
-            0: ("active", "pending", "test"),
-            1: ("done", "active", "test"),
-            2: ("done", "done", "active"),
-        }.get(index, ("pending", "pending", "test"))
-        for label, state in zip((self.flow_annotate, self.flow_build, self.flow_demo), states):
-            label.setProperty("state", state)
-            label.style().unpolish(label)
-            label.style().polish(label)
 
     def _set_status(self, text: str, state: str) -> None:
         self.status_label.setText(text)
         self.status_label.setProperty("state", state)
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
+
+    def _set_label_state(self, label: QLabel, state: str) -> None:
+        label.setProperty("state", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
 
     def _prepare_log_file(self) -> Path:
         fallback_dir = Path(tempfile.gettempdir()) / "laminar_boundary_builder_logs"
@@ -1952,6 +1943,10 @@ class LaminarBoundaryWindow(QMainWindow):
         return Path(tempfile.gettempdir()) / f"laminar_boundary_builder_{os.getpid()}.log"
 
     def _make_menu_bar(self) -> None:
+        tools_menu = self.menuBar().addMenu("Tools")
+        demo_action = tools_menu.addAction("Run Demo Test")
+        demo_action.triggered.connect(lambda _checked=False: self.show_demo_dialog())
+
         log_menu = self.menuBar().addMenu("Log")
         view_action = log_menu.addAction("View Current Log")
         view_action.triggered.connect(lambda _checked=False: self.show_log_dialog())
@@ -1959,6 +1954,26 @@ class LaminarBoundaryWindow(QMainWindow):
         folder_action.triggered.connect(lambda _checked=False: self.show_log_folder())
         clear_action = log_menu.addAction("Clear Current Log")
         clear_action.triggered.connect(lambda _checked=False: self.clear_current_log())
+
+    def show_demo_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Demo Test")
+        dialog.resize(900, 360)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(self._make_demo_tab(), 1)
+
+        close_row = QHBoxLayout()
+        close_row.setContentsMargins(0, 0, 0, 0)
+        close_row.addStretch(1)
+        close_button = self._make_button("Close", "secondary")
+        close_button.clicked.connect(dialog.accept)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+        dialog.exec_()
 
     def _read_current_log(self) -> str:
         try:
@@ -2091,9 +2106,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.flip_inner_path_shortcut.setContext(Qt.ApplicationShortcut)
         self.flip_inner_path_shortcut.activated.connect(lambda: self.flip_annotation_arc("inner"))
 
-        self.annotation_overlay_shortcut = QShortcut(QKeySequence(Qt.Key_H), self)
-        self.annotation_overlay_shortcut.setContext(Qt.ApplicationShortcut)
-        self.annotation_overlay_shortcut.activated.connect(lambda: self.slice_canvas.toggle_overlays())
+        self.annotation_shortcuts_overlay = QShortcut(QKeySequence(Qt.Key_H), self)
+        self.annotation_shortcuts_overlay.setContext(Qt.ApplicationShortcut)
+        self.annotation_shortcuts_overlay.activated.connect(lambda: self.slice_canvas.toggle_shortcut_help())
 
         self.zoom_in_shortcut = QShortcut(QKeySequence(Qt.Key_Plus), self)
         self.zoom_in_shortcut.setContext(Qt.ApplicationShortcut)
@@ -2296,19 +2311,33 @@ class LaminarBoundaryWindow(QMainWindow):
         page_layout = QVBoxLayout(tab)
         page_layout.setContentsMargins(0, 8, 0, 0)
         page_layout.setSpacing(10)
-        page_layout.addWidget(
-            self._make_hint(
-                "Step 1: choose one input source, start picking, then click four points in order: "
-                "outer_start, outer_end, inner_start, inner_end. "
-                "X undo, Enter accept + next, Esc edit settings."
-            )
-        )
+        page_layout.addWidget(self._make_annotation_hint())
 
         content = QWidget()
         layout = QHBoxLayout(content)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
+        controls = self._make_annotation_control_panel()
+        self.annotation_preview_splitter = self._make_annotation_preview_area()
+        self.annotate_settings_button = self._make_annotation_settings_button()
+        self.annotate_controls_scroll = self._make_annotation_controls_scroll(controls)
+
+        layout.addWidget(self.annotate_settings_button)
+        layout.addWidget(self.annotate_controls_scroll)
+        layout.addWidget(self.annotation_preview_splitter, 1)
+        page_layout.addWidget(content, 1)
+
+        self._init_annotation_state()
+        return tab
+
+    def _make_annotation_hint(self) -> QFrame:
+        return self._make_hint(
+            "Choose one input source, then pick four points: outer start/end and inner start/end. "
+            "Enter accepts the slice."
+        )
+
+    def _make_annotation_control_panel(self) -> QWidget:
         controls = QWidget()
         controls.setMinimumWidth(420)
         controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
@@ -2316,6 +2345,18 @@ class LaminarBoundaryWindow(QMainWindow):
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(8)
 
+        self._create_annotation_input_fields()
+        action_row = self._create_annotation_action_buttons()
+        self._create_annotation_status_labels()
+
+        self._add_annotation_source_section(controls_layout)
+        self._add_annotation_reference_section(controls_layout)
+        self._add_annotation_advanced_section(controls_layout)
+        self._add_annotation_picking_section(controls_layout, action_row)
+        controls_layout.addStretch(1)
+        return controls
+
+    def _create_annotation_input_fields(self) -> None:
         self.annotate_atlas = PathRow(
             "Built-in Allen annotation_10.nrrd, or choose another atlas",
             file_filter="Atlas files (*.pkl *.nrrd *.nhdr *.npy *.npz);;All files (*)",
@@ -2362,7 +2403,17 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_inner_path.setMinimumHeight(28)
         self.annotate_outer_path.currentIndexChanged.connect(self.on_annotation_path_choice_changed)
         self.annotate_inner_path.currentIndexChanged.connect(self.on_annotation_path_choice_changed)
+        self._connect_annotation_readiness_signals()
 
+    def _connect_annotation_readiness_signals(self) -> None:
+        self.annotate_region.textChanged.connect(self._update_annotation_readiness)
+        self.annotate_atlas.edit.textChanged.connect(self._update_annotation_readiness)
+        self.annotate_mask.edit.textChanged.connect(self._update_annotation_readiness)
+        self.annotate_template.edit.textChanged.connect(self._update_annotation_readiness)
+        self.annotate_output.edit.textChanged.connect(self._update_annotation_readiness)
+        self.annotate_custom_atlas.toggled.connect(self._update_annotation_readiness)
+
+    def _create_annotation_action_buttons(self) -> QWidget:
         self.load_button = self._make_button("Load Source And Start Picking", "primary")
         self.load_button.clicked.connect(self.load_annotation_data)
         self.load_previous_csv_button = self._make_button("Load Previous CSV", "secondary")
@@ -2423,7 +2474,12 @@ class LaminarBoundaryWindow(QMainWindow):
         action_layout.addWidget(flip_row)
         action_layout.addWidget(self.clear_slice_button)
         action_layout.addWidget(self.export_button)
+        return action_row
 
+    def _create_annotation_status_labels(self) -> None:
+        self.annotation_readiness = QLabel()
+        self.annotation_readiness.setObjectName("readinessText")
+        self.annotation_readiness.setWordWrap(True)
         self.annotate_status = QLabel("No mask loaded")
         self.annotate_status.setWordWrap(True)
         self.next_point_label = QLabel("Next point: outer_start")
@@ -2432,7 +2488,11 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_progress = QLabel("Load a mask to see slice count.")
         self.annotate_progress.setObjectName("progressText")
         self.annotate_progress.setWordWrap(True)
+        self.annotation_review_slice = CleanComboBox()
+        self.annotation_review_slice.addItem("No accepted slices yet", None)
+        self.annotation_review_slice.activated.connect(self.jump_to_annotation_review_slice)
 
+    def _add_annotation_source_section(self, controls_layout: QVBoxLayout) -> None:
         source_box, source_form = self._make_form_section("1. Choose Input Source")
         source_form.addRow(
             "",
@@ -2450,14 +2510,19 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_atlas_label = source_form.labelForField(self.annotate_atlas_row)
         self._update_custom_atlas_visibility(False)
         self._add_help_row(source_form, "Mask", self.annotate_mask, *ANNOTATE_HELP["mask"])
+        source_form.addRow("Checklist", self.annotation_readiness)
         source_form.addRow("", self.load_button)
+        controls_layout.addWidget(source_box)
 
+    def _add_annotation_reference_section(self, controls_layout: QVBoxLayout) -> None:
         save_box, save_form = self._make_form_section("2. Optional Reference And Recovery")
         self._add_help_row(save_form, "Template image", self.annotate_template, *ANNOTATE_HELP["template"])
         self._add_help_row(save_form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
         self._add_help_row(save_form, "Previous CSV", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
         save_form.addRow("", self.load_previous_csv_button)
+        controls_layout.addWidget(save_box)
 
+    def _add_annotation_advanced_section(self, controls_layout: QVBoxLayout) -> None:
         advanced_box, advanced_form = self._make_form_section(
             "Advanced Annotation Settings",
             checkable=True,
@@ -2467,7 +2532,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self._add_help_row(advanced_form, "Min contour area", self.annotate_min_area, *ANNOTATE_HELP["min_area"])
         self._add_help_row(advanced_form, "", self.annotate_keep_all, *ANNOTATE_HELP["keep_all"])
         self._set_collapsible_form_visible(advanced_box, advanced_form, False)
+        controls_layout.addWidget(advanced_box)
 
+    def _add_annotation_picking_section(self, controls_layout: QVBoxLayout, action_row: QWidget) -> None:
         picking_box, picking_form = self._make_form_section("3. Pick And Review")
         self._add_help_row(picking_form, "Slice", self.annotate_slice, *ANNOTATE_HELP["slice"])
         picking_form.addRow("", self.annotate_slider)
@@ -2475,16 +2542,13 @@ class LaminarBoundaryWindow(QMainWindow):
         self._add_help_row(picking_form, "Outer arc path", self.annotate_outer_path, *ANNOTATE_HELP["outer_path"])
         self._add_help_row(picking_form, "Inner arc path", self.annotate_inner_path, *ANNOTATE_HELP["inner_path"])
         picking_form.addRow("Next", self.next_point_label)
+        picking_form.addRow("Review slice", self.annotation_review_slice)
         picking_form.addRow("Actions", action_row)
         picking_form.addRow("Progress", self.annotate_progress)
         picking_form.addRow("Status", self.annotate_status)
-
-        controls_layout.addWidget(source_box)
-        controls_layout.addWidget(save_box)
-        controls_layout.addWidget(advanced_box)
         controls_layout.addWidget(picking_box)
-        controls_layout.addStretch(1)
 
+    def _make_annotation_preview_area(self) -> QSplitter:
         self.slice_canvas = SliceCanvas()
         self.slice_canvas.landmark_changed.connect(self.on_landmark_changed)
         scroll = QScrollArea()
@@ -2500,13 +2564,17 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_preview_splitter.setStretchFactor(0, 3)
         self.annotation_preview_splitter.setStretchFactor(1, 2)
         self.annotation_preview_splitter.setSizes([740, 430])
+        return self.annotation_preview_splitter
 
+    def _make_annotation_settings_button(self) -> QPushButton:
         self.annotate_settings_button = QPushButton("›")
         self.annotate_settings_button.setObjectName("settingsPeek")
         self.annotate_settings_button.setToolTip("Show or hide annotation settings. Esc exits point-picking mode.")
         self.annotate_settings_button.clicked.connect(self.toggle_annotation_settings_panel)
         self.annotate_settings_button.hide()
+        return self.annotate_settings_button
 
+    def _make_annotation_controls_scroll(self, controls: QWidget) -> QScrollArea:
         self.annotate_controls_scroll = QScrollArea()
         self.annotate_controls_scroll.setObjectName("sideScroll")
         self.annotate_controls_scroll.setWidgetResizable(True)
@@ -2514,12 +2582,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_controls_scroll.setWidget(controls)
         self.annotate_controls_scroll.setMinimumWidth(450)
         self.annotate_controls_scroll.setMaximumWidth(480)
+        return self.annotate_controls_scroll
 
-        layout.addWidget(self.annotate_settings_button)
-        layout.addWidget(self.annotate_controls_scroll)
-        layout.addWidget(self.annotation_preview_splitter, 1)
-        page_layout.addWidget(content, 1)
-
+    def _init_annotation_state(self) -> None:
         self.annotation_mask_data = None
         self.annotation_template_data = None
         self.annotation_slice_axis_int = 0
@@ -2535,7 +2600,121 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_slice_counts = None
         self.annotation_picking_active = False
         self.annotation_settings_expanded = True
-        return tab
+        self._update_annotation_readiness()
+        self._update_annotation_review_slice_choices()
+
+    def _resolved_existing_input_path(self, text: str) -> Optional[Path]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            path = _core()._resolve_existing_input_path(raw)
+        except Exception:
+            path = Path(raw).expanduser()
+        return path if path.exists() else None
+
+    def _update_annotation_readiness(self, *_args) -> None:
+        if not hasattr(self, "annotation_readiness"):
+            return
+
+        region = self.annotate_region.text().strip()
+        mask_text = self.annotate_mask.text()
+        template_text = self.annotate_template.text()
+        output_text = self.annotate_output.text().strip()
+        custom_atlas_checked = self.annotate_custom_atlas.isChecked()
+        custom_atlas_text = self.annotate_atlas.text()
+
+        lines = []
+        has_source = False
+        has_warning = False
+        if region:
+            if custom_atlas_checked:
+                atlas_path = self._resolved_existing_input_path(custom_atlas_text)
+                if atlas_path is None:
+                    has_warning = True
+                    lines.append("Input source: Brain region set, but custom atlas file is missing.")
+                else:
+                    has_source = True
+                    lines.append(f"Input source: Brain region from custom atlas ({atlas_path.name}).")
+            else:
+                try:
+                    atlas_path = _core().resolve_annotation_path(None)
+                    has_source = True
+                    lines.append(f"Input source: Brain region from built-in atlas ({Path(atlas_path).name}).")
+                except Exception:
+                    has_warning = True
+                    lines.append("Input source: Brain region set, but built-in atlas was not found.")
+        elif mask_text:
+            mask_path = self._resolved_existing_input_path(mask_text)
+            has_source = mask_path is not None
+            if mask_path is None:
+                has_warning = True
+                lines.append("Input source: Mask path is set, but the file was not found.")
+            else:
+                lines.append(f"Input source: existing mask ({mask_path.name}).")
+        else:
+            lines.append("Input source: choose Brain region or an existing Mask.")
+
+        if template_text:
+            template_path = self._resolved_existing_input_path(template_text)
+            if template_path is None:
+                has_warning = True
+                lines.append("Template: file was not found; it will not load.")
+            else:
+                lines.append(f"Template: ready ({template_path.name}).")
+        else:
+            lines.append("Template: optional.")
+
+        if output_text:
+            lines.append("Output folder: set.")
+        else:
+            lines.append("Output folder: optional now; the app can choose one when saving.")
+
+        self.annotation_readiness.setText("\n".join(lines))
+        state = "ready" if has_source and not has_warning else "warning" if has_source else "missing"
+        self._set_label_state(self.annotation_readiness, state)
+        self.load_button.setEnabled(has_source)
+
+    def _update_annotation_review_slice_choices(self) -> None:
+        if not hasattr(self, "annotation_review_slice"):
+            return
+        current_slice = int(self.annotate_slice.value()) if hasattr(self, "annotate_slice") else None
+        self.annotation_review_slice.blockSignals(True)
+        self.annotation_review_slice.clear()
+
+        rows = []
+        for slice_index in sorted(self.annotation_rows):
+            row = self.annotation_rows[slice_index]
+            try:
+                mode = self._surface_mode_label(row.get("surface_mode", "normal"))
+            except Exception:
+                mode = "accepted"
+            rows.append((slice_index, f"Accepted slice {slice_index} - {mode}"))
+        for slice_index in sorted(self.annotation_skipped_slices):
+            if slice_index not in self.annotation_rows:
+                rows.append((slice_index, f"Skipped slice {slice_index}"))
+
+        if not rows:
+            self.annotation_review_slice.addItem("No accepted slices yet", None)
+        else:
+            for slice_index, label in sorted(rows):
+                self.annotation_review_slice.addItem(label, slice_index)
+            if current_slice is not None:
+                for index in range(self.annotation_review_slice.count()):
+                    if self.annotation_review_slice.itemData(index) == current_slice:
+                        self.annotation_review_slice.setCurrentIndex(index)
+                        break
+        self.annotation_review_slice.blockSignals(False)
+
+    def jump_to_annotation_review_slice(self, index: int) -> None:
+        if index < 0:
+            return
+        slice_index = self.annotation_review_slice.itemData(index)
+        if slice_index is None or self.annotation_mask_data is None:
+            return
+        self.annotate_slice.setValue(int(slice_index))
+        self.slice_canvas.setFocus(Qt.OtherFocusReason)
+        self.annotate_status.setText(f"Reviewing slice {slice_index}. Edit points or clear it if needed.")
 
     def _annotation_shortcuts_active(self) -> bool:
         return self.tabs.currentIndex() == 0 and self.annotation_picking_active
@@ -3108,7 +3287,7 @@ class LaminarBoundaryWindow(QMainWindow):
             if reply == QMessageBox.Yes:
                 self.run_surface_build()
         except Exception as exc:
-            QMessageBox.critical(self, "Auto build failed", str(exc))
+            self._show_exception_dialog("Auto build failed", exc)
 
     def _go_to_next_annotation_slice(self) -> None:
         current = int(self.annotate_slice.value())
@@ -3219,8 +3398,7 @@ class LaminarBoundaryWindow(QMainWindow):
             )
 
     def _uses_atlas_extraction(self) -> bool:
-        custom_atlas = self.annotate_custom_atlas.isChecked() and self.annotate_atlas.text()
-        return bool(custom_atlas or self.annotate_region.text().strip())
+        return bool(self.annotate_region.text().strip())
 
     def _cleanup_temporary_mask(self) -> None:
         if self.temporary_mask_dir is not None:
@@ -3290,6 +3468,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self._refresh_annotation_reference_contours()
         self._set_annotation_path_widgets("auto", "auto")
         self.refresh_annotation_slice()
+        self._update_annotation_readiness()
         self.enter_annotation_picking_mode()
 
     def _update_progress_dialog(self, text: str) -> None:
@@ -3387,7 +3566,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self.append_log(f"Loaded temporary annotation mask: {extraction.mask_path}\n")
         except Exception as exc:
             self._set_status("Failed", "failed")
-            QMessageBox.critical(self, "Load failed", str(exc))
+            self._show_exception_dialog("Load failed", exc)
 
     def annotation_mask_extraction_failed(self, trace: str) -> None:
         self._close_progress_dialog()
@@ -3401,6 +3580,13 @@ class LaminarBoundaryWindow(QMainWindow):
             core = _core()
             if self._uses_atlas_extraction():
                 self.start_annotation_mask_extraction()
+                return
+            if not self.annotate_mask.text().strip():
+                QMessageBox.warning(
+                    self,
+                    "Choose input source",
+                    "Choose a Brain region or select an existing Mask before starting.",
+                )
                 return
 
             mask_path = self._require_path("Mask", self.annotate_mask.text())
@@ -3418,7 +3604,7 @@ class LaminarBoundaryWindow(QMainWindow):
                     self.temporary_mask_dir = None
             self.append_log(f"Loaded annotation mask: {mask_path}\n")
         except Exception as exc:
-            QMessageBox.critical(self, "Load failed", str(exc))
+            self._show_exception_dialog("Load failed", exc)
 
     def _annotation_image_for_slice(self, slice_index: int):
         core = _core()
@@ -3791,6 +3977,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self.annotate_status.setText("No mask loaded")
             self.annotate_progress.setText("Load a mask to see slice count.")
             self.slice_canvas.set_progress_text("")
+            self._update_annotation_review_slice_choices()
             return
         slice_index = int(self.annotate_slice.value())
         landmarks = self.annotation_landmarks_by_slice.get(slice_index, self.slice_canvas.landmarks)
@@ -3807,6 +3994,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 f"Clear Current Slice if you want to annotate it."
             )
             self._update_annotation_progress()
+            self._update_annotation_review_slice_choices()
             return
         row = self.annotation_rows.get(slice_index)
         if row is not None and _core().normalize_surface_mode(row.get("surface_mode")) != "normal":
@@ -3816,6 +4004,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 f"Clear Current Slice if you want four-point annotation. Accepted slices: {accepted_count}."
             )
             self._update_annotation_progress()
+            self._update_annotation_review_slice_choices()
             return
         if missing:
             prefix = "Editing accepted slice. " if slice_index in self.annotation_rows else ""
@@ -3829,6 +4018,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 f"Press Enter or click Accept Slice + Next. Accepted slices: {accepted_count}."
             )
         self._update_annotation_progress()
+        self._update_annotation_review_slice_choices()
 
     def _recommended_annotation_count(self) -> int:
         if self.annotation_target_slices:
@@ -4001,7 +4191,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self.append_log(f"Loaded previous manual CSV: {csv_path}\n")
             QMessageBox.information(self, "Previous CSV loaded", message)
         except Exception as exc:
-            QMessageBox.critical(self, "Load previous CSV failed", str(exc))
+            self._show_exception_dialog("Load previous CSV failed", exc)
 
     def export_annotation_csv(self) -> None:
         if not self.annotation_rows:
@@ -4021,7 +4211,7 @@ class LaminarBoundaryWindow(QMainWindow):
             )
             self.append_log(f"Saved interactive manual CSV: {csv_path}\n")
         except Exception as exc:
-            QMessageBox.critical(self, "Save failed", str(exc))
+            self._show_exception_dialog("Save failed", exc)
 
     def _sync_build_from_annotation(self, csv_path: Path, annotation_output_dir: Path) -> None:
         self.build_manual.set_text(csv_path)
@@ -4034,6 +4224,52 @@ class LaminarBoundaryWindow(QMainWindow):
         self.build_keep_all.setChecked(self.annotate_keep_all.isChecked())
         self.depth_method.setCurrentText("surfaces only")
         self.tabs.setCurrentIndex(1)
+
+    def _validate_build_inputs(self, needs_boundaries: bool = False) -> bool:
+        missing = []
+        if not self.build_mask.text().strip():
+            missing.append("Mask")
+        if not self.build_manual.text().strip() and not needs_boundaries:
+            missing.append("Manual CSV")
+        if not self.build_output.text().strip():
+            missing.append("Output folder")
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Build input missing",
+                "Please fill: " + ", ".join(missing) + ".",
+            )
+            return False
+
+        path_checks = [
+            ("Mask", self.build_mask.text()),
+        ]
+        if not needs_boundaries:
+            path_checks.append(("Manual CSV", self.build_manual.text()))
+        if self.build_template.text().strip():
+            path_checks.append(("Template image", self.build_template.text()))
+        if self.build_cell_csv.text().strip():
+            path_checks.append(("Cell CSV", self.build_cell_csv.text()))
+
+        for label, text in path_checks:
+            if self._resolved_existing_input_path(text) is None:
+                QMessageBox.warning(
+                    self,
+                    f"{label} not found",
+                    f"Choose an existing {label} file:\n{text}",
+                )
+                return False
+
+        if needs_boundaries:
+            boundaries_path = self._build_boundaries_path()
+            if not boundaries_path.exists():
+                QMessageBox.warning(
+                    self,
+                    "Boundary JSON not found",
+                    "Run Extract Surfaces first, or choose an existing boundary_annotations.json.",
+                )
+                return False
+        return True
 
     def _make_prepare_tab(self) -> QWidget:
         tab = QWidget()
@@ -4077,13 +4313,23 @@ class LaminarBoundaryWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(12)
-        layout.addWidget(
-            self._make_hint(
-                "Step 2: confirm the saved annotation inputs, extract surfaces, "
-                "then compute depth only when needed."
-            )
+        layout.addWidget(self._make_build_hint())
+
+        self._create_build_input_fields()
+        layout.addWidget(self._make_build_required_section())
+        layout.addWidget(self._make_build_optional_section())
+        layout.addWidget(self._make_build_advanced_section())
+        layout.addLayout(self._make_build_button_row())
+        layout.addWidget(self._make_build_result_section())
+        layout.addStretch(1)
+        return tab
+
+    def _make_build_hint(self) -> QFrame:
+        return self._make_hint(
+            "Check the saved mask, landmark CSV, and output folder before extracting surfaces."
         )
 
+    def _create_build_input_fields(self) -> None:
         self.build_mask = PathRow("Target mask volume (.nrrd/.npy/.npz)")
         self.build_manual = PathRow(
             "manual_landmarks_template.csv",
@@ -4132,7 +4378,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.qc_every.setButtonSymbols(QSpinBox.NoButtons)
         self.qc_every.setMinimumHeight(28)
         self.build_keep_all = QCheckBox("Keep all contours per slice")
+        self.build_readiness = QLabel()
+        self.build_readiness.setObjectName("buildReadyText")
+        self.build_readiness.setWordWrap(True)
+        self._connect_build_readiness_signals()
 
+    def _make_build_required_section(self) -> QGroupBox:
         required_box, required_form = self._make_form_section("Required Build Inputs")
         required_form.addRow(
             "",
@@ -4141,15 +4392,90 @@ class LaminarBoundaryWindow(QMainWindow):
                 "Check them, then run the surface build."
             ),
         )
+        required_form.addRow("Build checklist", self.build_readiness)
         self._add_help_row(required_form, "Mask", self.build_mask, *BUILD_HELP["mask"])
         self._add_help_row(required_form, "Manual CSV", self.build_manual, *BUILD_HELP["manual_csv"])
         self._add_help_row(required_form, "Output folder", self.build_output, *BUILD_HELP["output"])
+        return required_box
 
+    def _connect_build_readiness_signals(self) -> None:
+        for path_row in (
+            self.build_mask,
+            self.build_manual,
+            self.build_boundaries,
+            self.build_output,
+            self.build_template,
+            self.build_cell_csv,
+        ):
+            path_row.edit.textChanged.connect(self._update_build_readiness)
+        self.build_swc_glob.textChanged.connect(self._update_build_readiness)
+
+    def _update_build_readiness(self, *_args) -> None:
+        if not hasattr(self, "build_readiness"):
+            return
+
+        missing = []
+        warnings = []
+        mask_text = self.build_mask.text().strip()
+        manual_text = self.build_manual.text().strip()
+        output_text = self.build_output.text().strip()
+
+        if not mask_text:
+            missing.append("Mask")
+        elif self._resolved_existing_input_path(mask_text) is None:
+            missing.append("Mask file")
+
+        if not manual_text:
+            missing.append("Manual CSV")
+        elif self._resolved_existing_input_path(manual_text) is None:
+            missing.append("Manual CSV file")
+
+        if not output_text:
+            missing.append("Output folder")
+
+        for label, text in (
+            ("Template image", self.build_template.text().strip()),
+            ("Cell CSV", self.build_cell_csv.text().strip()),
+        ):
+            if text and self._resolved_existing_input_path(text) is None:
+                warnings.append(f"{label} file is missing.")
+
+        surface_ready = not missing
+        boundary_text = self.build_boundaries.text().strip()
+        if boundary_text:
+            boundary_path = Path(boundary_text).expanduser()
+        elif output_text:
+            boundary_path = Path(output_text).expanduser() / "boundary_annotations.json"
+        else:
+            boundary_path = None
+        depth_ready = surface_ready and boundary_path is not None and boundary_path.exists()
+
+        lines = []
+        if not surface_ready:
+            lines.append("Surface build: fill " + ", ".join(missing) + ".")
+        elif depth_ready:
+            lines.append("Surface build and depth volume are ready.")
+        else:
+            lines.append("Surface build is ready. Depth unlocks after Boundary JSON exists.")
+        lines.extend(warnings)
+
+        self.build_readiness.setText("\n".join(lines))
+        state = "ready" if surface_ready and not warnings else "missing" if missing else "warning"
+        self._set_label_state(self.build_readiness, state)
+
+        if hasattr(self, "surface_button"):
+            self.surface_button.setEnabled(surface_ready)
+        if hasattr(self, "depth_button"):
+            self.depth_button.setEnabled(depth_ready)
+
+    def _make_build_optional_section(self) -> QGroupBox:
         optional_box, optional_form = self._make_form_section("Optional Measurements")
         self._add_help_row(optional_form, "Template image", self.build_template, *BUILD_HELP["template"])
         self._add_help_row(optional_form, "Cell CSV", self.build_cell_csv, *BUILD_HELP["cell_csv"])
         self._add_help_row(optional_form, "SWC glob", self.build_swc_glob, *BUILD_HELP["swc_glob"])
+        return optional_box
 
+    def _make_build_advanced_section(self) -> QGroupBox:
         advanced_box, advanced_form = self._make_form_section(
             "Advanced Build Settings",
             checkable=True,
@@ -4166,24 +4492,122 @@ class LaminarBoundaryWindow(QMainWindow):
         self._add_help_row(advanced_form, "QC interval", self.qc_every, *BUILD_HELP["qc_every"])
         self._add_help_row(advanced_form, "", self.build_keep_all, *BUILD_HELP["keep_all"])
         self._set_collapsible_form_visible(advanced_box, advanced_form, False)
+        return advanced_box
 
-        surface_button = self._make_button("Extract Surfaces", "primary")
-        surface_button.clicked.connect(self.run_surface_build)
-        depth_button = self._make_button("Compute Laminar Depth Volume", "secondary")
-        depth_button.clicked.connect(self.run_depth_build)
+    def _make_build_button_row(self) -> QHBoxLayout:
+        self.surface_button = self._make_button("Extract Surfaces", "primary")
+        self.surface_button.clicked.connect(self.run_surface_build)
+        self.depth_button = self._make_button("Compute Laminar Depth Volume", "secondary")
+        self.depth_button.clicked.connect(self.run_depth_build)
         button_row = QHBoxLayout()
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(8)
-        button_row.addWidget(surface_button)
-        button_row.addWidget(depth_button)
+        button_row.addWidget(self.surface_button)
+        button_row.addWidget(self.depth_button)
         button_row.addStretch(1)
+        self._update_build_readiness()
+        return button_row
 
-        layout.addWidget(required_box)
-        layout.addWidget(optional_box)
-        layout.addWidget(advanced_box)
-        layout.addLayout(button_row)
-        layout.addStretch(1)
-        return tab
+    def _make_build_result_section(self) -> QGroupBox:
+        result_box, result_form = self._make_form_section("Build Result")
+        self.build_result_label = QLabel("No build has run yet.")
+        self.build_result_label.setObjectName("buildResultText")
+        self.build_result_label.setWordWrap(True)
+        self._set_label_state(self.build_result_label, "idle")
+
+        self.open_build_output_button = self._make_button("Open Output Folder", "secondary")
+        self.open_build_output_button.clicked.connect(self.open_build_output_folder)
+        self.open_build_output_button.setEnabled(False)
+        self.review_qc_button = self._make_button("Back To Annotate Review", "secondary")
+        self.review_qc_button.clicked.connect(self.review_build_qc_slices)
+        self.review_qc_button.setEnabled(False)
+
+        result_buttons = QWidget()
+        button_layout = QHBoxLayout(result_buttons)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        button_layout.setSpacing(8)
+        button_layout.addWidget(self.open_build_output_button)
+        button_layout.addWidget(self.review_qc_button)
+        button_layout.addStretch(1)
+
+        result_form.addRow("Summary", self.build_result_label)
+        result_form.addRow("", result_buttons)
+        return result_box
+
+    def open_build_output_folder(self) -> None:
+        output_text = self.build_output.text().strip()
+        if not output_text:
+            QMessageBox.information(self, "No output folder", "Choose or run a Build output folder first.")
+            return
+        output_dir = Path(output_text).expanduser()
+        if not output_dir.exists():
+            QMessageBox.information(
+                self,
+                "Output folder missing",
+                f"Folder does not exist yet:\n{output_dir}",
+            )
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_dir)))
+
+    def review_build_qc_slices(self) -> None:
+        review_slices = self._current_qc_review_slices()
+        if not review_slices:
+            QMessageBox.information(
+                self,
+                "No QC review slices",
+                "No uncertain slices were found in the current build.",
+            )
+            return
+
+        targets = self._review_targets_from_ranges(review_slices)
+        self.tabs.setCurrentIndex(0)
+        if self.annotation_mask_data is None:
+            self.annotate_status.setText(
+                "QC review slices are available. Load the same mask, "
+                "then load the saved Manual CSV to revise them."
+            )
+            self.annotate_progress.setText(
+                "Suggested QC review targets: " + ", ".join(str(value) for value in targets)
+            )
+            return
+
+        region_targets = [
+            slice_index for slice_index in targets if slice_index in self.annotation_region_slices
+        ]
+        self.annotation_target_slices = region_targets or targets
+        if self.annotation_target_slices:
+            self.annotate_slice.setValue(self.annotation_target_slices[0])
+        if not self.annotation_picking_active:
+            self.enter_annotation_picking_mode()
+        self._update_annotation_progress()
+        self.annotate_status.setText(
+            "QC review mode: check suggested slices "
+            + ", ".join(str(value) for value in self.annotation_target_slices)
+            + "."
+        )
+
+    def _update_build_result_from_task(self, result: TaskResult) -> None:
+        if not hasattr(self, "build_result_label"):
+            return
+        if not result.title.lower().startswith(("build", "depth")):
+            return
+
+        lines = result.message.splitlines()
+        summary_lines = [lines[0] if lines else result.title]
+        if result.output_dir:
+            summary_lines.append(f"Output folder: {result.output_dir}")
+
+        qc_lines = [
+            line
+            for line in lines
+            if line.startswith(("QC:", "QC review needed", "Uncertain ranges", "Suggested re-annotation"))
+        ]
+        summary_lines.extend(qc_lines)
+        self.build_result_label.setText("\n".join(summary_lines))
+        self._set_label_state(self.build_result_label, "ready")
+        self.open_build_output_button.setEnabled(bool(result.output_dir))
+        self.review_qc_button.setEnabled(any(line.startswith("QC review needed") for line in qc_lines))
+        self._update_build_readiness()
 
     def _make_demo_tab(self) -> QWidget:
         tab = QWidget()
@@ -4240,6 +4664,12 @@ class LaminarBoundaryWindow(QMainWindow):
 
         self.append_log(f"\n--- {label} started ---\n")
         self._set_status(f"Running: {label}", "running")
+        if hasattr(self, "build_result_label") and label in ("build", "depth"):
+            action = "Extracting surfaces" if label == "build" else "Computing laminar depth"
+            self.build_result_label.setText(action + "...")
+            self._set_label_state(self.build_result_label, "running")
+            self.open_build_output_button.setEnabled(False)
+            self.review_qc_button.setEnabled(False)
         self.thread = QThread()
         self.worker = Worker(fn)
         self.worker.moveToThread(self.thread)
@@ -4273,6 +4703,7 @@ class LaminarBoundaryWindow(QMainWindow):
     def task_finished(self, result: TaskResult) -> None:
         self._set_status("Ready", "ready")
         self.append_log(f"\n{result.message}\n")
+        self._update_build_result_from_task(result)
         self._show_task_result(result)
 
     def _show_task_result(self, result: TaskResult) -> None:
@@ -4296,19 +4727,48 @@ class LaminarBoundaryWindow(QMainWindow):
             return line
         return "Unknown error"
 
+    def _error_recovery_hint(self, summary: str) -> str:
+        text = summary.lower()
+        if "allen annotation atlas" in text:
+            return "Use a custom atlas file, or choose an existing Mask instead."
+        if "input file does not exist" in text or "no such file" in text or "not found" in text:
+            return "Choose an existing file and try again."
+        if "boundary_annotations.json" in text or "boundary json" in text:
+            return "Run Extract Surfaces first, or choose the existing boundary_annotations.json file."
+        if "template shape" in text:
+            return "The template is only a visual background. Choose a matching template, or leave it empty."
+        return "Check the highlighted input and try again."
+
     def _show_error_dialog(self, title: str, trace: str) -> None:
+        summary = self._error_summary(trace)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Critical)
         box.setWindowTitle(title)
-        box.setText(self._error_summary(trace))
-        box.setInformativeText("Details were written to Log > View Current Log.")
+        box.setText(summary)
+        box.setInformativeText(
+            self._error_recovery_hint(summary)
+            + "\n\nDetails were written to Log > View Current Log."
+        )
         if trace:
             box.setDetailedText(trace)
         box.exec_()
 
+    def _show_exception_dialog(self, title: str, exc: Exception) -> None:
+        trace = traceback.format_exc()
+        if "NoneType: None" in trace:
+            trace = str(exc)
+        self.append_log("\n" + trace)
+        self._show_error_dialog(title, trace)
+
     def task_failed(self, trace: str) -> None:
+        running_status = self.status_label.text().lower()
         self._set_status("Failed", "failed")
         self.append_log("\n" + trace)
+        if hasattr(self, "build_result_label") and ("build" in running_status or "depth" in running_status):
+            self.build_result_label.setText("Run failed.\n" + self._error_summary(trace))
+            self._set_label_state(self.build_result_label, "failed")
+            self.open_build_output_button.setEnabled(False)
+            self.review_qc_button.setEnabled(False)
         self._show_error_dialog("Run failed", trace)
 
     def run_prepare(self) -> None:
@@ -4339,6 +4799,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.run_build()
 
     def run_build(self) -> None:
+        if not self._validate_build_inputs():
+            return
+
         def task() -> TaskResult:
             output_dir = self._require_path("Output folder", self.build_output.text())
             swc_glob = self.build_swc_glob.text().strip()
@@ -4418,6 +4881,9 @@ class LaminarBoundaryWindow(QMainWindow):
         return "\n".join(lines)
 
     def run_depth_build(self) -> None:
+        if not self._validate_build_inputs(needs_boundaries=True):
+            return
+
         def task() -> TaskResult:
             output_dir = self._require_path("Output folder", self.build_output.text())
             swc_glob = self.build_swc_glob.text().strip()
@@ -4444,6 +4910,10 @@ class LaminarBoundaryWindow(QMainWindow):
             lines.extend(f"{key}: {value}" for key, value in outputs.items())
             return TaskResult("Depth volume finished", "\n".join(lines), output_dir=output_dir)
 
+        if hasattr(self, "build_result_label"):
+            self.build_result_label.setText("Computing laminar depth volume...")
+            self.open_build_output_button.setEnabled(False)
+            self.review_qc_button.setEnabled(False)
         self.start_task("depth", task)
 
     def run_demo(self) -> None:

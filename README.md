@@ -27,11 +27,12 @@ apps/laminar_boundary_builder/
 python apps/laminar_boundary_builder/launch_gui.py
 ```
 
-GUI 里有三个页面，界面主线是 `1 Annotate -> 2 Build`：
+GUI 主界面有两个正式页面：
 
-- `1 Annotate`：在切片图上直接点 outer / inner 的起止点，并保存人工标注
-- `2 Build`：生成 surface、laminar depth、layer normal、表格和 QC
-- `Demo test`：用合成数据检查软件能不能正常跑，不是真实分析入口
+- `Annotate`：在切片图上直接点 outer / inner 的起止点，并保存人工标注
+- `Build`：生成 surface、laminar depth、layer normal、表格和 QC
+
+`Tools > Run Demo Test` 可以用合成数据检查软件能不能正常跑，不是真实分析入口。
 
 ## 图上交互标注
 
@@ -116,6 +117,13 @@ CSV 现在只是后台保存格式，不需要手动编辑，也不需要在 `Bu
 ```bash
 python apps/laminar_boundary_builder/run.py demo \
   --output-dir /tmp/laminar_boundary_demo
+```
+
+也可以跑一个更完整的冒烟检查：
+
+```bash
+python apps/laminar_boundary_builder/run.py selfcheck \
+  --output-dir /tmp/laminar_boundary_selfcheck
 ```
 
 ## 安装成命令

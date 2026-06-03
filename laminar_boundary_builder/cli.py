@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import glob
 import sys
+import tempfile
 from pathlib import Path
 
 from .core import (
+    load_volume,
     prepare_laminar_project,
     run_laminar_boundary_pipeline,
     write_demo_project,
@@ -84,6 +86,51 @@ def cmd_demo(args: argparse.Namespace) -> None:
     print(f"demo_manual_csv: {manual_csv}")
     for key, value in outputs.items():
         print(f"{key}: {value}")
+
+
+def cmd_selfcheck(args: argparse.Namespace) -> None:
+    output_dir = Path(args.output_dir) if args.output_dir else Path(
+        tempfile.mkdtemp(prefix="laminar_boundary_builder_selfcheck_")
+    )
+    demo_input_dir = output_dir / "demo_input"
+    mask_path, manual_csv = write_demo_project(demo_input_dir)
+    build_dir = output_dir / "demo_build"
+    outputs = run_laminar_boundary_pipeline(
+        mask_path=mask_path,
+        manual_csv=manual_csv,
+        output_dir=build_dir,
+        slice_axis=0,
+        min_area=20.0,
+        resample_points=24,
+        depth_method="distance",
+        qc_every=4,
+        volume_format="nrrd",
+    )
+
+    required_outputs = [
+        "boundaries",
+        "boundary_summary",
+        "outer_surface",
+        "inner_surface",
+        "lateral_surface",
+        "laminar_depth",
+        "boundary_labels",
+    ]
+    missing = [key for key in required_outputs if not Path(outputs[key]).exists()]
+    if missing:
+        raise RuntimeError("Selfcheck output missing: " + ", ".join(missing))
+
+    try:
+        load_volume(output_dir / "missing_input.nrrd")
+    except FileNotFoundError:
+        missing_file_check = "ok"
+    else:
+        raise RuntimeError("Selfcheck expected missing input to raise FileNotFoundError.")
+
+    print("Selfcheck finished.")
+    print(f"output_dir: {output_dir}")
+    print("demo_pipeline: ok")
+    print(f"missing_file_error: {missing_file_check}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -187,6 +234,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Volume output format. NIfTI output needs nibabel installed.",
     )
     demo.set_defaults(func=cmd_demo)
+
+    selfcheck = subparsers.add_parser(
+        "selfcheck",
+        help="Run a small smoke test for demo output and missing-file errors.",
+    )
+    selfcheck.add_argument("--output-dir", default=None, help="Optional selfcheck output folder")
+    selfcheck.set_defaults(func=cmd_selfcheck)
 
     return parser
 
