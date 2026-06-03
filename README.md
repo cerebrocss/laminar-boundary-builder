@@ -2,7 +2,7 @@
 
 这是一个独立工作目录，用来后续做成可安装 app。当前第一版已经有一个可双击打开的 macOS GUI，同时保留命令行入口。核心代码已经复制到本目录里，不依赖仓库外的 `src/neuronvis`。
 
-## 这个文件夹里有什么
+## 文件结构
 
 ```text
 apps/laminar_boundary_builder/
