@@ -216,6 +216,8 @@ def load_volume(path: str | Path) -> VolumeData:
     """Load a 3D volume from NRRD, NumPy, or NIfTI if nibabel is installed."""
 
     path = _resolve_existing_input_path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input file does not exist: {path}")
     suffixes = "".join(path.suffixes).lower()
 
     if suffixes.endswith(".nrrd") or suffixes.endswith(".nhdr"):

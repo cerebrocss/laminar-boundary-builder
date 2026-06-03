@@ -127,6 +127,11 @@ QLabel#hintText {
     color: #35534e;
     font-weight: 650;
 }
+QLabel#sectionNote {
+    color: #5c706c;
+    font-size: 12px;
+    line-height: 130%;
+}
 QLabel#progressText {
     background: #eef7f4;
     border: 1px solid #cddfda;
@@ -473,7 +478,7 @@ ANNOTATE_HELP = {
     "output": (
         "Output folder",
         "Purpose: choose where the manual landmark CSV will be saved.\n"
-        "Effect: Save CSV for Build writes manual_landmarks_interactive.csv here and prepares the Build step.\n"
+        "Effect: Save CSV And Review Build writes manual_landmarks_interactive.csv here and prepares the Build step.\n"
         "Recommended: choose a project-specific folder so the CSV is easy to find later.",
     ),
     "previous_csv": (
@@ -537,7 +542,7 @@ BUILD_HELP = {
         "Manual CSV",
         "Purpose: the landmark CSV saved from the Annotate step.\n"
         "Effect: these landmark rows define the outer and inner boundary curves used to build surfaces.\n"
-        "Recommended: use manual_landmarks_interactive.csv created by Save CSV for Build.",
+        "Recommended: use manual_landmarks_interactive.csv created by Save CSV And Review Build.",
     ),
     "boundaries_json": (
         "Boundary JSON",
@@ -2114,12 +2119,53 @@ class LaminarBoundaryWindow(QMainWindow):
         layout.addWidget(label)
         return box
 
+    def _make_note_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("sectionNote")
+        label.setWordWrap(True)
+        return label
+
     def _tune_form(self, form: QFormLayout) -> None:
         form.setContentsMargins(10, 10, 10, 10)
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(6)
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+    def _make_form_section(
+        self,
+        title: str,
+        checkable: bool = False,
+        checked: bool = True,
+    ) -> tuple[QGroupBox, QFormLayout]:
+        section = QGroupBox(title)
+        section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        if checkable:
+            section.setCheckable(True)
+            section.setChecked(checked)
+        form = QFormLayout(section)
+        self._tune_form(form)
+        if checkable:
+            section.toggled.connect(
+                lambda visible, current_section=section, current_form=form: self._set_collapsible_form_visible(
+                    current_section,
+                    current_form,
+                    visible,
+                )
+            )
+        return section, form
+
+    def _set_form_widgets_visible(self, form: QFormLayout, visible: bool) -> None:
+        for row in range(form.rowCount()):
+            for role in (QFormLayout.LabelRole, QFormLayout.FieldRole, QFormLayout.SpanningRole):
+                item = form.itemAt(row, role)
+                widget = item.widget() if item is not None else None
+                if widget is not None:
+                    widget.setVisible(visible)
+
+    def _set_collapsible_form_visible(self, section: QGroupBox, form: QFormLayout, visible: bool) -> None:
+        self._set_form_widgets_visible(form, visible)
+        section.setMaximumHeight(16777215 if visible else 48)
 
     def _add_help_row(self, form: QFormLayout, label: str, field: QWidget, title: str, body: str) -> QWidget:
         row = self._with_help(field, title, body)
@@ -2252,8 +2298,9 @@ class LaminarBoundaryWindow(QMainWindow):
         page_layout.setSpacing(10)
         page_layout.addWidget(
             self._make_hint(
-                "Step 1: extract or load a mask, then click four points in order: "
-                "outer_start, outer_end, inner_start, inner_end. X undo, Enter accept + next, Esc edit settings."
+                "Step 1: choose one input source, start picking, then click four points in order: "
+                "outer_start, outer_end, inner_start, inner_end. "
+                "X undo, Enter accept + next, Esc edit settings."
             )
         )
 
@@ -2262,11 +2309,12 @@ class LaminarBoundaryWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
 
-        controls = QGroupBox("1. Annotate Boundaries")
+        controls = QWidget()
         controls.setMinimumWidth(420)
         controls.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        form = QFormLayout(controls)
-        self._tune_form(form)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
 
         self.annotate_atlas = PathRow(
             "Built-in Allen annotation_10.nrrd, or choose another atlas",
@@ -2315,7 +2363,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_outer_path.currentIndexChanged.connect(self.on_annotation_path_choice_changed)
         self.annotate_inner_path.currentIndexChanged.connect(self.on_annotation_path_choice_changed)
 
-        self.load_button = self._make_button("Extract / Load / Start Picking", "primary")
+        self.load_button = self._make_button("Load Source And Start Picking", "primary")
         self.load_button.clicked.connect(self.load_annotation_data)
         self.load_previous_csv_button = self._make_button("Load Previous CSV", "secondary")
         self.load_previous_csv_button.setToolTip("Load saved manual landmarks into the annotation workspace.")
@@ -2324,7 +2372,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.save_slice_button.setToolTip("Accept landmarks on this slice and move to the next region slice.")
         self.save_slice_button.clicked.connect(self.accept_annotation_slice_and_advance)
         self.suggest_slice_button = self._make_button("Suggest Slice Set (N)", "secondary")
-        self.suggest_slice_button.setToolTip("Build a stable suggested slice set and jump to its first unaccepted slice.")
+        self.suggest_slice_button.setToolTip(
+            "Build a stable suggested slice set and jump to its first unaccepted slice."
+        )
         self.suggest_slice_button.clicked.connect(self.suggest_next_annotation_slice)
         self.outer_only_slice_button = self._make_button("Outer Only / No Inner (S)", "secondary")
         self.outer_only_slice_button.setToolTip(
@@ -2352,8 +2402,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.clear_slice_button = self._make_button("Clear Current Slice", "danger")
         self.clear_slice_button.setToolTip("Clear landmarks on the current slice.")
         self.clear_slice_button.clicked.connect(self.clear_annotation_slice)
-        self.export_button = self._make_button("Save CSV for Build", "secondary")
-        self.export_button.setToolTip("Save accepted landmarks as a CSV and switch to the Build step.")
+        self.export_button = self._make_button("Save CSV And Review Build", "secondary")
+        self.export_button.setToolTip("Save accepted landmarks as a CSV and switch to the Build settings.")
         self.export_button.clicked.connect(self.export_annotation_csv)
         action_row = QWidget()
         action_layout = QVBoxLayout(action_row)
@@ -2383,33 +2433,57 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_progress.setObjectName("progressText")
         self.annotate_progress.setWordWrap(True)
 
-        self._add_help_row(form, "Brain region", self.annotate_region, *ANNOTATE_HELP["region"])
-        self._add_help_row(form, "Hemisphere", self.annotate_hemisphere, *ANNOTATE_HELP["hemisphere"])
-        self._add_help_row(form, "", self.annotate_include_children, *ANNOTATE_HELP["include_children"])
-        self._add_help_row(form, "", self.annotate_custom_atlas, *ANNOTATE_HELP["custom_atlas_enabled"])
-        self.annotate_atlas_row = self._add_help_row(
-            form, "Custom atlas", self.annotate_atlas, *ANNOTATE_HELP["custom_atlas"]
+        source_box, source_form = self._make_form_section("1. Choose Input Source")
+        source_form.addRow(
+            "",
+            self._make_note_label(
+                "Use Brain region to extract from Allen atlas, or leave it empty and choose an existing Mask."
+            ),
         )
-        self.annotate_atlas_label = form.labelForField(self.annotate_atlas_row)
+        self._add_help_row(source_form, "Brain region", self.annotate_region, *ANNOTATE_HELP["region"])
+        self._add_help_row(source_form, "Hemisphere", self.annotate_hemisphere, *ANNOTATE_HELP["hemisphere"])
+        self._add_help_row(source_form, "", self.annotate_include_children, *ANNOTATE_HELP["include_children"])
+        self._add_help_row(source_form, "", self.annotate_custom_atlas, *ANNOTATE_HELP["custom_atlas_enabled"])
+        self.annotate_atlas_row = self._add_help_row(
+            source_form, "Custom atlas", self.annotate_atlas, *ANNOTATE_HELP["custom_atlas"]
+        )
+        self.annotate_atlas_label = source_form.labelForField(self.annotate_atlas_row)
         self._update_custom_atlas_visibility(False)
-        self._add_help_row(form, "Mask", self.annotate_mask, *ANNOTATE_HELP["mask"])
-        self._add_help_row(form, "Template image", self.annotate_template, *ANNOTATE_HELP["template"])
-        self._add_help_row(form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
-        self._add_help_row(form, "Previous CSV", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
-        form.addRow("", self.load_previous_csv_button)
-        self._add_help_row(form, "Slice axis", self.annotate_slice_axis, *ANNOTATE_HELP["slice_axis"])
-        self._add_help_row(form, "Min contour area", self.annotate_min_area, *ANNOTATE_HELP["min_area"])
-        self._add_help_row(form, "", self.annotate_keep_all, *ANNOTATE_HELP["keep_all"])
-        form.addRow("", self.load_button)
-        self._add_help_row(form, "Slice", self.annotate_slice, *ANNOTATE_HELP["slice"])
-        form.addRow("", self.annotate_slider)
-        self._add_help_row(form, "Contour", self.annotate_contour, *ANNOTATE_HELP["contour"])
-        self._add_help_row(form, "Outer arc path", self.annotate_outer_path, *ANNOTATE_HELP["outer_path"])
-        self._add_help_row(form, "Inner arc path", self.annotate_inner_path, *ANNOTATE_HELP["inner_path"])
-        form.addRow("Next", self.next_point_label)
-        form.addRow("Actions", action_row)
-        form.addRow("Progress", self.annotate_progress)
-        form.addRow("Status", self.annotate_status)
+        self._add_help_row(source_form, "Mask", self.annotate_mask, *ANNOTATE_HELP["mask"])
+        source_form.addRow("", self.load_button)
+
+        save_box, save_form = self._make_form_section("2. Optional Reference And Recovery")
+        self._add_help_row(save_form, "Template image", self.annotate_template, *ANNOTATE_HELP["template"])
+        self._add_help_row(save_form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
+        self._add_help_row(save_form, "Previous CSV", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
+        save_form.addRow("", self.load_previous_csv_button)
+
+        advanced_box, advanced_form = self._make_form_section(
+            "Advanced Annotation Settings",
+            checkable=True,
+            checked=False,
+        )
+        self._add_help_row(advanced_form, "Slice axis", self.annotate_slice_axis, *ANNOTATE_HELP["slice_axis"])
+        self._add_help_row(advanced_form, "Min contour area", self.annotate_min_area, *ANNOTATE_HELP["min_area"])
+        self._add_help_row(advanced_form, "", self.annotate_keep_all, *ANNOTATE_HELP["keep_all"])
+        self._set_collapsible_form_visible(advanced_box, advanced_form, False)
+
+        picking_box, picking_form = self._make_form_section("3. Pick And Review")
+        self._add_help_row(picking_form, "Slice", self.annotate_slice, *ANNOTATE_HELP["slice"])
+        picking_form.addRow("", self.annotate_slider)
+        self._add_help_row(picking_form, "Contour", self.annotate_contour, *ANNOTATE_HELP["contour"])
+        self._add_help_row(picking_form, "Outer arc path", self.annotate_outer_path, *ANNOTATE_HELP["outer_path"])
+        self._add_help_row(picking_form, "Inner arc path", self.annotate_inner_path, *ANNOTATE_HELP["inner_path"])
+        picking_form.addRow("Next", self.next_point_label)
+        picking_form.addRow("Actions", action_row)
+        picking_form.addRow("Progress", self.annotate_progress)
+        picking_form.addRow("Status", self.annotate_status)
+
+        controls_layout.addWidget(source_box)
+        controls_layout.addWidget(save_box)
+        controls_layout.addWidget(advanced_box)
+        controls_layout.addWidget(picking_box)
+        controls_layout.addStretch(1)
 
         self.slice_canvas = SliceCanvas()
         self.slice_canvas.landmark_changed.connect(self.on_landmark_changed)
@@ -2506,7 +2580,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self._set_annotation_parameter_widgets_enabled(True)
         self._apply_annotation_settings_panel_state()
         self._set_next_annotation_mode()
-        self.annotate_status.setText("Point picking paused. Edit settings, then Load Mask / Start Picking again.")
+        self.annotate_status.setText(
+            "Point picking paused. Edit settings, then Load Source And Start Picking again."
+        )
 
     def toggle_annotation_settings_panel(self) -> None:
         if not self.annotation_picking_active:
@@ -3015,12 +3091,22 @@ class LaminarBoundaryWindow(QMainWindow):
             self.annotate_settings_button.hide()
             self._set_annotation_parameter_widgets_enabled(True)
             self._apply_annotation_settings_panel_state()
+            self.tabs.setCurrentIndex(1)
             self.append_log(
                 f"Suggested annotation set complete: {len(target_slices)} slices.\n"
                 f"Saved manual landmarks: {csv_path}\n"
-                "Auto-starting build.\n"
+                "Build settings are ready for review.\n"
             )
-            self.run_build()
+            reply = QMessageBox.question(
+                self,
+                "Annotation saved",
+                "Suggested annotation set is complete and the Build step is ready.\n\n"
+                "Run surface extraction now?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.Yes:
+                self.run_surface_build()
         except Exception as exc:
             QMessageBox.critical(self, "Auto build failed", str(exc))
 
@@ -3308,7 +3394,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self._set_status("Failed", "failed")
         self._cleanup_temporary_mask()
         self.append_log("\n" + trace)
-        QMessageBox.critical(self, "Mask extraction failed", trace.splitlines()[-1] if trace else "Unknown error")
+        self._show_error_dialog("Mask extraction failed", trace)
 
     def load_annotation_data(self) -> None:
         try:
@@ -3927,10 +4013,11 @@ class LaminarBoundaryWindow(QMainWindow):
             csv_path = output_dir / "manual_landmarks_interactive.csv"
             self._write_annotation_rows_csv(csv_path)
             self._sync_build_from_annotation(csv_path, output_dir)
+            self.tabs.setCurrentIndex(1)
             QMessageBox.information(
                 self,
                 "Manual CSV saved",
-                f"Saved:\n{csv_path}\n\nBuild is ready with the same mask and settings.",
+                f"Saved:\n{csv_path}\n\nReview the Build settings, then run Extract Surfaces.",
             )
             self.append_log(f"Saved interactive manual CSV: {csv_path}\n")
         except Exception as exc:
@@ -3991,17 +4078,27 @@ class LaminarBoundaryWindow(QMainWindow):
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(12)
         layout.addWidget(
-            self._make_hint("Step 2: extract surfaces first. Compute laminar depth volume later if needed.")
+            self._make_hint(
+                "Step 2: confirm the saved annotation inputs, extract surfaces, "
+                "then compute depth only when needed."
+            )
         )
 
-        settings = QGroupBox("2. Extract Surfaces / Optional Depth Volume")
-
         self.build_mask = PathRow("Target mask volume (.nrrd/.npy/.npz)")
-        self.build_manual = PathRow("manual_landmarks_template.csv", file_filter="CSV files (*.csv);;All files (*)")
-        self.build_boundaries = PathRow("boundary_annotations.json", file_filter="JSON files (*.json);;All files (*)")
+        self.build_manual = PathRow(
+            "manual_landmarks_template.csv",
+            file_filter="CSV files (*.csv);;All files (*)",
+        )
+        self.build_boundaries = PathRow(
+            "boundary_annotations.json",
+            file_filter="JSON files (*.json);;All files (*)",
+        )
         self.build_output = PathRow("Output folder for surfaces, volumes, tables, and QC", select_file=False)
         self.build_template = PathRow("Optional template image volume")
-        self.build_cell_csv = PathRow("Optional soma coordinate CSV", file_filter="CSV files (*.csv);;All files (*)")
+        self.build_cell_csv = PathRow(
+            "Optional soma coordinate CSV",
+            file_filter="CSV files (*.csv);;All files (*)",
+        )
         self.build_swc_glob = QLineEdit()
         self.build_swc_glob.setPlaceholderText("Optional SWC glob, for example data/local/swc/*.swc")
         self.build_slice_axis = self._axis_combo()
@@ -4036,24 +4133,39 @@ class LaminarBoundaryWindow(QMainWindow):
         self.qc_every.setMinimumHeight(28)
         self.build_keep_all = QCheckBox("Keep all contours per slice")
 
-        form = QFormLayout(settings)
-        self._tune_form(form)
-        self._add_help_row(form, "Mask", self.build_mask, *BUILD_HELP["mask"])
-        self._add_help_row(form, "Manual CSV", self.build_manual, *BUILD_HELP["manual_csv"])
-        self._add_help_row(form, "Boundary JSON", self.build_boundaries, *BUILD_HELP["boundaries_json"])
-        self._add_help_row(form, "Output folder", self.build_output, *BUILD_HELP["output"])
-        self._add_help_row(form, "Template image", self.build_template, *BUILD_HELP["template"])
-        self._add_help_row(form, "Cell CSV", self.build_cell_csv, *BUILD_HELP["cell_csv"])
-        self._add_help_row(form, "SWC glob", self.build_swc_glob, *BUILD_HELP["swc_glob"])
-        self._add_help_row(form, "Slice axis", self.build_slice_axis, *BUILD_HELP["slice_axis"])
-        self._add_help_row(form, "Min contour area", self.build_min_area, *BUILD_HELP["min_area"])
-        self._add_help_row(form, "Resample points", self.resample_points, *BUILD_HELP["resample_points"])
-        self._add_help_row(form, "Depth method", self.depth_method, *BUILD_HELP["depth_method"])
-        self._add_help_row(form, "Volume format", self.volume_format, *BUILD_HELP["volume_format"])
-        self._add_help_row(form, "Max Laplace voxels", self.max_laplace_voxels, *BUILD_HELP["max_laplace_voxels"])
-        self._add_help_row(form, "Boundary dilation", self.boundary_dilation, *BUILD_HELP["boundary_dilation"])
-        self._add_help_row(form, "QC interval", self.qc_every, *BUILD_HELP["qc_every"])
-        self._add_help_row(form, "", self.build_keep_all, *BUILD_HELP["keep_all"])
+        required_box, required_form = self._make_form_section("Required Build Inputs")
+        required_form.addRow(
+            "",
+            self._make_note_label(
+                "These are filled automatically after Save CSV And Review Build. "
+                "Check them, then run the surface build."
+            ),
+        )
+        self._add_help_row(required_form, "Mask", self.build_mask, *BUILD_HELP["mask"])
+        self._add_help_row(required_form, "Manual CSV", self.build_manual, *BUILD_HELP["manual_csv"])
+        self._add_help_row(required_form, "Output folder", self.build_output, *BUILD_HELP["output"])
+
+        optional_box, optional_form = self._make_form_section("Optional Measurements")
+        self._add_help_row(optional_form, "Template image", self.build_template, *BUILD_HELP["template"])
+        self._add_help_row(optional_form, "Cell CSV", self.build_cell_csv, *BUILD_HELP["cell_csv"])
+        self._add_help_row(optional_form, "SWC glob", self.build_swc_glob, *BUILD_HELP["swc_glob"])
+
+        advanced_box, advanced_form = self._make_form_section(
+            "Advanced Build Settings",
+            checkable=True,
+            checked=False,
+        )
+        self._add_help_row(advanced_form, "Boundary JSON", self.build_boundaries, *BUILD_HELP["boundaries_json"])
+        self._add_help_row(advanced_form, "Slice axis", self.build_slice_axis, *BUILD_HELP["slice_axis"])
+        self._add_help_row(advanced_form, "Min contour area", self.build_min_area, *BUILD_HELP["min_area"])
+        self._add_help_row(advanced_form, "Resample points", self.resample_points, *BUILD_HELP["resample_points"])
+        self._add_help_row(advanced_form, "Depth method", self.depth_method, *BUILD_HELP["depth_method"])
+        self._add_help_row(advanced_form, "Volume format", self.volume_format, *BUILD_HELP["volume_format"])
+        self._add_help_row(advanced_form, "Max Laplace voxels", self.max_laplace_voxels, *BUILD_HELP["max_laplace_voxels"])
+        self._add_help_row(advanced_form, "Boundary dilation", self.boundary_dilation, *BUILD_HELP["boundary_dilation"])
+        self._add_help_row(advanced_form, "QC interval", self.qc_every, *BUILD_HELP["qc_every"])
+        self._add_help_row(advanced_form, "", self.build_keep_all, *BUILD_HELP["keep_all"])
+        self._set_collapsible_form_visible(advanced_box, advanced_form, False)
 
         surface_button = self._make_button("Extract Surfaces", "primary")
         surface_button.clicked.connect(self.run_surface_build)
@@ -4066,7 +4178,9 @@ class LaminarBoundaryWindow(QMainWindow):
         button_row.addWidget(depth_button)
         button_row.addStretch(1)
 
-        layout.addWidget(settings)
+        layout.addWidget(required_box)
+        layout.addWidget(optional_box)
+        layout.addWidget(advanced_box)
         layout.addLayout(button_row)
         layout.addStretch(1)
         return tab
@@ -4174,10 +4288,28 @@ class LaminarBoundaryWindow(QMainWindow):
         box.setDetailedText(result.message)
         box.exec_()
 
+    def _error_summary(self, trace: str) -> str:
+        lines = [line.strip() for line in trace.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.startswith(("Traceback ", "File ")):
+                continue
+            return line
+        return "Unknown error"
+
+    def _show_error_dialog(self, title: str, trace: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle(title)
+        box.setText(self._error_summary(trace))
+        box.setInformativeText("Details were written to Log > View Current Log.")
+        if trace:
+            box.setDetailedText(trace)
+        box.exec_()
+
     def task_failed(self, trace: str) -> None:
         self._set_status("Failed", "failed")
         self.append_log("\n" + trace)
-        QMessageBox.critical(self, "Run failed", trace.splitlines()[-1] if trace else "Unknown error")
+        self._show_error_dialog("Run failed", trace)
 
     def run_prepare(self) -> None:
         def task() -> TaskResult:
