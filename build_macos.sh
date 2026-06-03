@@ -5,6 +5,7 @@ APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
 
 APP_NAME="Laminar Boundary Builder"
+BUNDLE_ID="org.cerebrocss.laminar-boundary-builder"
 ENTRY="$APP_DIR/launch_gui.py"
 ICON="$APP_DIR/assets/app.icns"
 ONTOLOGY_JSON="$APP_DIR/../../data/local/misc/1.json"
@@ -18,6 +19,7 @@ PYINSTALLER_ARGS=(
   --clean
   --windowed
   --name "$APP_NAME"
+  --osx-bundle-identifier "$BUNDLE_ID"
   --paths "$APP_DIR"
   --hidden-import scipy.ndimage
   --hidden-import scipy.spatial
