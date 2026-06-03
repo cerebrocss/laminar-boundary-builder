@@ -2431,6 +2431,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_path_choices_by_slice: Dict[int, Dict[str, str]] = {}
         self.annotation_skipped_slices = set()
         self.annotation_contours_by_slice: Dict[int, list] = {}
+        self.annotation_boundary_cache: Dict[int, tuple[tuple[str, ...], object]] = {}
         self.annotation_region_slices: List[int] = []
         self.annotation_target_slices: List[int] = []
         self.annotation_reference_contours = []
@@ -2575,6 +2576,7 @@ class LaminarBoundaryWindow(QMainWindow):
         row["outer_path"] = self.annotate_outer_path.currentText()
         row["inner_path"] = self.annotate_inner_path.currentText()
         row["note"] = note
+        self.annotation_boundary_cache.pop(slice_index, None)
         return self._autosave_annotation_rows()
 
     def on_annotation_path_choice_changed(self, *_args) -> None:
@@ -2848,6 +2850,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_rows.pop(slice_index, None)
         self.annotation_landmarks_by_slice.pop(slice_index, None)
         self.annotation_path_choices_by_slice.pop(slice_index, None)
+        self.annotation_boundary_cache.pop(slice_index, None)
         self.slice_canvas.landmarks = {}
         self._set_annotation_path_widgets("auto", "auto")
         self._set_next_annotation_mode()
@@ -3126,6 +3129,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_path_choices_by_slice.clear()
         self.annotation_skipped_slices.clear()
         self.annotation_contours_by_slice.clear()
+        self.annotation_boundary_cache.clear()
         self._refresh_annotation_reference_contours()
         self._set_annotation_path_widgets("auto", "auto")
         self.refresh_annotation_slice()
@@ -3481,12 +3485,18 @@ class LaminarBoundaryWindow(QMainWindow):
     def _annotation_boundary_from_row(self, row: Dict[str, str]):
         core = _core()
         slice_index = int(float(row["slice_index"]))
+        signature = tuple(str(row.get(key, "")) for key in self._annotation_csv_fieldnames())
+        cached = self.annotation_boundary_cache.get(slice_index)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
         contours = self.annotation_contours_by_slice.get(slice_index)
         if contours is None:
             contours = self._extract_contours_for_annotation_slice(slice_index)
             self.annotation_contours_by_slice[slice_index] = contours
         contour = core._select_contour_for_row(row, contours)
-        return core.make_boundary_from_landmark_row(contour, row, resample_points=64)
+        boundary = core.make_boundary_from_landmark_row(contour, row, resample_points=64)
+        self.annotation_boundary_cache[slice_index] = (signature, boundary)
+        return boundary
 
     def _current_annotation_boundary(self):
         contour = self.slice_canvas.selected_contour()
@@ -3575,12 +3585,12 @@ class LaminarBoundaryWindow(QMainWindow):
                     landmarks,
                     note="interactive_edit",
                 )
+                self.annotation_boundary_cache.pop(slice_index, None)
                 autosave_path = self._autosave_annotation_rows()
                 if autosave_path is not None:
                     self.append_log(f"Updated accepted slice {slice_index}; autosaved: {autosave_path}\n")
         self._set_next_annotation_mode()
         self._update_annotation_status()
-        self._refresh_annotation_reference_contours()
         self.refresh_annotation_preview()
 
     def _update_annotation_status(self) -> None:
@@ -3688,7 +3698,7 @@ class LaminarBoundaryWindow(QMainWindow):
             "outer_path": row["outer_path"],
             "inner_path": row["inner_path"],
         }
-        self._refresh_annotation_reference_contours()
+        self.annotation_boundary_cache.pop(slice_index, None)
         self._update_annotation_status()
         self.refresh_annotation_preview()
         self.append_log(f"Accepted manual landmarks for slice {slice_index}\n")
@@ -3704,12 +3714,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_landmarks_by_slice.pop(slice_index, None)
         self.annotation_rows.pop(slice_index, None)
         self.annotation_path_choices_by_slice.pop(slice_index, None)
+        self.annotation_boundary_cache.pop(slice_index, None)
         self.annotation_skipped_slices.discard(slice_index)
         self._set_annotation_path_widgets("auto", "auto")
         self.slice_canvas.landmarks = {}
         self._set_next_annotation_mode()
         self.slice_canvas.update()
-        self._refresh_annotation_reference_contours()
         self._update_annotation_status()
         self.refresh_annotation_preview()
         self._autosave_annotation_rows()
@@ -3751,6 +3761,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self.annotation_landmarks_by_slice = loaded_landmarks
             self.annotation_path_choices_by_slice = loaded_paths
             self.annotation_skipped_slices.clear()
+            self.annotation_boundary_cache.clear()
             self.annotation_target_slices = sorted(loaded_rows)
             self.annotate_previous_csv.set_text(csv_path)
             if not self.annotate_output.text().strip():
@@ -4227,6 +4238,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_rows.clear()
         self.annotation_path_choices_by_slice.clear()
         self.annotation_skipped_slices.clear()
+        self.annotation_boundary_cache.clear()
         self.annotation_reference_contours = []
         self.annotation_mask_path = None
         self.annotation_mask_is_temporary = False
