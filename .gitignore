@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+*.spec
+demo_build/
+demo_output/
+test_output/
+local_data/
+*.log

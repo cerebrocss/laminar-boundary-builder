@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "laminar-boundary-builder"
+version = "0.1.0"
+description = "Semi-automatic laminar boundary, surface, and depth-field builder for brain region masks."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pillow",
+    "scipy",
+    "pynrrd",
+    "PyQt5",
+]
+
+[project.optional-dependencies]
+nifti = ["nibabel"]
+packaging = ["pyinstaller"]
+
+[project.scripts]
+laminar-boundary-builder = "laminar_boundary_builder.cli:main"
+laminar-boundary-builder-gui = "laminar_boundary_builder.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["laminar_boundary_builder*"]

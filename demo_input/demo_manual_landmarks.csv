@@ -1,0 +1,4 @@
+slice_index,contour_id,outer_start_index,outer_end_index,outer_path,inner_start_index,inner_end_index,inner_path
+2,0,150,22,1,103,69,-1
+9,0,150,20,1,103,67,-1
+15,0,146,19,1,98,66,-1
