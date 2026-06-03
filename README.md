@@ -82,6 +82,8 @@ inner_end
 ```text
 X      撤销当前切片上最后一个点
 Enter  接受当前切片并进入下一张有效切片
+S      当前整圈 contour 只作为 outer surface；适合 inner 已经结束的封顶切片
+A      当前整圈 contour 只作为 inner surface；适合 outer 已经结束的封顶切片
 Esc    退出点选模式，重新编辑参数
 ```
 

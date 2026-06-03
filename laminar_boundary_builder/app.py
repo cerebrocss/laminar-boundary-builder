@@ -1329,7 +1329,7 @@ class SliceCanvas(QWidget):
         painter.drawText(label_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, label)
 
         if self.picking_enabled:
-            keys = "Drag background pan   S no inner   H info   N suggest   O/I flip   Wheel/+/- zoom   0 reset   X undo"
+            keys = "Drag pan   S outer only   A inner only   H info   N suggest   O/I flip   Wheel/+/- zoom   0 reset   X undo"
             metrics = painter.fontMetrics()
             keys_width = min(max(560, metrics.horizontalAdvance(keys) + 24), max(120, self.width() - 20))
             keys_rect = QRectF(10, 46, keys_width, 26)
@@ -2068,9 +2068,16 @@ class LaminarBoundaryWindow(QMainWindow):
         self.suggest_next_slice_shortcut.setContext(Qt.ApplicationShortcut)
         self.suggest_next_slice_shortcut.activated.connect(self.suggest_next_annotation_slice)
 
-        self.skip_annotation_slice_shortcut = QShortcut(QKeySequence(Qt.Key_S), self)
-        self.skip_annotation_slice_shortcut.setContext(Qt.ApplicationShortcut)
-        self.skip_annotation_slice_shortcut.activated.connect(self.skip_current_annotation_slice)
+        self.outer_only_annotation_slice_shortcut = QShortcut(QKeySequence(Qt.Key_S), self)
+        self.outer_only_annotation_slice_shortcut.setContext(Qt.ApplicationShortcut)
+        self.outer_only_annotation_slice_shortcut.activated.connect(
+            lambda: self.mark_current_annotation_cap("outer_only")
+        )
+        self.inner_only_annotation_slice_shortcut = QShortcut(QKeySequence(Qt.Key_A), self)
+        self.inner_only_annotation_slice_shortcut.setContext(Qt.ApplicationShortcut)
+        self.inner_only_annotation_slice_shortcut.activated.connect(
+            lambda: self.mark_current_annotation_cap("inner_only")
+        )
 
         self.flip_outer_path_shortcut = QShortcut(QKeySequence(Qt.Key_O), self)
         self.flip_outer_path_shortcut.setContext(Qt.ApplicationShortcut)
@@ -2319,8 +2326,22 @@ class LaminarBoundaryWindow(QMainWindow):
         self.suggest_slice_button = self._make_button("Suggest Slice Set (N)", "secondary")
         self.suggest_slice_button.setToolTip("Build a stable suggested slice set and jump to its first unaccepted slice.")
         self.suggest_slice_button.clicked.connect(self.suggest_next_annotation_slice)
-        self.skip_slice_button = self._make_button("Skip / No Inner (S)", "secondary")
-        self.skip_slice_button.setToolTip("Skip this slice when it has no real inner surface.")
+        self.outer_only_slice_button = self._make_button("Outer Only / No Inner (S)", "secondary")
+        self.outer_only_slice_button.setToolTip(
+            "Mark the whole current contour as outer surface, with no inner surface on this slice."
+        )
+        self.outer_only_slice_button.clicked.connect(
+            lambda _checked=False: self.mark_current_annotation_cap("outer_only")
+        )
+        self.inner_only_slice_button = self._make_button("Inner Only / No Outer (A)", "secondary")
+        self.inner_only_slice_button.setToolTip(
+            "Mark the whole current contour as inner surface, with no outer surface on this slice."
+        )
+        self.inner_only_slice_button.clicked.connect(
+            lambda _checked=False: self.mark_current_annotation_cap("inner_only")
+        )
+        self.skip_slice_button = self._make_button("Skip Slice", "secondary")
+        self.skip_slice_button.setToolTip("Ignore this slice entirely when the contour is not usable.")
         self.skip_slice_button.clicked.connect(self.skip_current_annotation_slice)
         self.flip_outer_path_button = self._make_button("Flip Outer (O)", "secondary")
         self.flip_outer_path_button.setToolTip("Use the other contour side between outer_start and outer_end.")
@@ -2346,6 +2367,8 @@ class LaminarBoundaryWindow(QMainWindow):
         flip_layout.addWidget(self.flip_inner_path_button)
         action_layout.addWidget(self.save_slice_button)
         action_layout.addWidget(self.suggest_slice_button)
+        action_layout.addWidget(self.outer_only_slice_button)
+        action_layout.addWidget(self.inner_only_slice_button)
         action_layout.addWidget(self.skip_slice_button)
         action_layout.addWidget(flip_row)
         action_layout.addWidget(self.clear_slice_button)
@@ -2547,6 +2570,15 @@ class LaminarBoundaryWindow(QMainWindow):
         if value in ("backward", "ccw", "counterclockwise", "-", "-1"):
             return "backward"
         return "auto"
+
+    @staticmethod
+    def _surface_mode_label(surface_mode: str) -> str:
+        mode = _core().normalize_surface_mode(surface_mode)
+        if mode == "outer_only":
+            return "outer-only / no inner"
+        if mode == "inner_only":
+            return "inner-only / no outer"
+        return "normal"
 
     def _set_combo_text_without_signal(self, combo: QComboBox, text: str) -> None:
         normalized = self._normalize_annotation_path_choice(text)
@@ -2858,12 +2890,51 @@ class LaminarBoundaryWindow(QMainWindow):
         self._update_annotation_status()
         autosave_path = self._autosave_annotation_rows()
         saved = f" Autosaved: {autosave_path}" if autosave_path is not None else ""
-        self.append_log(f"Skipped slice {slice_index}: no inner surface.{saved}\n")
+        self.append_log(f"Skipped slice {slice_index}: unusable contour.{saved}\n")
 
         if self._annotation_target_set_complete():
             self.finish_annotation_and_run_build()
             return
-        self.annotate_status.setText(f"Skipped slice {slice_index}: no real inner surface.{saved}")
+        self.annotate_status.setText(f"Skipped slice {slice_index}: unusable contour.{saved}")
+        self._go_to_next_annotation_slice()
+
+    def mark_current_annotation_cap(self, surface_mode: str) -> None:
+        if not self._annotation_shortcuts_active():
+            return
+        if self.annotation_mask_data is None:
+            return
+        contour = self.slice_canvas.selected_contour()
+        if contour is None:
+            QMessageBox.warning(self, "No contour", "No usable contour is available on this slice.")
+            return
+
+        mode = _core().normalize_surface_mode(surface_mode)
+        if mode == "normal":
+            return
+        slice_index = int(self.annotate_slice.value())
+        row = self._annotation_row_from_cap(contour, mode, note=f"{mode}_interactive")
+        self.annotation_rows[slice_index] = row
+        self.annotation_landmarks_by_slice.pop(slice_index, None)
+        self.annotation_path_choices_by_slice[slice_index] = {
+            "outer_path": row["outer_path"],
+            "inner_path": row["inner_path"],
+        }
+        self.annotation_skipped_slices.discard(slice_index)
+        self.annotation_boundary_cache.pop(slice_index, None)
+        self.slice_canvas.landmarks = {}
+        self._set_annotation_path_widgets("auto", "auto")
+        self._set_next_annotation_mode()
+        self.refresh_annotation_preview()
+        self._update_annotation_status()
+        autosave_path = self._autosave_annotation_rows()
+        saved = f" Autosaved: {autosave_path}" if autosave_path is not None else ""
+        label = self._surface_mode_label(mode)
+        self.append_log(f"Marked slice {slice_index} as {label}.{saved}\n")
+
+        if self._annotation_target_set_complete():
+            self.finish_annotation_and_run_build()
+            return
+        self.annotate_status.setText(f"Marked slice {slice_index} as {label}.{saved}")
         self._go_to_next_annotation_slice()
 
     def undo_annotation_point(self) -> None:
@@ -3358,6 +3429,7 @@ class LaminarBoundaryWindow(QMainWindow):
         return {
             "slice_index": str(contour.slice_index),
             "contour_id": str(contour.contour_id),
+            "surface_mode": "normal",
             "outer_start_index": str(landmarks["outer_start"]),
             "outer_start_x": f"{points[landmarks['outer_start'], 0]:.4f}",
             "outer_start_y": f"{points[landmarks['outer_start'], 1]:.4f}",
@@ -3379,10 +3451,31 @@ class LaminarBoundaryWindow(QMainWindow):
             "note": note,
         }
 
+    def _annotation_row_from_cap(
+        self,
+        contour,
+        surface_mode: str,
+        note: Optional[str] = None,
+    ) -> Dict[str, str]:
+        mode = _core().normalize_surface_mode(surface_mode)
+        row = {field: "" for field in self._annotation_csv_fieldnames()}
+        row.update(
+            {
+                "slice_index": str(contour.slice_index),
+                "contour_id": str(contour.contour_id),
+                "surface_mode": mode,
+                "outer_path": "whole" if mode == "outer_only" else "",
+                "inner_path": "whole" if mode == "inner_only" else "",
+                "note": note or mode,
+            }
+        )
+        return row
+
     def _annotation_csv_fieldnames(self) -> List[str]:
         return [
             "slice_index",
             "contour_id",
+            "surface_mode",
             "outer_start_index",
             "outer_start_x",
             "outer_start_y",
@@ -3468,6 +3561,15 @@ class LaminarBoundaryWindow(QMainWindow):
             self.annotation_contours_by_slice[slice_index] = contours
             self._prune_annotation_contour_cache(slice_index)
         contour = core._select_contour_for_row(row, contours)
+        surface_mode = core.normalize_surface_mode(row.get("surface_mode"))
+        if surface_mode != "normal":
+            loaded_row = self._annotation_row_from_cap(
+                contour,
+                surface_mode,
+                note=row.get("note") or "loaded",
+            )
+            return slice_index, loaded_row, {}
+
         points = core._normalize_contour(contour.points)
         landmarks = {
             name: self._landmark_index_from_loaded_row(row, points, name)
@@ -3534,20 +3636,25 @@ class LaminarBoundaryWindow(QMainWindow):
         current_complete = all(name in current_landmarks for name in SliceCanvas.LANDMARK_ORDER)
         boundaries = []
         skipped = 0
+        current_boundary = None
         for row in self.annotation_rows.values():
             row_slice = int(float(row.get("slice_index", -1)))
-            if row_slice == current_slice and not current_complete:
+            row_mode = _core().normalize_surface_mode(row.get("surface_mode"))
+            if row_slice == current_slice and row_mode == "normal" and not current_complete:
                 continue
             try:
-                boundaries.append(self._annotation_boundary_from_row(row))
+                boundary = self._annotation_boundary_from_row(row)
+                boundaries.append(boundary)
+                if row_slice == current_slice:
+                    current_boundary = boundary
             except Exception:
                 skipped += 1
 
-        current_boundary = None
-        try:
-            current_boundary = self._current_annotation_boundary()
-        except Exception:
-            current_boundary = None
+        if current_boundary is None:
+            try:
+                current_boundary = self._current_annotation_boundary()
+            except Exception:
+                current_boundary = None
 
         shown_slices = {boundary.slice_index for boundary in boundaries}
         if current_boundary is not None:
@@ -3564,7 +3671,7 @@ class LaminarBoundaryWindow(QMainWindow):
         if skipped:
             message += f", {skipped} skipped"
         if self.annotation_skipped_slices:
-            message += f", {len(self.annotation_skipped_slices)} no-inner"
+            message += f", {len(self.annotation_skipped_slices)} ignored"
         self.surface_preview_canvas.set_boundaries(
             boundaries,
             current_boundary=current_boundary,
@@ -3610,8 +3717,17 @@ class LaminarBoundaryWindow(QMainWindow):
         contour_text = "no contour" if not self.slice_canvas.contours else f"contour {self.slice_canvas.selected_contour_index}"
         if slice_index in self.annotation_skipped_slices:
             self.annotate_status.setText(
-                f"Slice {slice_index} is skipped because it has no real inner surface. "
+                f"Slice {slice_index} is skipped because its contour is not usable. "
                 f"Clear Current Slice if you want to annotate it."
+            )
+            self._update_annotation_progress()
+            return
+        row = self.annotation_rows.get(slice_index)
+        if row is not None and _core().normalize_surface_mode(row.get("surface_mode")) != "normal":
+            label = self._surface_mode_label(row.get("surface_mode", "normal"))
+            self.annotate_status.setText(
+                f"Slice {slice_index}, {contour_text}. Marked as {label}. "
+                f"Clear Current Slice if you want four-point annotation. Accepted slices: {accepted_count}."
             )
             self._update_annotation_progress()
             return
@@ -3642,6 +3758,16 @@ class LaminarBoundaryWindow(QMainWindow):
         target_total = len(target_slices)
         accepted = len([slice_index for slice_index in self.annotation_rows if slice_index in target_slices])
         skipped = len(self.annotation_skipped_slices)
+        outer_only = sum(
+            1
+            for row in self.annotation_rows.values()
+            if _core().normalize_surface_mode(row.get("surface_mode")) == "outer_only"
+        )
+        inner_only = sum(
+            1
+            for row in self.annotation_rows.values()
+            if _core().normalize_surface_mode(row.get("surface_mode")) == "inner_only"
+        )
         if region_total == 0:
             self.annotate_progress.setText("Region slices: 0. No annotation target yet.")
             self.slice_canvas.set_progress_text("Progress: no region slice found.")
@@ -3663,12 +3789,12 @@ class LaminarBoundaryWindow(QMainWindow):
             f"Region slices: {region_total} ({first_slice}-{last_slice}). "
             f"{mode_label}: {target_total}. "
             f"Accepted target slices: {accepted}/{target}. Remaining: {remaining}. "
-            f"Skipped no-inner: {skipped}."
+            f"Outer-only: {outer_only}. Inner-only: {inner_only}. Skipped: {skipped}."
         )
         self.slice_canvas.set_progress_text(
             f"Accepted target slices: {accepted}/{target}, remaining {remaining}\n"
             f"Current target slice: {current_position}/{target_total} (slice {current_slice})\n"
-            f"Region range: {first_slice}-{last_slice}, skipped no-inner {skipped}"
+            f"Region range: {first_slice}-{last_slice}, outer-only {outer_only}, inner-only {inner_only}, skipped {skipped}"
         )
 
     def accept_annotation_slice(self, show_success: bool = True) -> bool:

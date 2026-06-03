@@ -42,6 +42,42 @@ BOUNDARY_OUTER = 2
 BOUNDARY_INNER = 3
 BOUNDARY_LATERAL = 4
 
+SURFACE_MODE_NORMAL = "normal"
+SURFACE_MODE_OUTER_ONLY = "outer_only"
+SURFACE_MODE_INNER_ONLY = "inner_only"
+SURFACE_MODES = {
+    SURFACE_MODE_NORMAL,
+    SURFACE_MODE_OUTER_ONLY,
+    SURFACE_MODE_INNER_ONLY,
+}
+
+
+def normalize_surface_mode(value: Optional[str]) -> str:
+    mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": SURFACE_MODE_NORMAL,
+        "normal": SURFACE_MODE_NORMAL,
+        "both": SURFACE_MODE_NORMAL,
+        "manual": SURFACE_MODE_NORMAL,
+        "outer": SURFACE_MODE_OUTER_ONLY,
+        "outer_only": SURFACE_MODE_OUTER_ONLY,
+        "outer_cap": SURFACE_MODE_OUTER_ONLY,
+        "outer_cap_only": SURFACE_MODE_OUTER_ONLY,
+        "no_inner": SURFACE_MODE_OUTER_ONLY,
+        "inner": SURFACE_MODE_INNER_ONLY,
+        "inner_only": SURFACE_MODE_INNER_ONLY,
+        "inner_cap": SURFACE_MODE_INNER_ONLY,
+        "inner_cap_only": SURFACE_MODE_INNER_ONLY,
+        "no_outer": SURFACE_MODE_INNER_ONLY,
+    }
+    if mode not in aliases:
+        raise ValueError(f"Unknown surface_mode: {value}")
+    return aliases[mode]
+
+
+def _row_surface_mode(row: Dict[str, str]) -> str:
+    return normalize_surface_mode(row.get("surface_mode"))
+
 
 @dataclass
 class VolumeData:
@@ -103,6 +139,7 @@ class BoundarySlice:
     flags: List[str] = field(default_factory=list)
     outer_path: str = "auto"
     inner_path: str = "auto"
+    surface_mode: str = SURFACE_MODE_NORMAL
     mean_snap_distance: float = 0.0
     min_outer_inner_distance: float = math.nan
 
@@ -111,6 +148,7 @@ class BoundarySlice:
             "slice_index": self.slice_index,
             "contour_id": self.contour_id,
             "source": self.source,
+            "surface_mode": normalize_surface_mode(self.surface_mode),
             "confidence": round(float(self.confidence), 4),
             "mean_snap_distance": round(float(self.mean_snap_distance), 4),
             "min_outer_inner_distance": round(float(self.min_outer_inner_distance), 4)
@@ -131,6 +169,7 @@ class BoundarySlice:
             "flags": list(self.flags),
             "outer_path": self.outer_path,
             "inner_path": self.inner_path,
+            "surface_mode": normalize_surface_mode(self.surface_mode),
             "mean_snap_distance": float(self.mean_snap_distance),
             "min_outer_inner_distance": float(self.min_outer_inner_distance)
             if np.isfinite(self.min_outer_inner_distance)
@@ -158,6 +197,7 @@ class BoundarySlice:
             flags=list(item.get("flags", [])),
             outer_path=str(item.get("outer_path", "auto")),
             inner_path=str(item.get("inner_path", "auto")),
+            surface_mode=normalize_surface_mode(item.get("surface_mode")),
             mean_snap_distance=float(item.get("mean_snap_distance", 0.0)),
             min_outer_inner_distance=float(min_distance)
             if min_distance is not None
@@ -1010,6 +1050,28 @@ def _normalize_contour(points: np.ndarray) -> np.ndarray:
     return points
 
 
+def _closed_contour_points(points: np.ndarray) -> np.ndarray:
+    points = _normalize_contour(points)
+    if len(points) == 0:
+        return points.reshape(0, 3)
+    return np.vstack([points, points[:1]])
+
+
+def _is_closed_polyline(points: np.ndarray) -> bool:
+    points = np.asarray(points, dtype=float)
+    return len(points) > 2 and np.linalg.norm(points[0] - points[-1]) < 1e-6
+
+
+def _align_closed_polyline_start(points: np.ndarray, target: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if not _is_closed_polyline(points):
+        return points
+    unique_points = points[:-1]
+    start_index = _nearest_index(unique_points, target)
+    shifted = np.vstack([unique_points[start_index:], unique_points[:start_index]])
+    return np.vstack([shifted, shifted[:1]])
+
+
 def _path_indices(n_points: int, start: int, end: int, direction: int) -> np.ndarray:
     if direction not in (1, -1):
         raise ValueError("direction must be 1 or -1")
@@ -1312,6 +1374,15 @@ def make_boundary_from_landmark_row(
     row: Dict[str, str],
     resample_points: int = 80,
 ) -> BoundarySlice:
+    surface_mode = _row_surface_mode(row)
+    if surface_mode != SURFACE_MODE_NORMAL:
+        return make_whole_contour_boundary(
+            contour,
+            surface_mode=surface_mode,
+            resample_points=resample_points,
+            source="manual",
+        )
+
     points = _normalize_contour(contour.points)
     outer_start = _landmark_index(row, points, "outer_start", "outer_start")
     outer_end = _landmark_index(row, points, "outer_end", "outer_end")
@@ -1357,8 +1428,39 @@ def make_boundary_from_landmark_row(
         flags=flags,
         outer_path=str(outer_direction),
         inner_path=str(inner_direction),
+        surface_mode=SURFACE_MODE_NORMAL,
         mean_snap_distance=0.0,
         min_outer_inner_distance=min_distance,
+    )
+
+
+def make_whole_contour_boundary(
+    contour: Contour2D,
+    surface_mode: str,
+    resample_points: int = 80,
+    source: str = "manual",
+) -> BoundarySlice:
+    surface_mode = normalize_surface_mode(surface_mode)
+    if surface_mode == SURFACE_MODE_NORMAL:
+        raise ValueError("Whole-contour boundary requires outer_only or inner_only mode.")
+
+    ring = resample_polyline(_closed_contour_points(contour.points), resample_points)
+    empty = np.empty((0, 3), dtype=float)
+    is_outer = surface_mode == SURFACE_MODE_OUTER_ONLY
+    return BoundarySlice(
+        slice_index=contour.slice_index,
+        contour_id=contour.contour_id,
+        outer_arc=ring if is_outer else empty,
+        inner_arc=empty if is_outer else ring,
+        lateral_arcs=[],
+        source=source,
+        confidence=1.0,
+        flags=[surface_mode],
+        outer_path="whole" if is_outer else "",
+        inner_path="" if is_outer else "whole",
+        surface_mode=surface_mode,
+        mean_snap_distance=0.0,
+        min_outer_inner_distance=math.nan,
     )
 
 
@@ -1515,6 +1617,23 @@ def propagate_boundaries(
         if span <= 1:
             continue
 
+        left_mode = normalize_surface_mode(left.surface_mode)
+        right_mode = normalize_surface_mode(right.surface_mode)
+        if left_mode != SURFACE_MODE_NORMAL or right_mode != SURFACE_MODE_NORMAL:
+            if left_mode == right_mode and left_mode != SURFACE_MODE_NORMAL:
+                for slice_index in range(left.slice_index + 1, right.slice_index):
+                    candidates = by_slice.get(slice_index, [])
+                    if not candidates:
+                        continue
+                    contour = max(candidates, key=lambda item: item.area)
+                    output[slice_index] = make_whole_contour_boundary(
+                        contour,
+                        surface_mode=left_mode,
+                        resample_points=resample_points,
+                        source="auto",
+                    )
+            continue
+
         for slice_index in range(left.slice_index + 1, right.slice_index):
             candidates = by_slice.get(slice_index, [])
             if not candidates:
@@ -1565,6 +1684,7 @@ def propagate_boundaries(
                 flags=flags,
                 outer_path=str(outer_direction),
                 inner_path=str(inner_direction),
+                surface_mode=SURFACE_MODE_NORMAL,
                 mean_snap_distance=mean_snap,
                 min_outer_inner_distance=min_distance,
             )
@@ -1608,10 +1728,25 @@ def loft_surface(
             curve = boundary.lateral_arcs[lateral_index]
         else:
             raise ValueError(f"Unknown arc name: {arc_name}")
+        if len(curve) < 2:
+            continue
         curves.append(resample_polyline(curve, resample_points))
 
     if len(curves) < 2:
         raise ValueError(f"Need at least two curves to build {arc_name} surface")
+    for index, curve in enumerate(curves):
+        if not _is_closed_polyline(curve):
+            continue
+        target = None
+        if index > 0:
+            target = curves[index - 1][0]
+        elif len(curves) > 1:
+            target = curves[index + 1][0]
+        if target is not None:
+            curves[index] = resample_polyline(
+                _align_closed_polyline_start(curve, target),
+                resample_points,
+            )
 
     vertices = np.vstack(curves).astype(float)
     faces: List[List[int]] = []
@@ -2071,7 +2206,11 @@ def write_qc_tables(boundaries: Sequence[BoundarySlice], output_dir: str | Path)
     summary_rows = [boundary.to_summary_row() for boundary in boundaries]
     _write_csv_rows(output_dir / "qc_surface_distance.csv", summary_rows)
 
-    benign_flags = {"no_lateral_boundary"}
+    benign_flags = {
+        "no_lateral_boundary",
+        SURFACE_MODE_OUTER_ONLY,
+        SURFACE_MODE_INNER_ONLY,
+    }
 
     def has_actionable_flags(row: Dict) -> bool:
         flags = [
@@ -2175,6 +2314,7 @@ def write_manual_landmark_template(
     fieldnames = [
         "slice_index",
         "contour_id",
+        "surface_mode",
         "outer_start_index",
         "outer_start_x",
         "outer_start_y",
@@ -2203,6 +2343,7 @@ def write_manual_landmark_template(
             {
                 "slice_index": contour.slice_index,
                 "contour_id": contour.contour_id,
+                "surface_mode": SURFACE_MODE_NORMAL,
                 "outer_start_index": "",
                 "outer_start_x": "",
                 "outer_start_y": "",
