@@ -2372,6 +2372,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_include_children = QCheckBox("Include child regions")
         self.annotate_include_children.setChecked(True)
         self.annotate_mask = PathRow("Optional existing target mask")
+        default_ent_mask = _core().resolve_default_ent_mask_path()
+        if default_ent_mask is not None:
+            self.annotate_mask.set_text(default_ent_mask)
         self.annotate_template = PathRow("Optional template image volume")
         self.annotate_output = PathRow("Output folder for saved manual CSV", select_file=False)
         self.annotate_previous_csv = PathRow(
@@ -2497,7 +2500,7 @@ class LaminarBoundaryWindow(QMainWindow):
         source_form.addRow(
             "",
             self._make_note_label(
-                "Use Brain region to extract from Allen atlas, or leave it empty and choose an existing Mask."
+                "Use the built-in Allen ENT mask, choose another Mask, or fill Brain region to extract from atlas."
             ),
         )
         self._add_help_row(source_form, "Brain region", self.annotate_region, *ANNOTATE_HELP["region"])

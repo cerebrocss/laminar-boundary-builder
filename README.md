@@ -39,7 +39,15 @@ GUI 主界面有两个正式页面：
 推荐现在用这个流程：
 
 1. 打开 `Annotate` 页。
-2. 如果还没有现成 mask，直接填 `Brain region`。本机打包版可以带上 `annotation_10.nrrd`；公开源码仓库不包含 atlas 大文件，其他人可以加载现成 mask，或在本地提供自己的 Allen annotation atlas。
+2. 默认 `Mask` 会填入内置的 Allen 官方 ENT 10um mask：
+
+```text
+laminar_boundary_builder/data/masks/ENT_official_structure_909_10um_mask.nrrd
+```
+
+这个文件来自 Allen CCF 2017 `structure_masks_10/structure_909.nrrd`。想直接试官方 ENT mask 时，不需要再手动指定 nrrd 路径，点 `Load Source And Start Picking` 就可以。
+
+如果想换别的脑区，清空 `Mask`，再填 `Brain region`。本机打包版可以带上 `annotation_10.nrrd`；公开源码仓库不包含 atlas 大文件，其他人也可以加载现成 mask，或在本地提供自己的 Allen annotation atlas。
 3. `Brain region` 填想提取的脑区 acronym 或 ID，例如：
 
 ```text
@@ -58,7 +66,7 @@ data/local/misc/average_template_10.nrrd
 
 5. 点 `Load Source And Start Picking`，等待提取进度窗口结束后开始标点。
 
-如果已经有现成 mask，也可以跳过 `Brain region`，直接在 `Mask` 里选择单侧 ENT mask，例如：
+如果已经有其他现成 mask，也可以跳过 `Brain region`，直接在 `Mask` 里选择单侧 ENT mask，例如：
 
 ```text
 data/local/laminar_boundary_masks/ENT_left_ml_low_10um_mask.nrrd

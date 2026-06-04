@@ -492,6 +492,47 @@ def _default_annotation_candidates() -> List[Path]:
     return candidates
 
 
+def default_ent_mask_candidates() -> List[Path]:
+    filename = "ENT_official_structure_909_10um_mask.nrrd"
+    candidates = [
+        Path(__file__).resolve().parent / "data" / "masks" / filename,
+    ]
+    bundle_root = getattr(sys, "_MEIPASS", "")
+    if bundle_root:
+        candidates.append(
+            Path(bundle_root).resolve()
+            / "laminar_boundary_builder"
+            / "data"
+            / "masks"
+            / filename
+        )
+    executable = getattr(sys, "executable", "")
+    if executable:
+        candidates.append(
+            Path(executable).resolve().parent.parent
+            / "Resources"
+            / "laminar_boundary_builder"
+            / "data"
+            / "masks"
+            / filename
+        )
+    for root in _candidate_project_roots() or [_repo_root()]:
+        candidates.extend(
+            [
+                root / "data" / "local" / "laminar_boundary_masks" / filename,
+                root / "data" / "local" / "laminar_boundary_masks" / "structure_909.nrrd",
+            ]
+        )
+    return candidates
+
+
+def resolve_default_ent_mask_path() -> Optional[Path]:
+    for candidate in default_ent_mask_candidates():
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def resolve_annotation_path(annotation_path: str | Path | None = None) -> Path:
     candidates: List[Path] = []
     if annotation_path:

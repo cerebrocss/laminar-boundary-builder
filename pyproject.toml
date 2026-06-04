@@ -27,3 +27,6 @@ laminar-boundary-builder-gui = "laminar_boundary_builder.app:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["laminar_boundary_builder*"]
+
+[tool.setuptools.package-data]
+laminar_boundary_builder = ["data/masks/*.nrrd"]
