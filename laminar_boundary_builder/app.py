@@ -2375,6 +2375,18 @@ class LaminarBoundaryWindow(QMainWindow):
         default_ent_mask = _core().resolve_default_ent_mask_path()
         if default_ent_mask is not None:
             self.annotate_mask.set_text(default_ent_mask)
+        self.allen_mask_cache_status = QLabel()
+        self.allen_mask_cache_status.setObjectName("readinessText")
+        self.allen_mask_cache_status.setWordWrap(True)
+        self.allen_mask_cache_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.download_allen_mask_button = self._make_button("Download Allen ENT Mask", "secondary")
+        self.download_allen_mask_button.clicked.connect(self.download_allen_ent_mask)
+        self.use_allen_mask_button = self._make_button("Use Allen ENT Mask", "secondary")
+        self.use_allen_mask_button.clicked.connect(self.use_default_allen_ent_mask)
+        self.open_allen_cache_button = self._make_button("Open Cache Folder", "secondary")
+        self.open_allen_cache_button.clicked.connect(self.open_allen_mask_cache_folder)
+        self.clear_allen_cache_button = self._make_button("Clear Cache", "danger")
+        self.clear_allen_cache_button.clicked.connect(self.clear_allen_mask_cache)
         self.annotate_template = PathRow("Optional template image volume")
         self.annotate_output = PathRow("Output folder for saved manual CSV", select_file=False)
         self.annotate_previous_csv = PathRow(
@@ -2513,9 +2525,127 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_atlas_label = source_form.labelForField(self.annotate_atlas_row)
         self._update_custom_atlas_visibility(False)
         self._add_help_row(source_form, "Mask", self.annotate_mask, *ANNOTATE_HELP["mask"])
+        source_form.addRow("Allen cache", self.allen_mask_cache_status)
+        source_form.addRow("", self._make_allen_mask_cache_actions())
+        self._refresh_allen_mask_cache_status()
         source_form.addRow("Checklist", self.annotation_readiness)
         source_form.addRow("", self.load_button)
         controls_layout.addWidget(source_box)
+
+    def _make_allen_mask_cache_actions(self) -> QWidget:
+        row = QWidget()
+        layout = QVBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        primary_row = QWidget()
+        primary_layout = QHBoxLayout(primary_row)
+        primary_layout.setContentsMargins(0, 0, 0, 0)
+        primary_layout.setSpacing(6)
+        primary_layout.addWidget(self.download_allen_mask_button)
+        primary_layout.addWidget(self.use_allen_mask_button)
+
+        folder_row = QWidget()
+        folder_layout = QHBoxLayout(folder_row)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.setSpacing(6)
+        folder_layout.addWidget(self.open_allen_cache_button)
+        folder_layout.addWidget(self.clear_allen_cache_button)
+
+        layout.addWidget(primary_row)
+        layout.addWidget(folder_row)
+        return row
+
+    def _same_path(self, first: str | Path, second: str | Path) -> bool:
+        return Path(first).expanduser().resolve() == Path(second).expanduser().resolve()
+
+    def _path_is_inside(self, path: str | Path, folder: str | Path) -> bool:
+        try:
+            Path(path).expanduser().resolve().relative_to(Path(folder).expanduser().resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _annotation_mask_source_name(self, mask_path: Path) -> str:
+        core = _core()
+        if self._same_path(mask_path, core.allen_ent_mask_cache_path()):
+            return "cached Allen ENT mask"
+        if mask_path.name == core.BUILTIN_ENT_MASK_FILENAME:
+            return "built-in Allen ENT mask"
+        if mask_path.name == core.ALLEN_ENT_MASK_FILENAME:
+            return "Allen ENT mask"
+        return "existing mask"
+
+    def _refresh_allen_mask_cache_status(self) -> None:
+        if not hasattr(self, "allen_mask_cache_status"):
+            return
+        core = _core()
+        cache_dir = core.allen_ent_mask_cache_dir()
+        cache_path = core.allen_ent_mask_cache_path()
+        cache_size = core.directory_size(cache_dir)
+        if cache_path.exists():
+            mask_size = core.format_bytes(cache_path.stat().st_size)
+            first_line = f"Cached Allen ENT mask: ready ({mask_size})."
+            state = "ready"
+        else:
+            first_line = "Cached Allen ENT mask: not downloaded. Built-in fallback is still available."
+            state = "warning"
+        lines = [
+            first_line,
+            f"Cache total: {core.format_bytes(cache_size)}",
+            f"Location: {cache_dir}",
+        ]
+        self.allen_mask_cache_status.setText("\n".join(lines))
+        self._set_label_state(self.allen_mask_cache_status, state)
+        self.open_allen_cache_button.setEnabled(True)
+        self.clear_allen_cache_button.setEnabled(cache_size > 0)
+
+    def use_default_allen_ent_mask(self) -> None:
+        mask_path = _core().resolve_default_ent_mask_path()
+        if mask_path is None:
+            QMessageBox.information(
+                self,
+                "Allen mask not found",
+                "No cached or built-in Allen ENT mask was found. Download it first.",
+            )
+            return
+        self.annotate_mask.set_text(mask_path)
+        self._refresh_allen_mask_cache_status()
+        self._update_annotation_readiness()
+
+    def open_allen_mask_cache_folder(self) -> None:
+        cache_dir = _core().allen_ent_mask_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self._refresh_allen_mask_cache_status()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(cache_dir)))
+
+    def clear_allen_mask_cache(self) -> None:
+        core = _core()
+        cache_dir = core.allen_ent_mask_cache_dir()
+        cache_size = core.directory_size(cache_dir)
+        if cache_size <= 0:
+            QMessageBox.information(self, "Cache empty", "Allen mask cache is already empty.")
+            self._refresh_allen_mask_cache_status()
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Clear Allen mask cache",
+            f"Delete cached Allen masks from:\n{cache_dir}\n\nCurrent size: {core.format_bytes(cache_size)}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        current_mask = self._resolved_existing_input_path(self.annotate_mask.text())
+        current_was_cached = current_mask is not None and self._path_is_inside(current_mask, cache_dir)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        if current_was_cached:
+            fallback = core.resolve_default_ent_mask_path()
+            self.annotate_mask.set_text(fallback or "")
+        self._refresh_allen_mask_cache_status()
+        self._update_annotation_readiness()
 
     def _add_annotation_reference_section(self, controls_layout: QVBoxLayout) -> None:
         save_box, save_form = self._make_form_section("2. Optional Reference And Recovery")
@@ -2654,7 +2784,8 @@ class LaminarBoundaryWindow(QMainWindow):
                 has_warning = True
                 lines.append("Input source: Mask path is set, but the file was not found.")
             else:
-                lines.append(f"Input source: existing mask ({mask_path.name}).")
+                source_name = self._annotation_mask_source_name(mask_path)
+                lines.append(f"Input source: {source_name} ({mask_path.name}).")
         else:
             lines.append("Input source: choose Brain region or an existing Mask.")
 
@@ -3485,6 +3616,77 @@ class LaminarBoundaryWindow(QMainWindow):
         if self.progress_dialog is not None:
             self.progress_dialog.close()
             self.progress_dialog = None
+
+    def download_allen_ent_mask(self) -> None:
+        if self.thread is not None:
+            QMessageBox.warning(self, "Task running", "Please wait for the current task to finish.")
+            return
+
+        core = _core()
+        cache_path = core.allen_ent_mask_cache_path()
+        if cache_path.exists():
+            reply = QMessageBox.question(
+                self,
+                "Download Allen ENT mask",
+                f"A cached Allen ENT mask already exists:\n{cache_path}\n\nDownload again and replace it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        def task() -> TaskResult:
+            core = _core()
+            mask_path = core.download_allen_ent_mask(progress=print)
+            return TaskResult(
+                "Allen ENT mask downloaded",
+                (
+                    "Allen ENT mask downloaded.\n"
+                    f"path: {mask_path}\n"
+                    f"size: {core.format_bytes(mask_path.stat().st_size)}"
+                ),
+                payload=mask_path,
+            )
+
+        self.append_log("\n--- Allen ENT mask download started ---\n")
+        self._set_status("Running: downloading Allen mask", "running")
+        self.progress_dialog = QProgressDialog("Downloading Allen ENT mask...", "", 0, 0, self)
+        self.progress_dialog.setWindowTitle("Downloading Allen mask")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setCancelButton(None)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.show()
+
+        self.thread = QThread()
+        self.worker = Worker(task)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.log.connect(self.append_log)
+        self.worker.log.connect(self._update_progress_dialog)
+        self.worker.finished.connect(self.allen_ent_mask_download_finished)
+        self.worker.failed.connect(self.allen_ent_mask_download_failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.clear_thread)
+        self.thread.start()
+
+    def allen_ent_mask_download_finished(self, result: TaskResult) -> None:
+        self._close_progress_dialog()
+        self._set_status("Ready", "ready")
+        mask_path = Path(result.payload)
+        self.annotate_mask.set_text(mask_path)
+        self._refresh_allen_mask_cache_status()
+        self._update_annotation_readiness()
+        self.append_log(f"\n{result.message}\n")
+        QMessageBox.information(self, "Allen mask downloaded", result.message)
+
+    def allen_ent_mask_download_failed(self, trace: str) -> None:
+        self._close_progress_dialog()
+        self._set_status("Failed", "failed")
+        self._refresh_allen_mask_cache_status()
+        self.append_log("\n" + trace)
+        self._show_error_dialog("Allen mask download failed", trace)
 
     def start_annotation_mask_extraction(self) -> None:
         if self.thread is not None:

@@ -47,6 +47,8 @@ laminar_boundary_builder/data/masks/ENT_official_structure_909_10um_mask.nrrd
 
 这个文件来自 Allen CCF 2017 `structure_masks_10/structure_909.nrrd`。想直接试官方 ENT mask 时，不需要再手动指定 nrrd 路径，点 `Load Source And Start Picking` 就可以。
 
+`Allen cache` 会显示本机缓存占用和存放位置。点 `Download Allen ENT Mask` 会从 Allen 官方地址下载 ENT mask，并保存到用户缓存目录；之后 app 会优先读取这份缓存。点 `Open Cache Folder` 可以直接打开缓存文件夹，点 `Clear Cache` 可以清掉用户缓存。清掉缓存不会删除 app 内置的兜底 ENT mask。
+
 如果想换别的脑区，清空 `Mask`，再填 `Brain region`。本机打包版可以带上 `annotation_10.nrrd`；公开源码仓库不包含 atlas 大文件，其他人也可以加载现成 mask，或在本地提供自己的 Allen annotation atlas。
 3. `Brain region` 填想提取的脑区 acronym 或 ID，例如：
 
