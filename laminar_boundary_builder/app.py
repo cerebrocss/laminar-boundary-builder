@@ -2463,11 +2463,11 @@ class LaminarBoundaryWindow(QMainWindow):
         self.load_previous_csv_button.setToolTip("Load saved manual landmarks into the annotation workspace.")
         self.load_previous_csv_button.clicked.connect(self.load_previous_annotation_csv)
         self.save_slice_button = self._make_button("Accept Slice + Next", "primary")
-        self.save_slice_button.setToolTip("Accept landmarks on this slice and move to the next region slice.")
+        self.save_slice_button.setToolTip("Accept landmarks on this slice and move to the next smart target slice.")
         self.save_slice_button.clicked.connect(self.accept_annotation_slice_and_advance)
-        self.suggest_slice_button = self._make_button("Suggest Slice Set (N)", "secondary")
+        self.suggest_slice_button = self._make_button("Refresh Smart Slice Set (N)", "secondary")
         self.suggest_slice_button.setToolTip(
-            "Build a stable suggested slice set and jump to its first unaccepted slice."
+            "Build a smart slice set that is denser near tails, shape changes, and QC review ranges."
         )
         self.suggest_slice_button.clicked.connect(self.suggest_next_annotation_slice)
         self.outer_only_slice_button = self._make_button("Outer Only / No Inner (S)", "secondary")
@@ -3084,6 +3084,116 @@ class LaminarBoundaryWindow(QMainWindow):
                 picked.append(slice_index)
         return picked
 
+    def _slice_shape_features(self, slices: List[int]) -> Dict[int, Dict[str, float]]:
+        if self.annotation_mask_data is None:
+            return {}
+        np = _numpy()
+        core = _core()
+        features: Dict[int, Dict[str, float]] = {}
+        for slice_index in slices:
+            try:
+                plane = core._take_slice(
+                    self.annotation_mask_data,
+                    int(slice_index),
+                    self.annotation_slice_axis_int,
+                )
+            except Exception:
+                continue
+            mask = np.asarray(plane, dtype=bool)
+            coords = np.argwhere(mask)
+            if coords.size == 0:
+                continue
+            mins = coords.min(axis=0)
+            maxs = coords.max(axis=0)
+            centroid = coords.mean(axis=0)
+            padded = np.pad(mask, 1, mode="constant", constant_values=False)
+            center = padded[1:-1, 1:-1]
+            interior = (
+                center
+                & padded[:-2, 1:-1]
+                & padded[2:, 1:-1]
+                & padded[1:-1, :-2]
+                & padded[1:-1, 2:]
+            )
+            boundary = center & ~interior
+            features[int(slice_index)] = {
+                "area": float(coords.shape[0]),
+                "row": float(centroid[0]),
+                "col": float(centroid[1]),
+                "height": float(maxs[0] - mins[0] + 1),
+                "width": float(maxs[1] - mins[1] + 1),
+                "perimeter": float(np.count_nonzero(boundary)),
+            }
+        return features
+
+    @staticmethod
+    def _add_nearby_slices(picked: set, slices: List[int], center_slice: int, radius: int = 1) -> None:
+        if not slices:
+            return
+        nearest = min(slices, key=lambda value: (abs(value - center_slice), value))
+        center_index = slices.index(nearest)
+        for offset in range(-radius, radius + 1):
+            index = center_index + offset
+            if 0 <= index < len(slices):
+                picked.add(int(slices[index]))
+
+    def _tail_anchor_slices(
+        self,
+        slices: List[int],
+        features: Dict[int, Dict[str, float]],
+    ) -> List[int]:
+        if not slices or not features:
+            return []
+        max_area = max((feature["area"] for feature in features.values()), default=0.0)
+        if max_area <= 0:
+            return []
+        anchors = {int(slices[0]), int(slices[-1])}
+        for fraction in (0.025, 0.05, 0.10, 0.25):
+            minimum = max_area * fraction
+            left = next(
+                (slice_index for slice_index in slices if features.get(slice_index, {}).get("area", 0.0) >= minimum),
+                None,
+            )
+            right = next(
+                (
+                    slice_index
+                    for slice_index in reversed(slices)
+                    if features.get(slice_index, {}).get("area", 0.0) >= minimum
+                ),
+                None,
+            )
+            if left is not None:
+                anchors.add(int(left))
+            if right is not None:
+                anchors.add(int(right))
+        return sorted(anchors)
+
+    @staticmethod
+    def _shape_change_scores(
+        slices: List[int],
+        features: Dict[int, Dict[str, float]],
+    ) -> List[tuple[float, int, int]]:
+        scores: List[tuple[float, int, int]] = []
+        for left, right in zip(slices[:-1], slices[1:]):
+            left_feature = features.get(left)
+            right_feature = features.get(right)
+            if left_feature is None or right_feature is None:
+                continue
+            area_change = abs(math.log((right_feature["area"] + 1.0) / (left_feature["area"] + 1.0)))
+            perimeter_change = abs(
+                math.log((right_feature["perimeter"] + 1.0) / (left_feature["perimeter"] + 1.0))
+            )
+            width_change = abs(math.log((right_feature["width"] + 1.0) / (left_feature["width"] + 1.0)))
+            height_change = abs(math.log((right_feature["height"] + 1.0) / (left_feature["height"] + 1.0)))
+            centroid_scale = max(8.0, math.sqrt(max(left_feature["area"], right_feature["area"])))
+            centroid_shift = math.hypot(
+                right_feature["row"] - left_feature["row"],
+                right_feature["col"] - left_feature["col"],
+            ) / centroid_scale
+            score = 1.4 * area_change + centroid_shift + 0.8 * (width_change + height_change) + 0.7 * perimeter_change
+            scores.append((float(score), int(left), int(right)))
+        return sorted(scores, reverse=True)
+
     @staticmethod
     def _slice_ranges(slices: List[int]) -> List[tuple[int, int]]:
         ranges: List[tuple[int, int]] = []
@@ -3194,33 +3304,26 @@ class LaminarBoundaryWindow(QMainWindow):
         viable = self._viable_annotation_slices()
         if not viable:
             return []
-        np = _numpy()
-        target_count = min(len(viable), max(6, min(18, (len(viable) + 23) // 24)))
+        target_count = min(len(viable), max(8, min(72, (len(viable) + 7) // 8)))
         picked = set(self._pick_evenly_spaced_slices(viable, target_count))
 
-        counts = self.annotation_slice_counts
-        if counts is not None and len(viable) >= 3:
-            viable_counts = np.asarray([int(counts[slice_index]) for slice_index in viable], dtype=float)
-            changes = np.abs(np.diff(viable_counts))
-            change_slots = max(1, target_count // 4)
-            for index in np.argsort(changes)[::-1][:change_slots]:
-                left = viable[int(index)]
-                right = viable[int(index) + 1]
-                middle = self._closest_slice_from_list(viable, (left + right) * 0.5)
-                if middle is not None:
-                    picked.add(middle)
+        features = self._slice_shape_features(viable)
+        for slice_index in self._tail_anchor_slices(viable, features):
+            self._add_nearby_slices(picked, viable, slice_index, radius=1)
+
+        shape_scores = self._shape_change_scores(viable, features)
+        change_slots = min(max(4, target_count // 4), max(0, len(shape_scores)))
+        for _score, left, right in shape_scores[:change_slots]:
+            self._add_nearby_slices(picked, viable, left, radius=1)
+            self._add_nearby_slices(picked, viable, right, radius=1)
 
         qc_review_slices = [
             slice_index for slice_index in self._current_qc_review_slices() if slice_index in viable
         ]
-        picked.update(self._review_targets_from_ranges(qc_review_slices))
+        for slice_index in self._review_targets_from_ranges(qc_review_slices):
+            self._add_nearby_slices(picked, viable, slice_index, radius=1)
 
         return sorted(picked)
-
-    def _closest_slice_from_list(self, slices: List[int], target: float) -> Optional[int]:
-        if not slices:
-            return None
-        return min(slices, key=lambda slice_index: (abs(slice_index - target), slice_index))
 
     def _suggest_annotation_slice(self) -> tuple[Optional[int], str]:
         target_slices = self._target_annotation_slices()
@@ -3278,7 +3381,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_slice.setValue(target)
         self.slice_canvas.setFocus(Qt.OtherFocusReason)
         self.annotate_status.setText(
-            f"Suggested set active: {len(self.annotation_target_slices)} slices. "
+            f"Smart suggested set active: {len(self.annotation_target_slices)} slices. "
             f"Now showing slice {target}. {reason}"
         )
         self._update_annotation_progress()
@@ -3759,12 +3862,6 @@ class LaminarBoundaryWindow(QMainWindow):
         max_slice = self.annotation_mask_data.shape[self.annotation_slice_axis_int] - 1
         self.annotation_slice_counts = load_data.slice_counts
         self.annotation_region_slices = list(load_data.region_slices)
-        self.annotation_target_slices = []
-        if self.annotation_region_slices:
-            middle = self.annotation_region_slices[len(self.annotation_region_slices) // 2]
-            initial_slice = int(middle)
-        else:
-            initial_slice = 0
         self.annotation_landmarks_by_slice.clear()
         self.annotation_rows.clear()
         self.annotation_path_choices_by_slice.clear()
@@ -3778,6 +3875,14 @@ class LaminarBoundaryWindow(QMainWindow):
         self.review_source_build_dir = None
         self.review_round_csv_path = None
         self._apply_review_mode_ui(False)
+        self.annotation_target_slices = self._build_suggested_annotation_set()
+        if self.annotation_target_slices:
+            initial_slice = int(self.annotation_target_slices[0])
+        elif self.annotation_region_slices:
+            middle = self.annotation_region_slices[len(self.annotation_region_slices) // 2]
+            initial_slice = int(middle)
+        else:
+            initial_slice = 0
         self.annotation_preview_request_id += 1
         self.annotate_slice.blockSignals(True)
         self.annotate_slider.blockSignals(True)
@@ -4494,7 +4599,29 @@ class LaminarBoundaryWindow(QMainWindow):
             )
             return
         target = self._recommended_annotation_count()
-        remaining = max(0, target - accepted)
+        all_accepted = len(self.annotation_rows)
+        if self.annotation_target_slices:
+            remaining = max(0, target_total - accepted)
+            extra_slices = max(0, all_accepted - accepted)
+            progress_line = (
+                f"Smart suggested slices: {accepted}/{target_total}. "
+                f"Remaining: {remaining}. Extra manual slices: {extra_slices}."
+            )
+            canvas_line = (
+                f"Smart suggested slices: {accepted}/{target_total}, remaining {remaining}\n"
+                f"Extra manual slices: {extra_slices}"
+            )
+        else:
+            remaining = max(0, target - all_accepted)
+            extra_slices = max(0, all_accepted - target)
+            progress_line = (
+                f"Accepted slices: {all_accepted}. Recommended minimum: {target}. "
+                f"Remaining to recommendation: {remaining}. Extra anchors: {extra_slices}."
+            )
+            canvas_line = (
+                f"Accepted slices: {all_accepted}; recommended minimum {target}, remaining {remaining}\n"
+                f"Extra anchors: {extra_slices}"
+            )
         current_slice = int(self.annotate_slice.value())
         current_position = 0
         for index, slice_index in enumerate(target_slices, start=1):
@@ -4503,15 +4630,13 @@ class LaminarBoundaryWindow(QMainWindow):
                 break
         if current_position == 0:
             current_position = target_total
-        mode_label = "Suggested set" if self.annotation_target_slices else "Region slices"
         self.annotate_progress.setText(
             f"Region slices: {region_total} ({first_slice}-{last_slice}). "
-            f"{mode_label}: {target_total}. "
-            f"Accepted target slices: {accepted}/{target}. Remaining: {remaining}. "
+            f"{progress_line} "
             f"Outer-only: {outer_only}. Inner-only: {inner_only}. Skipped: {skipped}."
         )
         self.slice_canvas.set_progress_text(
-            f"Accepted target slices: {accepted}/{target}, remaining {remaining}\n"
+            f"{canvas_line}\n"
             f"Current target slice: {current_position}/{target_total} (slice {current_slice})\n"
             f"Region range: {first_slice}-{last_slice}, outer-only {outer_only}, inner-only {inner_only}, skipped {skipped}"
         )
