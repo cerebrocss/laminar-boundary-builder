@@ -805,6 +805,13 @@ class AnnotationLoadData:
     warnings: List[str]
 
 
+@dataclass
+class AnnotationPreviewCacheData:
+    request_id: int
+    reference_contours: list
+    contours_by_slice: Dict[int, list]
+
+
 class StreamBuffer(io.StringIO):
     def __init__(self, callback: Callable[[str], None]):
         super().__init__()
@@ -950,6 +957,7 @@ class SliceCanvas(QWidget):
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.image = None
+        self._qimage_cache: Optional[QImage] = None
         self.contours = []
         self.selected_contour_index = 0
         self.landmarks: Dict[str, int] = {}
@@ -985,6 +993,7 @@ class SliceCanvas(QWidget):
     ) -> None:
         np = _numpy()
         self.image = np.asarray(image)
+        self._qimage_cache = None
         self.contours = contours
         self.landmarks = dict(landmarks or {})
         self.selected_contour_index = min(max(0, selected_contour_index), max(0, len(contours) - 1))
@@ -1016,16 +1025,23 @@ class SliceCanvas(QWidget):
     def _image_to_qimage(self) -> Optional[QImage]:
         if self.image is None:
             return None
+        if self._qimage_cache is not None:
+            return self._qimage_cache
         np = _numpy()
-        image = np.asarray(self.image, dtype=float)
-        finite = image[np.isfinite(image)]
-        if finite.size == 0:
-            scaled = np.zeros(image.shape, dtype=np.uint8)
+        image = np.asarray(self.image)
+        if image.dtype == np.uint8:
+            scaled = np.ascontiguousarray(image)
         else:
-            lo, hi = np.percentile(finite, [1, 99])
-            if hi <= lo:
-                hi = lo + 1.0
-            scaled = np.clip((image - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+            image = image.astype(float, copy=False)
+            finite = image[np.isfinite(image)]
+            if finite.size == 0:
+                scaled = np.zeros(image.shape, dtype=np.uint8)
+            else:
+                lo, hi = np.percentile(finite, [1, 99])
+                if hi <= lo:
+                    hi = lo + 1.0
+                scaled = np.clip((image - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+            scaled = np.ascontiguousarray(scaled)
         qimage = QImage(
             scaled.data,
             scaled.shape[1],
@@ -1033,7 +1049,8 @@ class SliceCanvas(QWidget):
             scaled.strides[0],
             QImage.Format_Grayscale8,
         )
-        return qimage.copy()
+        self._qimage_cache = qimage.copy()
+        return self._qimage_cache
 
     def _update_transform(self) -> None:
         if self.image is None:
@@ -1869,6 +1886,9 @@ class LaminarBoundaryWindow(QMainWindow):
         super().__init__()
         self.thread: Optional[QThread] = None
         self.worker: Optional[Worker] = None
+        self.annotation_preview_thread: Optional[QThread] = None
+        self.annotation_preview_worker: Optional[Worker] = None
+        self.annotation_preview_request_id = 0
         self.progress_dialog: Optional[QProgressDialog] = None
         self.temporary_mask_dir: Optional[tempfile.TemporaryDirectory] = None
         self.annotation_mask_path: Optional[Path] = None
@@ -3272,6 +3292,7 @@ class LaminarBoundaryWindow(QMainWindow):
             f"Now showing slice {target}. {reason}"
         )
         self._update_annotation_progress()
+        self.start_annotation_preview_cache_warmup(target)
 
     def skip_current_annotation_slice(self) -> None:
         if not self._annotation_shortcuts_active():
@@ -3456,25 +3477,31 @@ class LaminarBoundaryWindow(QMainWindow):
 
         self.annotate_slice.setValue(next_slice)
         self.slice_canvas.setFocus(Qt.OtherFocusReason)
+        self.start_annotation_preview_cache_warmup(next_slice)
 
-    def _extract_contours_for_annotation_slice(self, slice_index: int) -> list:
-        if self.annotation_mask_data is None:
+    @staticmethod
+    def _extract_annotation_contours_from_mask(
+        mask_data,
+        slice_index: int,
+        slice_axis_int: int,
+        min_area: float,
+        keep_all: bool,
+    ) -> list:
+        if mask_data is None:
             return []
         core = _core()
-        np = _numpy()
         mask_2d = core._take_slice(
-            self.annotation_mask_data,
+            mask_data,
             slice_index,
-            self.annotation_slice_axis_int,
+            slice_axis_int,
         )
-        mask_2d = np.asarray(mask_2d) > 0
         raw_contours = core._find_mask_contours(mask_2d)
         contours = []
         for raw in raw_contours:
             area = core._polygon_area(raw)
-            if area < float(self.annotate_min_area.value()):
+            if area < float(min_area):
                 continue
-            points = core._plane_to_volume_points(raw, slice_index, self.annotation_slice_axis_int)
+            points = core._plane_to_volume_points(raw, slice_index, slice_axis_int)
             contours.append(
                 core.Contour2D(
                     slice_index=slice_index,
@@ -3484,22 +3511,35 @@ class LaminarBoundaryWindow(QMainWindow):
                     length=core._polyline_length(points, closed=True),
                 )
             )
-        if contours and not self.annotate_keep_all.isChecked():
+        if contours and not keep_all:
             biggest = max(contours, key=lambda contour: contour.area)
             biggest.contour_id = 0
             return [biggest]
         return contours
 
-    def _build_annotation_reference_contours(
-        self,
+    def _extract_contours_for_annotation_slice(self, slice_index: int) -> list:
+        return self._extract_annotation_contours_from_mask(
+            self.annotation_mask_data,
+            slice_index,
+            self.annotation_slice_axis_int,
+            float(self.annotate_min_area.value()),
+            self.annotate_keep_all.isChecked(),
+        )
+
+    @staticmethod
+    def _build_annotation_reference_contours_from_mask(
+        mask_data,
+        region_slices: List[int],
+        slice_axis_int: int,
+        min_area: float,
         max_slices: int = 56,
         points_per_contour: int = 96,
     ) -> list:
-        if self.annotation_mask_data is None or not self.annotation_region_slices:
+        if mask_data is None or not region_slices:
             return []
         core = _core()
         np = _numpy()
-        region_slices = list(self.annotation_region_slices)
+        region_slices = list(region_slices)
         if len(region_slices) > max_slices:
             positions = np.linspace(0, len(region_slices) - 1, max_slices)
             sample_slices = []
@@ -3511,22 +3551,18 @@ class LaminarBoundaryWindow(QMainWindow):
             sample_slices = region_slices
 
         reference_contours = []
-        min_area = max(1.0, float(self.annotate_min_area.value()))
+        min_area = max(1.0, float(min_area))
         for slice_index in sample_slices:
-            mask_2d = core._take_slice(
-                self.annotation_mask_data,
+            contours = LaminarBoundaryWindow._extract_annotation_contours_from_mask(
+                mask_data,
                 slice_index,
-                self.annotation_slice_axis_int,
+                slice_axis_int,
+                min_area,
+                keep_all=False,
             )
-            raw_contours = core._find_mask_contours(np.asarray(mask_2d) > 0)
-            candidates = [
-                raw for raw in raw_contours if core._polygon_area(raw) >= min_area
-            ]
-            if not candidates:
+            if not contours:
                 continue
-            raw = max(candidates, key=core._polygon_area)
-            points = core._plane_to_volume_points(raw, slice_index, self.annotation_slice_axis_int)
-            points = core._normalize_contour(points)
+            points = core._normalize_contour(contours[0].points)
             if len(points) < 2:
                 continue
             closed = np.vstack([points, points[:1]])
@@ -3535,6 +3571,20 @@ class LaminarBoundaryWindow(QMainWindow):
             reference_contours.append(closed)
         return reference_contours
 
+    def _build_annotation_reference_contours(
+        self,
+        max_slices: int = 56,
+        points_per_contour: int = 96,
+    ) -> list:
+        return self._build_annotation_reference_contours_from_mask(
+            self.annotation_mask_data,
+            list(self.annotation_region_slices),
+            self.annotation_slice_axis_int,
+            float(self.annotate_min_area.value()),
+            max_slices=max_slices,
+            points_per_contour=points_per_contour,
+        )
+
     def _refresh_annotation_reference_contours(self) -> None:
         self.annotation_reference_contours = self._build_annotation_reference_contours()
         if hasattr(self, "surface_preview_canvas"):
@@ -3542,6 +3592,113 @@ class LaminarBoundaryWindow(QMainWindow):
                 self.annotation_reference_contours,
                 self.annotation_slice_axis_int,
             )
+
+    def _annotation_warmup_slices(self, current_slice: int) -> List[int]:
+        warmup_slices = [int(current_slice)]
+        for slice_index in self._build_suggested_annotation_set():
+            if slice_index not in warmup_slices:
+                warmup_slices.append(slice_index)
+        return warmup_slices[:24]
+
+    def start_annotation_preview_cache_warmup(self, current_slice: int) -> None:
+        if self.annotation_mask_data is None or self.annotation_preview_thread is not None:
+            return
+
+        self.annotation_preview_request_id += 1
+        request_id = self.annotation_preview_request_id
+        mask_data = self.annotation_mask_data
+        region_slices = list(self.annotation_region_slices)
+        slice_axis_int = int(self.annotation_slice_axis_int)
+        min_area = float(self.annotate_min_area.value())
+        keep_all = self.annotate_keep_all.isChecked()
+        cached_slices = set(self.annotation_contours_by_slice)
+        warmup_slices = [
+            slice_index
+            for slice_index in self._annotation_warmup_slices(current_slice)
+            if slice_index not in cached_slices
+        ]
+        existing_reference = list(self.annotation_reference_contours)
+        needs_reference = not existing_reference and bool(region_slices)
+        if not needs_reference and not warmup_slices:
+            return
+
+        def task() -> TaskResult:
+            if needs_reference:
+                reference_contours = self._build_annotation_reference_contours_from_mask(
+                    mask_data,
+                    region_slices,
+                    slice_axis_int,
+                    min_area,
+                    max_slices=56,
+                    points_per_contour=96,
+                )
+            else:
+                reference_contours = existing_reference
+            contours_by_slice = {}
+            for slice_index in warmup_slices:
+                contours_by_slice[slice_index] = self._extract_annotation_contours_from_mask(
+                    mask_data,
+                    slice_index,
+                    slice_axis_int,
+                    min_area,
+                    keep_all,
+                )
+            return TaskResult(
+                "Annotation preview cache ready",
+                (
+                    f"Prepared target reference from {len(reference_contours)} slices and "
+                    f"cached {len(contours_by_slice)} annotation slices."
+                ),
+                payload=AnnotationPreviewCacheData(
+                    request_id=request_id,
+                    reference_contours=reference_contours,
+                    contours_by_slice=contours_by_slice,
+                ),
+            )
+
+        if hasattr(self, "surface_preview_canvas") and not self.annotation_reference_contours:
+            self.surface_preview_canvas.set_boundaries(
+                [],
+                slice_axis=self.annotation_slice_axis_int,
+                message="Preparing target region reference...",
+            )
+        self.annotation_preview_thread = QThread()
+        self.annotation_preview_worker = Worker(task)
+        self.annotation_preview_worker.moveToThread(self.annotation_preview_thread)
+        self.annotation_preview_thread.started.connect(self.annotation_preview_worker.run)
+        self.annotation_preview_worker.finished.connect(self.annotation_preview_cache_finished)
+        self.annotation_preview_worker.failed.connect(self.annotation_preview_cache_failed)
+        self.annotation_preview_worker.finished.connect(self.annotation_preview_thread.quit)
+        self.annotation_preview_worker.failed.connect(self.annotation_preview_thread.quit)
+        self.annotation_preview_thread.finished.connect(self.annotation_preview_thread.deleteLater)
+        self.annotation_preview_thread.finished.connect(self.clear_annotation_preview_thread)
+        self.annotation_preview_thread.start()
+
+    def annotation_preview_cache_finished(self, result: TaskResult) -> None:
+        payload = result.payload
+        if not isinstance(payload, AnnotationPreviewCacheData):
+            return
+        if payload.request_id != self.annotation_preview_request_id:
+            return
+        for slice_index, contours in payload.contours_by_slice.items():
+            self.annotation_contours_by_slice.setdefault(int(slice_index), contours)
+        if self.annotation_mask_data is not None:
+            self._prune_annotation_contour_cache(int(self.annotate_slice.value()))
+        self.annotation_reference_contours = list(payload.reference_contours)
+        if hasattr(self, "surface_preview_canvas"):
+            self.surface_preview_canvas.set_reference_contours(
+                self.annotation_reference_contours,
+                self.annotation_slice_axis_int,
+            )
+        self.refresh_annotation_preview()
+        self.append_log(result.message + "\n")
+
+    def annotation_preview_cache_failed(self, trace: str) -> None:
+        self.append_log("\nPreview cache failed:\n" + trace)
+
+    def clear_annotation_preview_thread(self) -> None:
+        self.annotation_preview_thread = None
+        self.annotation_preview_worker = None
 
     def _uses_atlas_extraction(self) -> bool:
         return bool(self.annotate_region.text().strip())
@@ -3603,16 +3760,14 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_mask.set_text(self.annotation_mask_path)
 
         max_slice = self.annotation_mask_data.shape[self.annotation_slice_axis_int] - 1
-        self.annotate_slice.setRange(0, max_slice)
-        self.annotate_slider.setRange(0, max_slice)
         self.annotation_slice_counts = load_data.slice_counts
         self.annotation_region_slices = list(load_data.region_slices)
         self.annotation_target_slices = []
         if self.annotation_region_slices:
             middle = self.annotation_region_slices[len(self.annotation_region_slices) // 2]
-            self.annotate_slice.setValue(int(middle))
+            initial_slice = int(middle)
         else:
-            self.annotate_slice.setValue(0)
+            initial_slice = 0
         self.annotation_landmarks_by_slice.clear()
         self.annotation_rows.clear()
         self.annotation_path_choices_by_slice.clear()
@@ -3620,12 +3775,22 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_contours_by_slice.clear()
         self.annotation_boundary_cache.clear()
         self.annotation_reference_contours = []
+        self.annotation_preview_request_id += 1
+        self.annotate_slice.blockSignals(True)
+        self.annotate_slider.blockSignals(True)
+        self.annotate_slice.setRange(0, max_slice)
+        self.annotate_slider.setRange(0, max_slice)
+        self.annotate_slice.setValue(initial_slice)
+        self.annotate_slider.setValue(initial_slice)
+        self.annotate_slider.blockSignals(False)
+        self.annotate_slice.blockSignals(False)
         if hasattr(self, "surface_preview_canvas"):
             self.surface_preview_canvas.set_reference_contours([], self.annotation_slice_axis_int)
         self._set_annotation_path_widgets("auto", "auto")
         self.refresh_annotation_slice()
         self._update_annotation_readiness()
         self.enter_annotation_picking_mode()
+        self.start_annotation_preview_cache_warmup(initial_slice)
 
     def _update_progress_dialog(self, text: str) -> None:
         if self.progress_dialog is None:
@@ -5277,6 +5442,14 @@ class LaminarBoundaryWindow(QMainWindow):
                 event.ignore()
                 return
             self.force_stop_current_task()
+
+        self.annotation_preview_request_id += 1
+        if self.annotation_preview_thread is not None:
+            self.annotation_preview_thread.requestInterruption()
+            self.annotation_preview_thread.terminate()
+            self.annotation_preview_thread.wait(1000)
+            self.annotation_preview_thread = None
+            self.annotation_preview_worker = None
 
         self._hide_help_popup()
         app = QApplication.instance()

@@ -985,7 +985,9 @@ def _other_axes(slice_axis: int) -> Tuple[int, int]:
 
 
 def _take_slice(volume: np.ndarray, slice_index: int, slice_axis: int) -> np.ndarray:
-    return np.take(volume, indices=slice_index, axis=slice_axis)
+    slicer = [slice(None)] * volume.ndim
+    slicer[int(slice_axis)] = int(slice_index)
+    return volume[tuple(slicer)]
 
 
 def _as_bool_mask(mask: np.ndarray) -> np.ndarray:
