@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -810,6 +811,14 @@ class AnnotationPreviewCacheData:
     request_id: int
     reference_contours: list
     contours_by_slice: Dict[int, list]
+
+
+@dataclass
+class ReviewRepairRequest:
+    mask_path: Path
+    manual_csv: Path
+    build_output_dir: Path
+    queue_slices: List[int]
 
 
 class StreamBuffer(io.StringIO):
@@ -1889,6 +1898,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_preview_thread: Optional[QThread] = None
         self.annotation_preview_worker: Optional[Worker] = None
         self.annotation_preview_request_id = 0
+        self.pending_review_request: Optional[ReviewRepairRequest] = None
         self.progress_dialog: Optional[QProgressDialog] = None
         self.temporary_mask_dir: Optional[tempfile.TemporaryDirectory] = None
         self.annotation_mask_path: Optional[Path] = None
@@ -2486,6 +2496,15 @@ class LaminarBoundaryWindow(QMainWindow):
         self.clear_slice_button = self._make_button("Clear Current Slice", "danger")
         self.clear_slice_button.setToolTip("Clear landmarks on the current slice.")
         self.clear_slice_button.clicked.connect(self.clear_annotation_slice)
+        self.review_ok_button = self._make_button("Looks OK + Next", "secondary")
+        self.review_ok_button.setToolTip("Mark this review slice as checked and move to the next review target.")
+        self.review_ok_button.clicked.connect(self.mark_review_slice_ok)
+        self.save_review_button = self._make_button("Save Review CSV", "secondary")
+        self.save_review_button.setToolTip("Save the current repaired landmarks as a review-round CSV.")
+        self.save_review_button.clicked.connect(self.save_review_repair_csv)
+        self.rebuild_review_button = self._make_button("Rebuild Review Round", "primary")
+        self.rebuild_review_button.setToolTip("Save review landmarks and rebuild into a new review output folder.")
+        self.rebuild_review_button.clicked.connect(self.rebuild_review_round)
         self.export_button = self._make_button("Save CSV And Review Build", "secondary")
         self.export_button.setToolTip("Save accepted landmarks as a CSV and switch to the Build settings.")
         self.export_button.clicked.connect(self.export_annotation_csv)
@@ -2509,8 +2528,12 @@ class LaminarBoundaryWindow(QMainWindow):
         action_layout.addWidget(self.skip_slice_button)
         action_layout.addWidget(flip_row)
         action_layout.addWidget(self.clear_slice_button)
+        action_layout.addWidget(self.review_ok_button)
+        action_layout.addWidget(self.save_review_button)
+        action_layout.addWidget(self.rebuild_review_button)
         action_layout.addWidget(self.export_mask_button)
         action_layout.addWidget(self.export_button)
+        self._apply_review_mode_ui(False)
         return action_row
 
     def _create_annotation_status_labels(self) -> None:
@@ -2660,8 +2683,14 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_slice_counts = None
         self.annotation_picking_active = False
         self.annotation_settings_expanded = True
+        self.review_mode_active = False
+        self.review_queue_slices: List[int] = []
+        self.review_checked_slices = set()
+        self.review_source_build_dir: Optional[Path] = None
+        self.review_round_csv_path: Optional[Path] = None
         self._update_annotation_readiness()
         self._update_annotation_review_slice_choices()
+        self._apply_review_mode_ui(False)
 
     def _resolved_existing_input_path(self, text: str) -> Optional[Path]:
         raw = str(text or "").strip()
@@ -2867,6 +2896,13 @@ class LaminarBoundaryWindow(QMainWindow):
             self.load_previous_csv_button,
         ):
             widget.setEnabled(enabled)
+
+    def _apply_review_mode_ui(self, active: bool) -> None:
+        for name in ("review_ok_button", "save_review_button", "rebuild_review_button"):
+            if hasattr(self, name):
+                getattr(self, name).setVisible(active)
+        if hasattr(self, "export_button"):
+            self.export_button.setVisible(not active)
 
     def _path_choices_for_slice(self, slice_index: int) -> Dict[str, str]:
         choices = {"outer_path": "auto", "inner_path": "auto"}
@@ -3101,6 +3137,59 @@ class LaminarBoundaryWindow(QMainWindow):
             return self._read_qc_review_slices(Path(annotate_output).expanduser() / "build")
         return []
 
+    @staticmethod
+    def _manual_qc_flag_slices(output_dir: Path) -> List[int]:
+        benign_flags = {"no_lateral_boundary"}
+        summary_path = output_dir / "tables" / "boundary_summary.csv"
+        flagged = []
+        try:
+            with summary_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    flags = [
+                        flag.strip()
+                        for flag in str(row.get("flags") or "").split(";")
+                        if flag.strip()
+                    ]
+                    has_actionable_flags = any(flag not in benign_flags for flag in flags)
+                    if row.get("source") == "manual" and has_actionable_flags:
+                        flagged.append(int(float(row["slice_index"])))
+        except (OSError, ValueError, KeyError):
+            return []
+        return sorted(set(flagged))
+
+    def _review_queue_from_build(self, output_dir: Path) -> List[int]:
+        uncertain = self._read_qc_review_slices(output_dir)
+        queue = set(self._review_targets_from_ranges(uncertain))
+        queue.update(self._manual_qc_flag_slices(output_dir))
+        return sorted(queue or uncertain)
+
+    @staticmethod
+    def _manual_slices_from_csv(manual_csv: Path) -> List[int]:
+        slices = []
+        try:
+            for row in _core().read_manual_landmarks(manual_csv):
+                slices.append(int(float(row["slice_index"])))
+        except (OSError, ValueError, KeyError):
+            return []
+        return sorted(set(slices))
+
+    @staticmethod
+    def _annotation_output_dir_from_build_dir(build_dir: Path) -> Path:
+        name = build_dir.name.lower()
+        if name == "build" or name.startswith("build_review_round"):
+            return build_dir.parent
+        return build_dir
+
+    @staticmethod
+    def _next_review_round_paths(annotation_output_dir: Path) -> tuple[Path, Path, int]:
+        round_index = 2
+        while True:
+            csv_path = annotation_output_dir / f"manual_landmarks_review_round{round_index}.csv"
+            build_dir = annotation_output_dir / f"build_review_round{round_index}"
+            if not csv_path.exists() and not build_dir.exists():
+                return csv_path, build_dir, round_index
+            round_index += 1
+
     def _build_suggested_annotation_set(self) -> List[int]:
         viable = self._viable_annotation_slices()
         if not viable:
@@ -3297,6 +3386,11 @@ class LaminarBoundaryWindow(QMainWindow):
         if not self._annotation_shortcuts_active():
             return
         if self.accept_annotation_slice(show_success=False):
+            if self.review_mode_active:
+                self.review_checked_slices.add(int(self.annotate_slice.value()))
+                self._update_annotation_progress()
+                self._advance_review_queue()
+                return
             if self._annotation_target_set_complete():
                 self.finish_annotation_and_run_build()
                 return
@@ -3678,6 +3772,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_contours_by_slice.clear()
         self.annotation_boundary_cache.clear()
         self.annotation_reference_contours = []
+        self.review_mode_active = False
+        self.review_queue_slices = []
+        self.review_checked_slices = set()
+        self.review_source_build_dir = None
+        self.review_round_csv_path = None
+        self._apply_review_mode_ui(False)
         self.annotation_preview_request_id += 1
         self.annotate_slice.blockSignals(True)
         self.annotate_slider.blockSignals(True)
@@ -3898,6 +3998,7 @@ class LaminarBoundaryWindow(QMainWindow):
             if warning_text:
                 QMessageBox.warning(self, "Mask loaded with warning", warning_text)
             self.append_log(f"\n{result.message}\n")
+            self._finish_pending_review_after_mask_load(load_data)
         except Exception as exc:
             self._set_status("Failed", "failed")
             self._show_exception_dialog("Load failed", exc)
@@ -4370,6 +4471,28 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         first_slice = self.annotation_region_slices[0]
         last_slice = self.annotation_region_slices[-1]
+        if self.review_mode_active:
+            current_slice = int(self.annotate_slice.value())
+            queue_total = len(self.review_queue_slices)
+            checked = len([slice_index for slice_index in self.review_checked_slices if slice_index in self.review_queue_slices])
+            current_position = 0
+            for index, slice_index in enumerate(self.review_queue_slices, start=1):
+                if slice_index >= current_slice:
+                    current_position = index
+                    break
+            if current_position == 0 and queue_total:
+                current_position = queue_total
+            remaining = max(0, queue_total - checked)
+            self.annotate_progress.setText(
+                f"Review & Repair: {checked}/{queue_total} checked. "
+                f"Remaining: {remaining}. Region range: {first_slice}-{last_slice}."
+            )
+            self.slice_canvas.set_progress_text(
+                f"Review queue: {checked}/{queue_total} checked, remaining {remaining}\n"
+                f"Current review target: {current_position}/{queue_total} (slice {current_slice})\n"
+                f"Source build: {self.review_source_build_dir or 'current build'}"
+            )
+            return
         target = self._recommended_annotation_count()
         remaining = max(0, target - accepted)
         current_slice = int(self.annotate_slice.value())
@@ -4446,6 +4569,72 @@ class LaminarBoundaryWindow(QMainWindow):
         self.refresh_annotation_preview()
         self._autosave_annotation_rows()
 
+    def _load_annotation_rows_from_csv(
+        self,
+        csv_path: Path,
+        output_dir: Optional[Path] = None,
+        show_message: bool = True,
+        sync_build: bool = True,
+    ) -> tuple[int, List[str]]:
+        rows = _core().read_manual_landmarks(csv_path)
+        loaded_rows: Dict[int, Dict[str, str]] = {}
+        loaded_landmarks: Dict[int, Dict[str, int]] = {}
+        loaded_paths: Dict[int, Dict[str, str]] = {}
+        errors = []
+        for row in rows:
+            try:
+                slice_index, loaded_row, landmarks = self._loaded_annotation_row(row)
+            except Exception as exc:
+                errors.append(f"slice {row.get('slice_index', '?')}: {exc}")
+                continue
+            loaded_rows[slice_index] = loaded_row
+            loaded_landmarks[slice_index] = landmarks
+            loaded_paths[slice_index] = {
+                "outer_path": loaded_row["outer_path"],
+                "inner_path": loaded_row["inner_path"],
+            }
+
+        if not loaded_rows:
+            detail = "\n".join(errors[:8])
+            raise ValueError("No usable annotation rows were loaded." + (f"\n{detail}" if detail else ""))
+
+        self.annotation_rows = loaded_rows
+        self.annotation_landmarks_by_slice = loaded_landmarks
+        self.annotation_path_choices_by_slice = loaded_paths
+        self.annotation_skipped_slices.clear()
+        self.annotation_boundary_cache.clear()
+        self.annotation_target_slices = sorted(loaded_rows)
+        self.annotate_previous_csv.set_text(csv_path)
+        if output_dir is None:
+            output_dir = Path(self.annotate_output.text()).expanduser() if self.annotate_output.text().strip() else csv_path.parent
+        if not self.annotate_output.text().strip():
+            self.annotate_output.set_text(output_dir)
+        if sync_build:
+            self._sync_build_from_annotation(csv_path, output_dir)
+
+        first_slice = self.annotation_target_slices[0]
+        current_slice = int(self.annotate_slice.value())
+        target = current_slice if current_slice in loaded_rows else first_slice
+        self.annotate_slice.setValue(target)
+        self.refresh_annotation_slice()
+        self.enter_annotation_picking_mode()
+        autosave_path = self._autosave_annotation_rows()
+
+        message = f"Loaded {len(loaded_rows)} annotation slices from:\n{csv_path}"
+        if errors:
+            message += f"\n\nSkipped {len(errors)} rows. See Log > View Current Log for details."
+            self.append_log("Previous CSV load skipped rows:\n" + "\n".join(errors) + "\n")
+        if autosave_path is not None:
+            message += f"\n\nAutosaved editable copy:\n{autosave_path}"
+        self.annotate_status.setText(
+            f"Loaded {len(loaded_rows)} previous annotation slices. "
+            "Use arrows/history or the slice control to edit selected slices."
+        )
+        self.append_log(f"Loaded previous manual CSV: {csv_path}\n")
+        if show_message:
+            QMessageBox.information(self, "Previous CSV loaded", message)
+        return len(loaded_rows), errors
+
     def load_previous_annotation_csv(self) -> None:
         if self.annotation_mask_data is None:
             QMessageBox.warning(
@@ -4457,59 +4646,7 @@ class LaminarBoundaryWindow(QMainWindow):
 
         try:
             csv_path = self._require_path("Previous CSV", self.annotate_previous_csv.text())
-            rows = _core().read_manual_landmarks(csv_path)
-            loaded_rows: Dict[int, Dict[str, str]] = {}
-            loaded_landmarks: Dict[int, Dict[str, int]] = {}
-            loaded_paths: Dict[int, Dict[str, str]] = {}
-            errors = []
-            for row in rows:
-                try:
-                    slice_index, loaded_row, landmarks = self._loaded_annotation_row(row)
-                except Exception as exc:
-                    errors.append(f"slice {row.get('slice_index', '?')}: {exc}")
-                    continue
-                loaded_rows[slice_index] = loaded_row
-                loaded_landmarks[slice_index] = landmarks
-                loaded_paths[slice_index] = {
-                    "outer_path": loaded_row["outer_path"],
-                    "inner_path": loaded_row["inner_path"],
-                }
-
-            if not loaded_rows:
-                detail = "\n".join(errors[:8])
-                raise ValueError("No usable annotation rows were loaded." + (f"\n{detail}" if detail else ""))
-
-            self.annotation_rows = loaded_rows
-            self.annotation_landmarks_by_slice = loaded_landmarks
-            self.annotation_path_choices_by_slice = loaded_paths
-            self.annotation_skipped_slices.clear()
-            self.annotation_boundary_cache.clear()
-            self.annotation_target_slices = sorted(loaded_rows)
-            self.annotate_previous_csv.set_text(csv_path)
-            if not self.annotate_output.text().strip():
-                self.annotate_output.set_text(csv_path.parent)
-            output_dir = Path(self.annotate_output.text()).expanduser()
-            self._sync_build_from_annotation(csv_path, output_dir)
-            first_slice = self.annotation_target_slices[0]
-            current_slice = int(self.annotate_slice.value())
-            target = current_slice if current_slice in loaded_rows else first_slice
-            self.annotate_slice.setValue(target)
-            self.refresh_annotation_slice()
-            self.enter_annotation_picking_mode()
-            autosave_path = self._autosave_annotation_rows()
-
-            message = f"Loaded {len(loaded_rows)} annotation slices from:\n{csv_path}"
-            if errors:
-                message += f"\n\nSkipped {len(errors)} rows. See Log > View Current Log for details."
-                self.append_log("Previous CSV load skipped rows:\n" + "\n".join(errors) + "\n")
-            if autosave_path is not None:
-                message += f"\n\nAutosaved editable copy:\n{autosave_path}"
-            self.annotate_status.setText(
-                f"Loaded {len(loaded_rows)} previous annotation slices. "
-                "Use arrows/history or the slice control to edit selected slices."
-            )
-            self.append_log(f"Loaded previous manual CSV: {csv_path}\n")
-            QMessageBox.information(self, "Previous CSV loaded", message)
+            self._load_annotation_rows_from_csv(csv_path, show_message=True)
         except Exception as exc:
             self._show_exception_dialog("Load previous CSV failed", exc)
 
@@ -4585,9 +4722,37 @@ class LaminarBoundaryWindow(QMainWindow):
         except Exception as exc:
             self._show_exception_dialog("Export mask failed", exc)
 
+    def _ensure_persistent_annotation_mask(self, annotation_output_dir: Path) -> Optional[Path]:
+        mask_path = self.annotation_mask_path
+        if mask_path is None:
+            current_mask = self._resolved_existing_input_path(self.annotate_mask.text())
+            return current_mask
+        if not self.annotation_mask_is_temporary:
+            return mask_path
+
+        output_dir = Path(annotation_output_dir).expanduser()
+        export_path = output_dir / "inputs" / "target_mask.npy"
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if mask_path.exists() and not self._same_path(mask_path, export_path):
+                shutil.copy2(mask_path, export_path)
+            elif not self._same_path(mask_path, export_path):
+                core = _core()
+                np = _numpy()
+                core.save_volume(export_path, np.asarray(self.annotation_mask_data, dtype=np.uint8))
+        except Exception as exc:
+            raise RuntimeError(f"Could not persist temporary mask to:\n{export_path}\n\n{exc}") from exc
+
+        self.annotation_mask_path = export_path
+        self.annotation_mask_is_temporary = False
+        self.annotate_mask.set_text(export_path)
+        self.append_log(f"Persisted temporary mask for review/build: {export_path}\n")
+        return export_path
+
     def _sync_build_from_annotation(self, csv_path: Path, annotation_output_dir: Path) -> None:
+        mask_path = self._ensure_persistent_annotation_mask(annotation_output_dir)
         self.build_manual.set_text(csv_path)
-        self.build_mask.set_text(self.annotation_mask_path or self.annotate_mask.text())
+        self.build_mask.set_text(mask_path or self.annotate_mask.text())
         self.build_template.set_text(self.annotate_template.text())
         self.build_output.set_text(annotation_output_dir / "build")
         self.build_boundaries.set_text(annotation_output_dir / "build" / "boundary_annotations.json")
@@ -4839,6 +5004,9 @@ class LaminarBoundaryWindow(QMainWindow):
             self.surface_button.setEnabled(surface_ready)
         if hasattr(self, "depth_button"):
             self.depth_button.setEnabled(depth_ready)
+        if hasattr(self, "review_qc_button"):
+            review_ready = surface_ready and bool(output_text) and Path(output_text).expanduser().exists()
+            self.review_qc_button.setEnabled(review_ready)
 
     def _make_build_optional_section(self) -> QGroupBox:
         optional_box, optional_form = self._make_form_section("Optional Measurements")
@@ -4890,7 +5058,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.open_build_output_button = self._make_button("Open Output Folder", "secondary")
         self.open_build_output_button.clicked.connect(self.open_build_output_folder)
         self.open_build_output_button.setEnabled(False)
-        self.review_qc_button = self._make_button("Back To Annotate Review", "secondary")
+        self.review_qc_button = self._make_button("Review And Repair Build", "secondary")
         self.review_qc_button.clicked.connect(self.review_build_qc_slices)
         self.review_qc_button.setEnabled(False)
 
@@ -4904,6 +5072,7 @@ class LaminarBoundaryWindow(QMainWindow):
 
         result_form.addRow("Summary", self.build_result_label)
         result_form.addRow("", result_buttons)
+        self._update_build_readiness()
         return result_box
 
     def open_build_output_folder(self) -> None:
@@ -4922,41 +5091,194 @@ class LaminarBoundaryWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_dir)))
 
     def review_build_qc_slices(self) -> None:
-        review_slices = self._current_qc_review_slices()
-        if not review_slices:
+        output_text = self.build_output.text().strip()
+        if not output_text:
+            QMessageBox.information(self, "No build output", "Run a build before starting review.")
+            return
+        build_output_dir = Path(output_text).expanduser()
+        if not build_output_dir.exists():
             QMessageBox.information(
                 self,
-                "No QC review slices",
-                "No uncertain slices were found in the current build.",
+                "Build output missing",
+                f"Folder does not exist yet:\n{build_output_dir}",
             )
             return
 
-        targets = self._review_targets_from_ranges(review_slices)
+        mask_path = self._resolved_existing_input_path(self.build_mask.text())
+        manual_csv = self._resolved_existing_input_path(self.build_manual.text())
+        if mask_path is None or manual_csv is None:
+            QMessageBox.warning(
+                self,
+                "Review inputs missing",
+                "Build review needs an existing Mask and Manual CSV.",
+            )
+            return
+
+        queue_slices = self._review_queue_from_build(build_output_dir)
+        if queue_slices:
+            self.append_log(
+                "Review & Repair queue uses QC targets: "
+                + ", ".join(str(value) for value in queue_slices)
+                + "\n"
+            )
+        else:
+            queue_slices = self._manual_slices_from_csv(manual_csv)
+            if queue_slices:
+                self.append_log(
+                    "Review & Repair found no QC targets; reviewing manual CSV slices: "
+                    + ", ".join(str(value) for value in queue_slices)
+                    + "\n"
+                )
+        if not queue_slices:
+            QMessageBox.information(
+                self,
+                "No review slices",
+                "No QC targets or manual annotation slices were found for this build.",
+            )
+            return
+
+        request = ReviewRepairRequest(
+            mask_path=mask_path,
+            manual_csv=manual_csv,
+            build_output_dir=build_output_dir,
+            queue_slices=queue_slices,
+        )
+        if self.annotation_mask_data is not None and self.annotation_mask_path is not None:
+            try:
+                if self._same_path(self.annotation_mask_path, mask_path):
+                    self._finish_review_repair_start(request)
+                    return
+            except OSError:
+                pass
+
+        self.pending_review_request = request
+        self.annotate_mask.set_text(mask_path)
         self.tabs.setCurrentIndex(0)
-        if self.annotation_mask_data is None:
-            self.annotate_status.setText(
-                "QC review slices are available. Load the same mask, "
-                "then load the saved Manual CSV to revise them."
-            )
-            self.annotate_progress.setText(
-                "Suggested QC review targets: " + ", ".join(str(value) for value in targets)
-            )
-            return
+        self.start_annotation_mask_load(mask_path)
 
-        region_targets = [
-            slice_index for slice_index in targets if slice_index in self.annotation_region_slices
-        ]
-        self.annotation_target_slices = region_targets or targets
-        if self.annotation_target_slices:
-            self.annotate_slice.setValue(self.annotation_target_slices[0])
+    def _finish_review_repair_start(self, request: ReviewRepairRequest) -> None:
+        annotation_output_dir = self._annotation_output_dir_from_build_dir(request.build_output_dir)
+        loaded_count, errors = self._load_annotation_rows_from_csv(
+            request.manual_csv,
+            output_dir=annotation_output_dir,
+            show_message=False,
+            sync_build=False,
+        )
+        self.review_mode_active = True
+        self.review_source_build_dir = request.build_output_dir
+        self.review_queue_slices = [
+            slice_index for slice_index in request.queue_slices if slice_index in self.annotation_region_slices
+        ] or list(request.queue_slices)
+        self.review_checked_slices = set()
+        self.review_round_csv_path = None
+        self.annotation_target_slices = list(self.review_queue_slices)
+        self.build_mask.set_text(request.mask_path)
+        self.build_manual.set_text(request.manual_csv)
+        self.build_output.set_text(request.build_output_dir)
+        self.build_boundaries.set_text(request.build_output_dir / "boundary_annotations.json")
+        self._apply_review_mode_ui(True)
+        self.tabs.setCurrentIndex(0)
+        if self.review_queue_slices:
+            self.annotate_slice.setValue(self.review_queue_slices[0])
         if not self.annotation_picking_active:
             self.enter_annotation_picking_mode()
         self._update_annotation_progress()
+        skipped_text = f" {len(errors)} rows skipped." if errors else ""
         self.annotate_status.setText(
-            "QC review mode: check suggested slices "
-            + ", ".join(str(value) for value in self.annotation_target_slices)
-            + "."
+            f"Review & Repair loaded {loaded_count} manual slices.{skipped_text} "
+            f"Queue: {len(self.review_queue_slices)} target slices."
         )
+        self.append_log(
+            "Review & Repair started.\n"
+            f"source_build: {request.build_output_dir}\n"
+            f"manual_csv: {request.manual_csv}\n"
+            f"queue_slices: {', '.join(str(value) for value in self.review_queue_slices)}\n"
+        )
+
+    def _advance_review_queue(self) -> None:
+        if not self.review_queue_slices:
+            self.annotate_status.setText("Review queue is empty.")
+            return
+        current = int(self.annotate_slice.value())
+        for slice_index in self.review_queue_slices:
+            if slice_index > current and slice_index not in self.review_checked_slices:
+                self.annotate_slice.setValue(slice_index)
+                self.slice_canvas.setFocus(Qt.OtherFocusReason)
+                return
+        for slice_index in self.review_queue_slices:
+            if slice_index not in self.review_checked_slices:
+                self.annotate_slice.setValue(slice_index)
+                self.slice_canvas.setFocus(Qt.OtherFocusReason)
+                return
+        self.annotate_status.setText(
+            "Review queue complete. Save Review CSV or run Rebuild Review Round."
+        )
+        self._update_annotation_progress()
+
+    def mark_review_slice_ok(self) -> None:
+        if not self.review_mode_active:
+            return
+        slice_index = int(self.annotate_slice.value())
+        self.review_checked_slices.add(slice_index)
+        self._update_annotation_progress()
+        self.append_log(f"Review slice marked OK: {slice_index}\n")
+        self._advance_review_queue()
+
+    def save_review_repair_csv(self) -> Optional[Path]:
+        if not self.review_mode_active:
+            QMessageBox.information(self, "Not in review mode", "Start Review And Repair from a build first.")
+            return None
+        if not self.annotation_rows:
+            QMessageBox.warning(self, "No annotations", "No annotation rows are loaded.")
+            return None
+
+        source_build = self.review_source_build_dir or Path(self.build_output.text()).expanduser()
+        annotation_output_dir = self._annotation_output_dir_from_build_dir(source_build)
+        if self.review_round_csv_path is None:
+            csv_path, _build_dir, _round_index = self._next_review_round_paths(annotation_output_dir)
+            self.review_round_csv_path = csv_path
+        self._write_annotation_rows_csv(self.review_round_csv_path)
+        self.annotate_previous_csv.set_text(self.review_round_csv_path)
+        self.build_manual.set_text(self.review_round_csv_path)
+        self.append_log(f"Saved review repair CSV: {self.review_round_csv_path}\n")
+        self.annotate_status.setText(f"Saved review CSV: {self.review_round_csv_path}")
+        return self.review_round_csv_path
+
+    def rebuild_review_round(self) -> None:
+        csv_path = self.save_review_repair_csv()
+        if csv_path is None:
+            return
+        source_build = self.review_source_build_dir or Path(self.build_output.text()).expanduser()
+        annotation_output_dir = self._annotation_output_dir_from_build_dir(source_build)
+        _csv_path, build_dir, round_index = self._next_review_round_paths(annotation_output_dir)
+        if self.review_round_csv_path is not None:
+            stem = self.review_round_csv_path.stem
+            match = re.search(r"round(\d+)$", stem)
+            if match:
+                round_index = int(match.group(1))
+                build_dir = annotation_output_dir / f"build_review_round{round_index}"
+        self.build_manual.set_text(csv_path)
+        self.build_output.set_text(build_dir)
+        self.build_boundaries.set_text(build_dir / "boundary_annotations.json")
+        self.tabs.setCurrentIndex(1)
+        self.append_log(f"Review round {round_index} rebuild started: {build_dir}\n")
+        self.run_surface_build()
+
+    def _finish_pending_review_after_mask_load(self, load_data: AnnotationLoadData) -> None:
+        request = self.pending_review_request
+        if request is None:
+            return
+        try:
+            if not self._same_path(load_data.mask_path, request.mask_path):
+                return
+        except OSError:
+            return
+        self.pending_review_request = None
+        try:
+            self._finish_review_repair_start(request)
+        except Exception as exc:
+            self._show_exception_dialog("Review setup failed", exc)
+            return
 
     def _update_build_result_from_task(self, result: TaskResult) -> None:
         if not hasattr(self, "build_result_label"):
