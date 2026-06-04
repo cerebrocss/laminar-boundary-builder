@@ -3236,15 +3236,38 @@ class LaminarBoundaryWindow(QMainWindow):
             return []
         return sorted(set(review_slices))
 
+    @staticmethod
+    def _read_surface_jump_slices(output_dir: Path) -> List[int]:
+        jump_path = output_dir / "qc" / "surface_jump_diagnostics.csv"
+        if not jump_path.exists():
+            return []
+        review_slices = []
+        try:
+            with jump_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    if not str(row.get("flags") or "").strip():
+                        continue
+                    review_slices.append(int(float(row["left_slice"])))
+                    review_slices.append(int(float(row["right_slice"])))
+        except (OSError, ValueError, KeyError):
+            return []
+        return sorted(set(review_slices))
+
+    @classmethod
+    def _read_build_review_slices(cls, output_dir: Path) -> List[int]:
+        review_slices = set(cls._read_qc_review_slices(output_dir))
+        review_slices.update(cls._read_surface_jump_slices(output_dir))
+        return sorted(review_slices)
+
     def _current_qc_review_slices(self) -> List[int]:
         output_text = ""
         if hasattr(self, "build_output"):
             output_text = self.build_output.text().strip()
         if output_text:
-            return self._read_qc_review_slices(Path(output_text).expanduser())
+            return self._read_build_review_slices(Path(output_text).expanduser())
         annotate_output = self.annotate_output.text().strip() if hasattr(self, "annotate_output") else ""
         if annotate_output:
-            return self._read_qc_review_slices(Path(annotate_output).expanduser() / "build")
+            return self._read_build_review_slices(Path(annotate_output).expanduser() / "build")
         return []
 
     @staticmethod
@@ -3268,10 +3291,10 @@ class LaminarBoundaryWindow(QMainWindow):
         return sorted(set(flagged))
 
     def _review_queue_from_build(self, output_dir: Path) -> List[int]:
-        uncertain = self._read_qc_review_slices(output_dir)
-        queue = set(self._review_targets_from_ranges(uncertain))
+        review_slices = self._read_build_review_slices(output_dir)
+        queue = set(self._review_targets_from_ranges(review_slices))
         queue.update(self._manual_qc_flag_slices(output_dir))
-        return sorted(queue or uncertain)
+        return sorted(queue or review_slices)
 
     @staticmethod
     def _manual_slices_from_csv(manual_csv: Path) -> List[int]:
@@ -5419,7 +5442,16 @@ class LaminarBoundaryWindow(QMainWindow):
         qc_lines = [
             line
             for line in lines
-            if line.startswith(("QC:", "QC review needed", "Uncertain ranges", "Suggested re-annotation"))
+            if line.startswith(
+                (
+                    "QC:",
+                    "QC review needed",
+                    "Uncertain ranges",
+                    "Suggested re-annotation",
+                    "Surface topology jumps",
+                    "Suggested topology review",
+                )
+            )
         ]
         summary_lines.extend(qc_lines)
         self.build_result_label.setText("\n".join(summary_lines))
@@ -5661,13 +5693,9 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _surface_qc_summary(self, output_dir: Path) -> str:
         review_slices = self._read_qc_review_slices(output_dir)
-        if not review_slices:
+        jump_slices = self._read_surface_jump_slices(output_dir)
+        if not review_slices and not jump_slices:
             return "QC: no uncertain propagated slices."
-        ranges = ", ".join(
-            str(start) if start == end else f"{start}-{end}"
-            for start, end in self._slice_ranges(review_slices)
-        )
-        targets = ", ".join(str(value) for value in self._review_targets_from_ranges(review_slices))
 
         manual_bad = []
         benign_flags = {"no_lateral_boundary"}
@@ -5686,11 +5714,35 @@ class LaminarBoundaryWindow(QMainWindow):
         except (OSError, ValueError, KeyError):
             manual_bad = []
 
-        lines = [
-            f"QC review needed: {len(review_slices)} uncertain propagated slices.",
-            f"Uncertain ranges: {ranges}",
-            f"Suggested re-annotation targets: {targets}",
-        ]
+        lines = []
+        if review_slices:
+            ranges = ", ".join(
+                str(start) if start == end else f"{start}-{end}"
+                for start, end in self._slice_ranges(review_slices)
+            )
+            targets = ", ".join(str(value) for value in self._review_targets_from_ranges(review_slices))
+            lines.extend(
+                [
+                    f"QC review needed: {len(review_slices)} uncertain propagated slices.",
+                    f"Uncertain ranges: {ranges}",
+                    f"Suggested re-annotation targets: {targets}",
+                ]
+            )
+        else:
+            lines.append("QC review needed: surface topology jumps detected.")
+
+        if jump_slices:
+            jump_ranges = ", ".join(
+                str(start) if start == end else f"{start}-{end}"
+                for start, end in self._slice_ranges(jump_slices)
+            )
+            jump_targets = ", ".join(str(value) for value in self._review_targets_from_ranges(jump_slices))
+            lines.extend(
+                [
+                    f"Surface topology jumps: {jump_ranges}",
+                    f"Suggested topology review targets: {jump_targets}",
+                ]
+            )
         if manual_bad:
             lines.append(
                 "Manual slices with QC flags: "

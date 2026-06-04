@@ -1623,7 +1623,15 @@ def propagate_boundaries(
         left_mode = normalize_surface_mode(left.surface_mode)
         right_mode = normalize_surface_mode(right.surface_mode)
         if left_mode != SURFACE_MODE_NORMAL or right_mode != SURFACE_MODE_NORMAL:
+            single_surface_mode = None
             if left_mode == right_mode and left_mode != SURFACE_MODE_NORMAL:
+                single_surface_mode = left_mode
+            elif left_mode == SURFACE_MODE_NORMAL and right_mode != SURFACE_MODE_NORMAL:
+                single_surface_mode = right_mode
+            elif left_mode != SURFACE_MODE_NORMAL and right_mode == SURFACE_MODE_NORMAL:
+                single_surface_mode = left_mode
+
+            if single_surface_mode is not None:
                 for slice_index in range(left.slice_index + 1, right.slice_index):
                     candidates = by_slice.get(slice_index, [])
                     if not candidates:
@@ -1631,7 +1639,7 @@ def propagate_boundaries(
                     contour = max(candidates, key=lambda item: item.area)
                     output[slice_index] = make_whole_contour_boundary(
                         contour,
-                        surface_mode=left_mode,
+                        surface_mode=single_surface_mode,
                         resample_points=resample_points,
                         source="auto",
                     )
@@ -1719,7 +1727,7 @@ def loft_surface(
     resample_points: int = 80,
     lateral_index: int = 0,
 ) -> SurfaceMesh:
-    curves: List[np.ndarray] = []
+    entries: List[Tuple[BoundarySlice, np.ndarray, bool]] = []
     for boundary in sorted(boundaries, key=lambda item: item.slice_index):
         if arc_name == "outer":
             curve = boundary.outer_arc
@@ -1733,39 +1741,117 @@ def loft_surface(
             raise ValueError(f"Unknown arc name: {arc_name}")
         if len(curve) < 2:
             continue
-        curves.append(resample_polyline(curve, resample_points))
+        is_closed = _is_closed_polyline(curve)
+        if is_closed:
+            # Keep resample_points unique vertices for closed rings. The stored
+            # boundary keeps first == last, but surface topology should wrap
+            # around instead of carrying a duplicate seam column.
+            sampled = resample_polyline(curve, resample_points + 1)[:-1]
+        else:
+            sampled = resample_polyline(curve, resample_points)
+        entries.append((boundary, sampled, is_closed))
 
-    if len(curves) < 2:
+    if len(entries) < 2:
         raise ValueError(f"Need at least two curves to build {arc_name} surface")
-    for index, curve in enumerate(curves):
-        if not _is_closed_polyline(curve):
-            continue
-        target = None
-        if index > 0:
-            target = curves[index - 1][0]
-        elif len(curves) > 1:
-            target = curves[index + 1][0]
-        if target is not None:
-            curves[index] = resample_polyline(
-                _align_closed_polyline_start(curve, target),
-                resample_points,
-            )
 
-    vertices = np.vstack(curves).astype(float)
+    segments: List[List[Tuple[BoundarySlice, np.ndarray, bool]]] = []
+    current: List[Tuple[BoundarySlice, np.ndarray, bool]] = []
+    for entry in entries:
+        if not current:
+            current = [entry]
+            continue
+        compatible, aligned_entry = _compatible_loft_entry(current[-1], entry)
+        if compatible:
+            current.append(aligned_entry)
+        else:
+            segments.append(current)
+            current = [entry]
+    if current:
+        segments.append(current)
+
+    vertices_parts: List[np.ndarray] = []
     faces: List[List[int]] = []
-    n_curves = len(curves)
-    for curve_index in range(n_curves - 1):
-        base = curve_index * resample_points
-        next_base = (curve_index + 1) * resample_points
-        for point_index in range(resample_points - 1):
-            a = base + point_index
-            b = base + point_index + 1
-            c = next_base + point_index
-            d = next_base + point_index + 1
-            faces.append([a, c, b])
-            faces.append([b, c, d])
+    vertex_offset = 0
+    for segment in segments:
+        if len(segment) < 2:
+            continue
+        curves = [entry[1] for entry in segment]
+        is_closed = segment[0][2]
+        points_per_curve = len(curves[0])
+        if any(len(curve) != points_per_curve for curve in curves):
+            continue
+
+        vertices_parts.append(np.vstack(curves).astype(float))
+        for curve_index in range(len(curves) - 1):
+            base = vertex_offset + curve_index * points_per_curve
+            next_base = vertex_offset + (curve_index + 1) * points_per_curve
+            point_range = range(points_per_curve if is_closed else points_per_curve - 1)
+            for point_index in point_range:
+                next_point = (point_index + 1) % points_per_curve
+                a = base + point_index
+                b = base + next_point
+                c = next_base + point_index
+                d = next_base + next_point
+                faces.append([a, c, b])
+                faces.append([b, c, d])
+        vertex_offset += points_per_curve * len(curves)
+
+    if not vertices_parts or not faces:
+        raise ValueError(f"Need at least two compatible curves to build {arc_name} surface")
+
+    vertices = np.vstack(vertices_parts).astype(float)
 
     return SurfaceMesh(name=arc_name, vertices=vertices, faces=np.asarray(faces, dtype=np.int32))
+
+
+def _compatible_loft_entry(
+    left: Tuple[BoundarySlice, np.ndarray, bool],
+    right: Tuple[BoundarySlice, np.ndarray, bool],
+) -> Tuple[bool, Tuple[BoundarySlice, np.ndarray, bool]]:
+    left_boundary, left_curve, left_closed = left
+    right_boundary, right_curve, right_closed = right
+
+    if left_closed != right_closed:
+        return False, right
+    if right_boundary.slice_index - left_boundary.slice_index > 1:
+        return False, right
+    left_mode = normalize_surface_mode(left_boundary.surface_mode)
+    right_mode = normalize_surface_mode(right_boundary.surface_mode)
+    if left_mode != right_mode:
+        return False, right
+
+    aligned_curve = _align_loft_curve(left_curve, right_curve, left_closed)
+    mean_jump = _mean_curve_distance(left_curve, aligned_curve)
+    centroid_jump = float(np.linalg.norm(left_curve.mean(axis=0) - aligned_curve.mean(axis=0)))
+    scale = max(1.0, min(_polyline_length(left_curve), _polyline_length(aligned_curve)))
+    jump_limit = max(30.0, 0.25 * scale)
+    centroid_limit = max(25.0, 0.18 * scale)
+    if mean_jump > jump_limit and centroid_jump > centroid_limit:
+        return False, right
+
+    return True, (right_boundary, aligned_curve, right_closed)
+
+
+def _align_loft_curve(left_curve: np.ndarray, right_curve: np.ndarray, is_closed: bool) -> np.ndarray:
+    if is_closed:
+        closed = _closed_contour_points(right_curve)
+        aligned = _align_closed_polyline_start(closed, left_curve[0])
+        return resample_polyline(aligned, len(right_curve) + 1)[:-1]
+
+    same = _mean_curve_distance(left_curve, right_curve)
+    reversed_curve = right_curve[::-1]
+    reversed_mean = _mean_curve_distance(left_curve, reversed_curve)
+    if reversed_mean < same * 0.5:
+        return reversed_curve
+    return right_curve
+
+
+def _mean_curve_distance(left_curve: np.ndarray, right_curve: np.ndarray) -> float:
+    if len(left_curve) != len(right_curve):
+        count = min(len(left_curve), len(right_curve))
+        left_curve = resample_polyline(left_curve, count)
+        right_curve = resample_polyline(right_curve, count)
+    return float(np.linalg.norm(left_curve - right_curve, axis=1).mean())
 
 
 def write_ply(path: str | Path, mesh: SurfaceMesh) -> None:
@@ -2208,6 +2294,29 @@ def write_qc_tables(boundaries: Sequence[BoundarySlice], output_dir: str | Path)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_rows = [boundary.to_summary_row() for boundary in boundaries]
     _write_csv_rows(output_dir / "qc_surface_distance.csv", summary_rows)
+    jump_rows = surface_jump_diagnostics(boundaries)
+    if jump_rows:
+        _write_csv_rows(
+            output_dir / "surface_jump_diagnostics.csv",
+            jump_rows,
+            fieldnames=[
+                "arc",
+                "left_slice",
+                "right_slice",
+                "slice_gap",
+                "left_mode",
+                "right_mode",
+                "left_source",
+                "right_source",
+                "mean_point_jump",
+                "max_point_jump",
+                "centroid_jump",
+                "mean_reversed_jump",
+                "left_first_last_distance",
+                "right_first_last_distance",
+                "flags",
+            ],
+        )
 
     benign_flags = {
         "no_lateral_boundary",
@@ -2229,6 +2338,57 @@ def write_qc_tables(boundaries: Sequence[BoundarySlice], output_dir: str | Path)
         if float(row.get("confidence") or 0.0) < 0.6 or has_actionable_flags(row)
     ]
     _write_csv_rows(output_dir / "qc_uncertain_slices.csv", uncertain_rows)
+
+
+def surface_jump_diagnostics(boundaries: Sequence[BoundarySlice]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for arc_name in ("outer", "inner"):
+        entries = []
+        for boundary in sorted(boundaries, key=lambda item: item.slice_index):
+            curve = boundary.outer_arc if arc_name == "outer" else boundary.inner_arc
+            if len(curve) >= 2:
+                entries.append((boundary, np.asarray(curve, dtype=float)))
+
+        for (left_boundary, left_curve), (right_boundary, right_curve) in zip(entries[:-1], entries[1:]):
+            count = min(len(left_curve), len(right_curve))
+            if count < 2:
+                continue
+            left_curve = resample_polyline(left_curve, count)
+            right_curve = resample_polyline(right_curve, count)
+            point_distances = np.linalg.norm(left_curve - right_curve, axis=1)
+            reversed_distances = np.linalg.norm(left_curve - right_curve[::-1], axis=1)
+            centroid_jump = float(np.linalg.norm(left_curve.mean(axis=0) - right_curve.mean(axis=0)))
+            slice_gap = int(right_boundary.slice_index - left_boundary.slice_index)
+            flags = []
+            if float(point_distances.mean()) > 30.0 and centroid_jump > 25.0:
+                flags.append("large_curve_jump")
+            if slice_gap > 1:
+                flags.append("slice_gap")
+            if normalize_surface_mode(left_boundary.surface_mode) != normalize_surface_mode(right_boundary.surface_mode):
+                flags.append("mode_change")
+            if _is_closed_polyline(left_curve) != _is_closed_polyline(right_curve):
+                flags.append("open_closed_change")
+
+            rows.append(
+                {
+                    "arc": arc_name,
+                    "left_slice": int(left_boundary.slice_index),
+                    "right_slice": int(right_boundary.slice_index),
+                    "slice_gap": slice_gap,
+                    "left_mode": normalize_surface_mode(left_boundary.surface_mode),
+                    "right_mode": normalize_surface_mode(right_boundary.surface_mode),
+                    "left_source": left_boundary.source,
+                    "right_source": right_boundary.source,
+                    "mean_point_jump": round(float(point_distances.mean()), 4),
+                    "max_point_jump": round(float(point_distances.max()), 4),
+                    "centroid_jump": round(centroid_jump, 4),
+                    "mean_reversed_jump": round(float(reversed_distances.mean()), 4),
+                    "left_first_last_distance": round(float(np.linalg.norm(left_curve[0] - left_curve[-1])), 4),
+                    "right_first_last_distance": round(float(np.linalg.norm(right_curve[0] - right_curve[-1])), 4),
+                    "flags": ";".join(flags),
+                }
+            )
+    return rows
 
 
 def _image_to_uint8(image: np.ndarray) -> np.ndarray:
