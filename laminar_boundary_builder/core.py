@@ -24,7 +24,6 @@ import os
 import pickle
 import re
 import sys
-import urllib.request
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -51,15 +50,6 @@ SURFACE_MODES = {
     SURFACE_MODE_OUTER_ONLY,
     SURFACE_MODE_INNER_ONLY,
 }
-
-ALLEN_ENT_MASK_FILENAME = "structure_909.nrrd"
-BUILTIN_ENT_MASK_FILENAME = "ENT_official_structure_909_10um_mask.nrrd"
-ALLEN_ENT_MASK_URL = (
-    "https://download.alleninstitute.org/informatics-archive/current-release/"
-    "mouse_ccf/annotation/ccf_2017/structure_masks/structure_masks_10/"
-    "structure_909.nrrd"
-)
-
 
 def normalize_surface_mode(value: Optional[str]) -> str:
     mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
@@ -499,137 +489,6 @@ def _default_annotation_candidates() -> List[Path]:
             ]
         )
     return candidates
-
-
-def mask_cache_dir() -> Path:
-    env_value = os.environ.get("LAMINAR_BOUNDARY_MASK_CACHE_DIR")
-    if env_value:
-        return Path(env_value).expanduser()
-
-    app_name = "Laminar Boundary Builder"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / app_name / "masks"
-    if os.name == "nt":
-        root = Path(os.environ.get("APPDATA", Path.home()))
-        return root / app_name / "masks"
-    root = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return root / app_name / "masks"
-
-
-def allen_ent_mask_cache_dir() -> Path:
-    return mask_cache_dir() / "allen" / "ccf_2017" / "10um"
-
-
-def allen_ent_mask_cache_path() -> Path:
-    return allen_ent_mask_cache_dir() / ALLEN_ENT_MASK_FILENAME
-
-
-def format_bytes(size: int) -> str:
-    value = float(max(0, size))
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024 or unit == "GB":
-            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
-        value /= 1024
-    return f"{value:.1f} GB"
-
-
-def directory_size(path: str | Path) -> int:
-    root = Path(path).expanduser()
-    if not root.exists():
-        return 0
-    total = 0
-    for item in root.rglob("*"):
-        try:
-            if item.is_file():
-                total += item.stat().st_size
-        except OSError:
-            continue
-    return total
-
-
-def download_allen_ent_mask(progress: Optional[Callable[[str], None]] = None) -> Path:
-    cache_path = allen_ent_mask_cache_path()
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = cache_path.with_name(cache_path.name + ".download")
-    request = urllib.request.Request(
-        ALLEN_ENT_MASK_URL,
-        headers={"User-Agent": "LaminarBoundaryBuilder/0.1"},
-    )
-
-    try:
-        if progress:
-            progress(f"Downloading Allen ENT mask from {ALLEN_ENT_MASK_URL}")
-        with urllib.request.urlopen(request, timeout=120) as response:
-            total_text = response.headers.get("Content-Length", "")
-            total_size = int(total_text) if total_text.isdigit() else 0
-            downloaded = 0
-            with temp_path.open("wb") as handle:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-                    downloaded += len(chunk)
-                    if progress:
-                        if total_size:
-                            progress(f"Downloaded {format_bytes(downloaded)} of {format_bytes(total_size)}")
-                        else:
-                            progress(f"Downloaded {format_bytes(downloaded)}")
-        if temp_path.stat().st_size == 0:
-            raise RuntimeError("Allen ENT mask download finished with an empty file.")
-        os.replace(temp_path, cache_path)
-        if progress:
-            progress(f"Saved Allen ENT mask to {cache_path}")
-        return cache_path
-    except Exception:
-        try:
-            if temp_path.exists():
-                temp_path.unlink()
-        except OSError:
-            pass
-        raise
-
-
-def default_ent_mask_candidates() -> List[Path]:
-    filename = BUILTIN_ENT_MASK_FILENAME
-    candidates = [
-        allen_ent_mask_cache_path(),
-        Path(__file__).resolve().parent / "data" / "masks" / filename,
-    ]
-    bundle_root = getattr(sys, "_MEIPASS", "")
-    if bundle_root:
-        candidates.append(
-            Path(bundle_root).resolve()
-            / "laminar_boundary_builder"
-            / "data"
-            / "masks"
-            / filename
-        )
-    executable = getattr(sys, "executable", "")
-    if executable:
-        candidates.append(
-            Path(executable).resolve().parent.parent
-            / "Resources"
-            / "laminar_boundary_builder"
-            / "data"
-            / "masks"
-            / filename
-        )
-    for root in _candidate_project_roots() or [_repo_root()]:
-        candidates.extend(
-            [
-                root / "data" / "local" / "laminar_boundary_masks" / filename,
-                root / "data" / "local" / "laminar_boundary_masks" / "structure_909.nrrd",
-            ]
-        )
-    return candidates
-
-
-def resolve_default_ent_mask_path() -> Optional[Path]:
-    for candidate in default_ent_mask_candidates():
-        if candidate.exists():
-            return candidate
-    return None
 
 
 def resolve_annotation_path(annotation_path: str | Path | None = None) -> Path:

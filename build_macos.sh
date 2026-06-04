@@ -11,7 +11,6 @@ ICON="$APP_DIR/assets/app.icns"
 ONTOLOGY_JSON="$APP_DIR/../../data/local/misc/1.json"
 ONTOLOGY_TXT="$APP_DIR/../../data/local/misc/annot.txt"
 ANNOTATION_NRRD="$APP_DIR/../../data/local/misc/annotation_10.nrrd"
-BUILTIN_MASK_DIR="$APP_DIR/laminar_boundary_builder/data/masks"
 
 python -m pip install -e ".[packaging]"
 
@@ -56,10 +55,6 @@ fi
 
 if [[ -f "$ANNOTATION_NRRD" ]]; then
   PYINSTALLER_ARGS+=(--add-data "$ANNOTATION_NRRD:data/local/misc")
-fi
-
-if [[ -d "$BUILTIN_MASK_DIR" ]]; then
-  PYINSTALLER_ARGS+=(--add-data "$BUILTIN_MASK_DIR:laminar_boundary_builder/data/masks")
 fi
 
 if [[ -f "$ICON" ]]; then
