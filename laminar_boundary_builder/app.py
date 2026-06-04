@@ -793,6 +793,18 @@ class TaskResult:
     payload: object = None
 
 
+@dataclass
+class AnnotationLoadData:
+    mask_data: object
+    mask_path: Path
+    template_data: object
+    temporary: bool
+    slice_axis_int: int
+    slice_counts: object
+    region_slices: List[int]
+    warnings: List[str]
+
+
 class StreamBuffer(io.StringIO):
     def __init__(self, callback: Callable[[str], None]):
         super().__init__()
@@ -3539,58 +3551,66 @@ class LaminarBoundaryWindow(QMainWindow):
             self.temporary_mask_dir.cleanup()
             self.temporary_mask_dir = None
 
-    def _load_annotation_template(self, mask_shape) -> Optional[object]:
-        if not self.annotate_template.text():
-            return None
-
-        core = _core()
-        template_path = self._require_path("Template image", self.annotate_template.text())
-        try:
-            template = core.load_volume(template_path).data
-        except Exception as exc:
-            raise RuntimeError(f"Could not read Template image:\n{template_path}\n\n{exc}") from exc
-        if template.shape == mask_shape:
-            return template
-
-        QMessageBox.warning(
-            self,
-            "Template ignored",
-            "Template shape does not match the mask, so only the mask will be shown.",
-        )
-        return None
-
-    def _finish_annotation_load(
+    def _prepare_annotation_load_data(
         self,
         mask_data,
         mask_path: str | Path,
         template_data,
         temporary: bool,
-    ) -> None:
+        slice_axis_text: str,
+        warnings: Optional[List[str]] = None,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> AnnotationLoadData:
+        emit = progress or (lambda _message: None)
         np = _numpy()
         core = _core()
+
+        emit("Preparing mask array...")
         mask_array = np.asarray(mask_data)
         if mask_array.dtype == np.bool_:
-            self.annotation_mask_data = mask_array
+            prepared_mask = mask_array
         else:
-            self.annotation_mask_data = mask_array > 0
-        self.annotation_template_data = template_data
-        self.annotation_slice_axis_int = core._slice_axis_to_int(self.annotate_slice_axis.currentText())
-        self.annotation_mask_path = Path(mask_path).expanduser()
-        self.annotation_mask_is_temporary = temporary
+            prepared_mask = mask_array > 0
+
+        slice_axis_int = core._slice_axis_to_int(slice_axis_text)
+        emit("Counting non-empty slices...")
+        slice_counts = prepared_mask.sum(
+            axis=tuple(axis for axis in range(3) if axis != slice_axis_int)
+        )
+        slice_counts = np.asarray(slice_counts, dtype=np.int64)
+        region_slices = [int(index) for index in np.flatnonzero(slice_counts)]
+        emit(f"Mask ready with {len(region_slices)} non-empty slices.")
+        return AnnotationLoadData(
+            mask_data=prepared_mask,
+            mask_path=Path(mask_path).expanduser(),
+            template_data=template_data,
+            temporary=temporary,
+            slice_axis_int=slice_axis_int,
+            slice_counts=slice_counts,
+            region_slices=region_slices,
+            warnings=list(warnings or []),
+        )
+
+    def _finish_annotation_load(
+        self,
+        load_data: AnnotationLoadData,
+    ) -> None:
+        self.annotation_mask_data = load_data.mask_data
+        self.annotation_template_data = load_data.template_data
+        self.annotation_slice_axis_int = load_data.slice_axis_int
+        self.annotation_mask_path = load_data.mask_path
+        self.annotation_mask_is_temporary = load_data.temporary
         self.annotate_mask.set_text(self.annotation_mask_path)
 
         max_slice = self.annotation_mask_data.shape[self.annotation_slice_axis_int] - 1
         self.annotate_slice.setRange(0, max_slice)
         self.annotate_slider.setRange(0, max_slice)
-        slice_counts = self.annotation_mask_data.sum(
-            axis=tuple(axis for axis in range(3) if axis != self.annotation_slice_axis_int)
-        )
-        self.annotation_slice_counts = np.asarray(slice_counts, dtype=np.int64)
-        nonzero = np.flatnonzero(slice_counts)
-        self.annotation_region_slices = [int(index) for index in nonzero]
+        self.annotation_slice_counts = load_data.slice_counts
+        self.annotation_region_slices = list(load_data.region_slices)
         self.annotation_target_slices = []
-        if len(nonzero):
-            self.annotate_slice.setValue(int(nonzero[len(nonzero) // 2]))
+        if self.annotation_region_slices:
+            middle = self.annotation_region_slices[len(self.annotation_region_slices) // 2]
+            self.annotate_slice.setValue(int(middle))
         else:
             self.annotate_slice.setValue(0)
         self.annotation_landmarks_by_slice.clear()
@@ -3599,7 +3619,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_skipped_slices.clear()
         self.annotation_contours_by_slice.clear()
         self.annotation_boundary_cache.clear()
-        self._refresh_annotation_reference_contours()
+        self.annotation_reference_contours = []
+        if hasattr(self, "surface_preview_canvas"):
+            self.surface_preview_canvas.set_reference_contours([], self.annotation_slice_axis_int)
         self._set_annotation_path_widgets("auto", "auto")
         self.refresh_annotation_slice()
         self._update_annotation_readiness()
@@ -3707,6 +3729,7 @@ class LaminarBoundaryWindow(QMainWindow):
         template_path = self.annotate_template.text() or None
         include_children = self.annotate_include_children.isChecked()
         hemisphere = self.annotate_hemisphere.currentText()
+        slice_axis_text = self.annotate_slice_axis.currentText()
 
         def task() -> TaskResult:
             core = _core()
@@ -3719,6 +3742,15 @@ class LaminarBoundaryWindow(QMainWindow):
                 hemisphere=hemisphere,
                 progress=print,
             )
+            load_data = self._prepare_annotation_load_data(
+                mask_data=extraction.mask,
+                mask_path=extraction.mask_path,
+                template_data=extraction.template,
+                temporary=True,
+                slice_axis_text=slice_axis_text,
+                warnings=extraction.warnings,
+                progress=print,
+            )
             lines = [
                 "Mask extraction finished.",
                 f"atlas: {atlas_path}",
@@ -3728,7 +3760,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 f"voxels: {extraction.voxel_count}",
             ]
             lines.extend(f"warning: {warning}" for warning in extraction.warnings)
-            return TaskResult("Mask extraction finished", "\n".join(lines), payload=extraction)
+            return TaskResult("Mask extraction finished", "\n".join(lines), payload=(extraction, load_data))
 
         self.append_log("\n--- Mask extraction started ---\n")
         self._set_status("Running: extracting mask", "running")
@@ -3757,15 +3789,10 @@ class LaminarBoundaryWindow(QMainWindow):
         self._close_progress_dialog()
         self._set_status("Ready", "ready")
         self.append_log(f"\n{result.message}\n")
-        extraction = result.payload
+        extraction, load_data = result.payload
         try:
-            self._finish_annotation_load(
-                mask_data=extraction.mask,
-                mask_path=extraction.mask_path,
-                template_data=extraction.template,
-                temporary=True,
-            )
-            warning_text = "\n".join(extraction.warnings)
+            self._finish_annotation_load(load_data)
+            warning_text = "\n".join(load_data.warnings)
             if warning_text:
                 QMessageBox.warning(self, "Mask extracted with warning", warning_text)
             self.append_log(f"Loaded temporary annotation mask: {extraction.mask_path}\n")
@@ -3780,9 +3807,112 @@ class LaminarBoundaryWindow(QMainWindow):
         self.append_log("\n" + trace)
         self._show_error_dialog("Mask extraction failed", trace)
 
+    def start_annotation_mask_load(self, mask_path: Path) -> None:
+        if self.thread is not None:
+            QMessageBox.warning(self, "Task running", "Please wait for the current task to finish.")
+            return
+
+        template_text = self.annotate_template.text()
+        template_path = self._require_path("Template image", template_text) if template_text else None
+        slice_axis_text = self.annotate_slice_axis.currentText()
+        old_temp_dir = self.temporary_mask_dir
+        old_temp_path = self.annotation_mask_path if self.annotation_mask_is_temporary else None
+
+        def task() -> TaskResult:
+            core = _core()
+            warnings: List[str] = []
+            print("Loading mask volume...")
+            try:
+                mask_data = core.load_volume(mask_path).data
+            except Exception as exc:
+                raise RuntimeError(f"Could not read Mask:\n{mask_path}\n\n{exc}") from exc
+
+            template_data = None
+            if template_path is not None:
+                print("Loading template image...")
+                try:
+                    template = core.load_volume(template_path).data
+                except Exception as exc:
+                    raise RuntimeError(f"Could not read Template image:\n{template_path}\n\n{exc}") from exc
+                if template.shape == mask_data.shape:
+                    template_data = template
+                else:
+                    warnings.append(
+                        "Template shape does not match the mask, so only the mask will be shown."
+                    )
+
+            load_data = self._prepare_annotation_load_data(
+                mask_data=mask_data,
+                mask_path=mask_path,
+                template_data=template_data,
+                temporary=False,
+                slice_axis_text=slice_axis_text,
+                warnings=warnings,
+                progress=print,
+            )
+            message = (
+                "Annotation mask loaded.\n"
+                f"mask: {mask_path}\n"
+                f"non_empty_slices: {len(load_data.region_slices)}"
+            )
+            return TaskResult("Annotation mask loaded", message, payload=load_data)
+
+        self.append_log("\n--- Annotation mask load started ---\n")
+        self._set_status("Running: loading mask", "running")
+        self.progress_dialog = QProgressDialog("Loading annotation mask...", "", 0, 0, self)
+        self.progress_dialog.setWindowTitle("Loading mask")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setCancelButton(None)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.show()
+
+        self.thread = QThread()
+        self.worker = Worker(task)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.log.connect(self.append_log)
+        self.worker.log.connect(self._update_progress_dialog)
+        self.worker.finished.connect(
+            lambda result: self.annotation_mask_load_finished(result, old_temp_dir, old_temp_path)
+        )
+        self.worker.failed.connect(self.annotation_mask_load_failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.failed.connect(self.thread.quit)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.clear_thread)
+        self.thread.start()
+
+    def annotation_mask_load_finished(
+        self,
+        result: TaskResult,
+        old_temp_dir: Optional[tempfile.TemporaryDirectory],
+        old_temp_path: Optional[Path],
+    ) -> None:
+        self._close_progress_dialog()
+        self._set_status("Ready", "ready")
+        load_data = result.payload
+        try:
+            self._finish_annotation_load(load_data)
+            if old_temp_dir is not None and load_data.mask_path != old_temp_path:
+                old_temp_dir.cleanup()
+                if old_temp_dir is self.temporary_mask_dir:
+                    self.temporary_mask_dir = None
+            warning_text = "\n".join(load_data.warnings)
+            if warning_text:
+                QMessageBox.warning(self, "Mask loaded with warning", warning_text)
+            self.append_log(f"\n{result.message}\n")
+        except Exception as exc:
+            self._set_status("Failed", "failed")
+            self._show_exception_dialog("Load failed", exc)
+
+    def annotation_mask_load_failed(self, trace: str) -> None:
+        self._close_progress_dialog()
+        self._set_status("Failed", "failed")
+        self.append_log("\n" + trace)
+        self._show_error_dialog("Load failed", trace)
+
     def load_annotation_data(self) -> None:
         try:
-            core = _core()
             if self._uses_atlas_extraction():
                 self.start_annotation_mask_extraction()
                 return
@@ -3795,19 +3925,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 return
 
             mask_path = self._require_path("Mask", self.annotate_mask.text())
-            try:
-                mask_data = core.load_volume(mask_path).data
-            except Exception as exc:
-                raise RuntimeError(f"Could not read Mask:\n{mask_path}\n\n{exc}") from exc
-            old_temp_dir = self.temporary_mask_dir
-            old_temp_path = self.annotation_mask_path if self.annotation_mask_is_temporary else None
-            template_data = self._load_annotation_template(mask_data.shape)
-            self._finish_annotation_load(mask_data, mask_path, template_data, temporary=False)
-            if old_temp_dir is not None and Path(mask_path).expanduser() != old_temp_path:
-                old_temp_dir.cleanup()
-                if old_temp_dir is self.temporary_mask_dir:
-                    self.temporary_mask_dir = None
-            self.append_log(f"Loaded annotation mask: {mask_path}\n")
+            self.start_annotation_mask_load(mask_path)
         except Exception as exc:
             self._show_exception_dialog("Load failed", exc)
 
