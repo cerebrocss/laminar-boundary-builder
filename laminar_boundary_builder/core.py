@@ -51,6 +51,11 @@ SURFACE_MODES = {
     SURFACE_MODE_INNER_ONLY,
 }
 
+SURFACE_BUILD_MASK_CONSTRAINED = "mask_constrained"
+SURFACE_BUILD_FAST_LOFT = "fast_loft"
+SURFACE_BUILD_CONTOUR_SHELL = "contour_shell"
+
+
 def normalize_surface_mode(value: Optional[str]) -> str:
     mode = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -72,6 +77,27 @@ def normalize_surface_mode(value: Optional[str]) -> str:
     if mode not in aliases:
         raise ValueError(f"Unknown surface_mode: {value}")
     return aliases[mode]
+
+
+def normalize_surface_build_method(value: Optional[str]) -> str:
+    method = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": SURFACE_BUILD_MASK_CONSTRAINED,
+        "mask": SURFACE_BUILD_MASK_CONSTRAINED,
+        "mask_constrained": SURFACE_BUILD_MASK_CONSTRAINED,
+        "mask_constrained_voxel_shell": SURFACE_BUILD_MASK_CONSTRAINED,
+        "voxel": SURFACE_BUILD_MASK_CONSTRAINED,
+        "voxel_shell": SURFACE_BUILD_MASK_CONSTRAINED,
+        "fast": SURFACE_BUILD_FAST_LOFT,
+        "fast_loft": SURFACE_BUILD_FAST_LOFT,
+        "loft": SURFACE_BUILD_FAST_LOFT,
+        "legacy": SURFACE_BUILD_FAST_LOFT,
+        "contour": SURFACE_BUILD_CONTOUR_SHELL,
+        "contour_shell": SURFACE_BUILD_CONTOUR_SHELL,
+    }
+    if method not in aliases:
+        raise ValueError(f"Unknown surface_method: {value}")
+    return aliases[method]
 
 
 def _row_surface_mode(row: Dict[str, str]) -> str:
@@ -1754,82 +1780,163 @@ def loft_surface(
     if len(entries) < 2:
         raise ValueError(f"Need at least two curves to build {arc_name} surface")
 
-    segments: List[List[Tuple[BoundarySlice, np.ndarray, bool]]] = []
-    current: List[Tuple[BoundarySlice, np.ndarray, bool]] = []
-    for entry in entries:
-        if not current:
-            current = [entry]
-            continue
-        compatible, aligned_entry = _compatible_loft_entry(current[-1], entry)
-        if compatible:
-            current.append(aligned_entry)
-        else:
-            segments.append(current)
-            current = [entry]
-    if current:
-        segments.append(current)
+    aligned_entries: List[Tuple[BoundarySlice, np.ndarray, bool]] = [entries[0]]
+    for entry in entries[1:]:
+        aligned_entries.append(_align_next_loft_entry(aligned_entries[-1], entry))
 
-    vertices_parts: List[np.ndarray] = []
+    base_vertices = np.vstack([entry[1] for entry in aligned_entries]).astype(float)
+    extra_vertices: List[np.ndarray] = []
+
+    def add_vertex(point: np.ndarray) -> int:
+        extra_vertices.append(np.asarray(point, dtype=float))
+        return len(base_vertices) + len(extra_vertices) - 1
+
     faces: List[List[int]] = []
-    vertex_offset = 0
-    for segment in segments:
-        if len(segment) < 2:
-            continue
-        curves = [entry[1] for entry in segment]
-        is_closed = segment[0][2]
-        points_per_curve = len(curves[0])
-        if any(len(curve) != points_per_curve for curve in curves):
-            continue
+    points_per_curve = len(aligned_entries[0][1])
+    for entry_index, (left, right) in enumerate(zip(aligned_entries[:-1], aligned_entries[1:])):
+        base = entry_index * points_per_curve
+        next_base = (entry_index + 1) * points_per_curve
+        if _loft_entries_compatible(left, right):
+            faces.extend(_full_loft_faces(base, next_base, points_per_curve, left[2]))
+        else:
+            faces.extend(_transition_loft_faces(left, right, base, next_base, add_vertex))
 
-        vertices_parts.append(np.vstack(curves).astype(float))
-        for curve_index in range(len(curves) - 1):
-            base = vertex_offset + curve_index * points_per_curve
-            next_base = vertex_offset + (curve_index + 1) * points_per_curve
-            point_range = range(points_per_curve if is_closed else points_per_curve - 1)
-            for point_index in point_range:
-                next_point = (point_index + 1) % points_per_curve
-                a = base + point_index
-                b = base + next_point
-                c = next_base + point_index
-                d = next_base + next_point
-                faces.append([a, c, b])
-                faces.append([b, c, d])
-        vertex_offset += points_per_curve * len(curves)
+    for entry_index, entry in enumerate(aligned_entries):
+        _boundary, curve, is_closed = entry
+        if not is_closed:
+            continue
+        has_previous = entry_index > 0
+        has_next = entry_index + 1 < len(aligned_entries)
+        base = entry_index * points_per_curve
+        if not has_previous:
+            faces.extend(_cap_closed_ring_faces(curve, base, add_vertex, reverse=True))
+        if not has_next:
+            faces.extend(_cap_closed_ring_faces(curve, base, add_vertex, reverse=False))
 
-    if not vertices_parts or not faces:
+    if not faces:
         raise ValueError(f"Need at least two compatible curves to build {arc_name} surface")
 
-    vertices = np.vstack(vertices_parts).astype(float)
-
+    vertices = (
+        np.vstack([base_vertices, np.vstack(extra_vertices)]).astype(float)
+        if extra_vertices
+        else base_vertices
+    )
     return SurfaceMesh(name=arc_name, vertices=vertices, faces=np.asarray(faces, dtype=np.int32))
 
 
-def _compatible_loft_entry(
+def _align_next_loft_entry(
     left: Tuple[BoundarySlice, np.ndarray, bool],
     right: Tuple[BoundarySlice, np.ndarray, bool],
-) -> Tuple[bool, Tuple[BoundarySlice, np.ndarray, bool]]:
+) -> Tuple[BoundarySlice, np.ndarray, bool]:
+    _left_boundary, left_curve, left_closed = left
+    right_boundary, right_curve, right_closed = right
+    if left_closed == right_closed:
+        return right_boundary, _align_loft_curve(left_curve, right_curve, right_closed), right_closed
+    if right_closed:
+        return right_boundary, _align_closed_curve_to_open_curve(right_curve, left_curve), right_closed
+    return right_boundary, _align_open_curve_to_closed_curve(right_curve, left_curve), right_closed
+
+
+def _loft_entries_compatible(
+    left: Tuple[BoundarySlice, np.ndarray, bool],
+    right: Tuple[BoundarySlice, np.ndarray, bool],
+) -> bool:
     left_boundary, left_curve, left_closed = left
     right_boundary, right_curve, right_closed = right
 
     if left_closed != right_closed:
-        return False, right
+        return False
     if right_boundary.slice_index - left_boundary.slice_index > 1:
-        return False, right
+        return False
     left_mode = normalize_surface_mode(left_boundary.surface_mode)
     right_mode = normalize_surface_mode(right_boundary.surface_mode)
     if left_mode != right_mode:
-        return False, right
+        return False
 
-    aligned_curve = _align_loft_curve(left_curve, right_curve, left_closed)
-    mean_jump = _mean_curve_distance(left_curve, aligned_curve)
-    centroid_jump = float(np.linalg.norm(left_curve.mean(axis=0) - aligned_curve.mean(axis=0)))
-    scale = max(1.0, min(_polyline_length(left_curve), _polyline_length(aligned_curve)))
+    point_distances = np.linalg.norm(left_curve - right_curve, axis=1)
+    mean_jump = float(point_distances.mean())
+    max_jump = float(point_distances.max())
+    centroid_jump = float(np.linalg.norm(left_curve.mean(axis=0) - right_curve.mean(axis=0)))
+    scale = max(1.0, min(_polyline_length(left_curve), _polyline_length(right_curve)))
     jump_limit = max(30.0, 0.25 * scale)
     centroid_limit = max(25.0, 0.18 * scale)
+    max_jump_limit = max(80.0, 0.35 * scale)
     if mean_jump > jump_limit and centroid_jump > centroid_limit:
-        return False, right
+        return False
+    if mean_jump > 30.0 and max_jump > max_jump_limit:
+        return False
+    return True
 
-    return True, (right_boundary, aligned_curve, right_closed)
+
+def _full_loft_faces(
+    base: int,
+    next_base: int,
+    points_per_curve: int,
+    is_closed: bool,
+) -> List[List[int]]:
+    left_indices = [base + index for index in range(points_per_curve)]
+    right_indices = [next_base + index for index in range(points_per_curve)]
+    return _indexed_loft_faces(left_indices, right_indices, is_closed)
+
+
+def _indexed_loft_faces(
+    left_indices: Sequence[int],
+    right_indices: Sequence[int],
+    is_closed: bool,
+) -> List[List[int]]:
+    faces: List[List[int]] = []
+    points_per_curve = min(len(left_indices), len(right_indices))
+    point_range = range(points_per_curve if is_closed else points_per_curve - 1)
+    for point_index in point_range:
+        next_point = (point_index + 1) % points_per_curve
+        a = int(left_indices[point_index])
+        b = int(left_indices[next_point])
+        c = int(right_indices[point_index])
+        d = int(right_indices[next_point])
+        faces.append([a, c, b])
+        faces.append([b, c, d])
+    return faces
+
+
+def _cap_closed_ring_faces(
+    curve: np.ndarray,
+    base: int,
+    add_vertex: Callable[[np.ndarray], int],
+    reverse: bool = False,
+) -> List[List[int]]:
+    if len(curve) < 3:
+        return []
+    center_index = add_vertex(np.asarray(curve, dtype=float).mean(axis=0))
+    faces: List[List[int]] = []
+    for point_index in range(len(curve)):
+        next_point = (point_index + 1) % len(curve)
+        a = base + point_index
+        b = base + next_point
+        if reverse:
+            faces.append([center_index, b, a])
+        else:
+            faces.append([center_index, a, b])
+    return faces
+
+
+def _transition_loft_faces(
+    left: Tuple[BoundarySlice, np.ndarray, bool],
+    right: Tuple[BoundarySlice, np.ndarray, bool],
+    base: int,
+    next_base: int,
+    add_vertex: Callable[[np.ndarray], int],
+) -> List[List[int]]:
+    left_boundary, left_curve, left_closed = left
+    right_boundary, right_curve, right_closed = right
+    if right_boundary.slice_index - left_boundary.slice_index > 1:
+        return []
+    if left_closed and right_closed:
+        return []
+    if not left_closed and not right_closed:
+        return _subdivided_open_transition_faces(left_curve, right_curve, base, next_base, add_vertex)
+    if not left_closed and right_closed:
+        return _open_to_closed_transition_faces(left_curve, right_curve, base, next_base)
+    return _closed_to_open_transition_faces(left_curve, right_curve, base, next_base)
 
 
 def _align_loft_curve(left_curve: np.ndarray, right_curve: np.ndarray, is_closed: bool) -> np.ndarray:
@@ -1846,12 +1953,190 @@ def _align_loft_curve(left_curve: np.ndarray, right_curve: np.ndarray, is_closed
     return right_curve
 
 
+def _align_closed_curve_to_open_curve(closed_curve: np.ndarray, open_curve: np.ndarray) -> np.ndarray:
+    closed = _closed_contour_points(closed_curve)
+    aligned = _align_closed_polyline_start(closed, open_curve[0])
+    return resample_polyline(aligned, len(closed_curve) + 1)[:-1]
+
+
+def _align_open_curve_to_closed_curve(open_curve: np.ndarray, closed_curve: np.ndarray) -> np.ndarray:
+    closed = _closed_contour_points(closed_curve)
+    open_start = float(np.linalg.norm(open_curve[0] - closed[0]))
+    open_end = float(np.linalg.norm(open_curve[-1] - closed[0]))
+    if open_end < open_start:
+        return open_curve[::-1]
+    return open_curve
+
+
 def _mean_curve_distance(left_curve: np.ndarray, right_curve: np.ndarray) -> float:
     if len(left_curve) != len(right_curve):
         count = min(len(left_curve), len(right_curve))
         left_curve = resample_polyline(left_curve, count)
         right_curve = resample_polyline(right_curve, count)
     return float(np.linalg.norm(left_curve - right_curve, axis=1).mean())
+
+
+def _transition_distance_limit(left_curve: np.ndarray, right_curve: np.ndarray) -> float:
+    scale = max(1.0, min(_polyline_length(left_curve), _polyline_length(right_curve)))
+    return max(35.0, min(70.0, 0.18 * scale))
+
+
+def _subdivided_open_transition_faces(
+    left_curve: np.ndarray,
+    right_curve: np.ndarray,
+    base: int,
+    next_base: int,
+    add_vertex: Callable[[np.ndarray], int],
+) -> List[List[int]]:
+    distances = np.linalg.norm(left_curve - right_curve, axis=1)
+    max_distance = float(distances.max()) if len(distances) else 0.0
+    if max_distance <= 0.0:
+        return _full_loft_faces(base, next_base, len(left_curve), is_closed=False)
+
+    # Large real topology changes should not be bridged by one huge triangle
+    # strip. Insert simple intermediate cross-sections so the generated patch is
+    # explicit, local, and easy to spot in QC instead of becoming a folded slab.
+    step_count = max(1, min(12, int(math.ceil(max_distance / 24.0))))
+    faces: List[List[int]] = []
+    previous_indices = [base + index for index in range(len(left_curve))]
+
+    for step in range(1, step_count):
+        t = step / float(step_count)
+        intermediate = (1.0 - t) * left_curve + t * right_curve
+        current_indices = [add_vertex(point) for point in intermediate]
+        faces.extend(_indexed_loft_faces(previous_indices, current_indices, is_closed=False))
+        previous_indices = current_indices
+
+    right_indices = [next_base + index for index in range(len(right_curve))]
+    faces.extend(_indexed_loft_faces(previous_indices, right_indices, is_closed=False))
+    return faces
+
+
+def _ring_path_indices(count: int, start: int, end: int) -> List[int]:
+    indices = [int(start)]
+    index = int(start)
+    while index != int(end):
+        index = (index + 1) % count
+        indices.append(index)
+    return indices
+
+
+def _best_closed_subarc_indices(open_curve: np.ndarray, closed_curve: np.ndarray) -> Optional[List[int]]:
+    if len(open_curve) < 2 or len(closed_curve) < 3:
+        return None
+    start_index = int(np.linalg.norm(closed_curve - open_curve[0], axis=1).argmin())
+    end_index = int(np.linalg.norm(closed_curve - open_curve[-1], axis=1).argmin())
+    candidates = [
+        _ring_path_indices(len(closed_curve), start_index, end_index),
+        list(reversed(_ring_path_indices(len(closed_curve), end_index, start_index))),
+    ]
+    best_indices: Optional[List[int]] = None
+    best_mean = math.inf
+    for indices in candidates:
+        if len(indices) < 2:
+            continue
+        subarc = closed_curve[indices]
+        sampled = resample_polyline(subarc, len(open_curve))
+        mean_distance = _mean_curve_distance(open_curve, sampled)
+        if mean_distance < best_mean:
+            best_mean = mean_distance
+            best_indices = indices
+
+    if best_indices is None:
+        return None
+    limit = _transition_distance_limit(open_curve, closed_curve)
+    if best_mean > limit:
+        return None
+    return best_indices
+
+
+def _polyline_cumulative_fraction(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) < 2:
+        return np.zeros(len(points), dtype=float)
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+    total = float(cumulative[-1])
+    if total <= 0:
+        return np.linspace(0.0, 1.0, len(points))
+    return cumulative / total
+
+
+def _strip_faces_between_polylines(
+    left_indices: Sequence[int],
+    left_points: np.ndarray,
+    right_indices: Sequence[int],
+    right_points: np.ndarray,
+) -> List[List[int]]:
+    if len(left_indices) < 2 or len(right_indices) < 2:
+        return []
+    left_t = _polyline_cumulative_fraction(left_points)
+    right_t = _polyline_cumulative_fraction(right_points)
+    faces: List[List[int]] = []
+    left_pos = 0
+    right_pos = 0
+    while left_pos < len(left_indices) - 1 or right_pos < len(right_indices) - 1:
+        can_advance_left = left_pos < len(left_indices) - 1
+        can_advance_right = right_pos < len(right_indices) - 1
+        if not can_advance_right or (
+            can_advance_left and left_t[left_pos + 1] <= right_t[right_pos + 1]
+        ):
+            faces.append(
+                [
+                    int(left_indices[left_pos]),
+                    int(right_indices[right_pos]),
+                    int(left_indices[left_pos + 1]),
+                ]
+            )
+            left_pos += 1
+        else:
+            faces.append(
+                [
+                    int(left_indices[left_pos]),
+                    int(right_indices[right_pos]),
+                    int(right_indices[right_pos + 1]),
+                ]
+            )
+            right_pos += 1
+    return faces
+
+
+def _open_to_closed_transition_faces(
+    open_curve: np.ndarray,
+    closed_curve: np.ndarray,
+    open_base: int,
+    closed_base: int,
+) -> List[List[int]]:
+    subarc_indices = _best_closed_subarc_indices(open_curve, closed_curve)
+    if subarc_indices is None:
+        return []
+    open_indices = [open_base + index for index in range(len(open_curve))]
+    closed_indices = [closed_base + index for index in subarc_indices]
+    return _strip_faces_between_polylines(
+        open_indices,
+        open_curve,
+        closed_indices,
+        closed_curve[subarc_indices],
+    )
+
+
+def _closed_to_open_transition_faces(
+    closed_curve: np.ndarray,
+    open_curve: np.ndarray,
+    closed_base: int,
+    open_base: int,
+) -> List[List[int]]:
+    subarc_indices = _best_closed_subarc_indices(open_curve, closed_curve)
+    if subarc_indices is None:
+        return []
+    closed_indices = [closed_base + index for index in subarc_indices]
+    open_indices = [open_base + index for index in range(len(open_curve))]
+    return _strip_faces_between_polylines(
+        closed_indices,
+        closed_curve[subarc_indices],
+        open_indices,
+        open_curve,
+    )
 
 
 def write_ply(path: str | Path, mesh: SurfaceMesh) -> None:
@@ -1880,6 +2165,597 @@ def write_obj(path: str | Path, mesh: SurfaceMesh) -> None:
         for face in mesh.faces:
             # OBJ indices are 1-based.
             handle.write(f"f {face[0] + 1} {face[1] + 1} {face[2] + 1}\n")
+
+
+def mask_constrained_surface_patches(
+    mask: np.ndarray,
+    boundaries: Sequence[BoundarySlice],
+    resample_points: int = 80,
+    slice_axis: int | str = 0,
+    component_seed_distance: float = 6.0,
+    max_surface_quads: int = 1_500_000,
+) -> Dict[str, SurfaceMesh]:
+    """Build patch surfaces directly from exposed voxel faces of the mask."""
+
+    mask = _as_bool_mask(mask)
+    quad_count = _count_exposed_voxel_quads(mask)
+    if quad_count > max_surface_quads:
+        raise ValueError(
+            f"Mask surface has {quad_count:,} exposed faces; limit is {max_surface_quads:,}"
+        )
+
+    seed_trees = _surface_seed_trees(boundaries)
+    vertices_by_label: Dict[int, List[Tuple[int, int, int]]] = {
+        BOUNDARY_OUTER: [],
+        BOUNDARY_INNER: [],
+        BOUNDARY_LATERAL: [],
+    }
+    vertex_index_by_label: Dict[int, Dict[Tuple[int, int, int], int]] = {
+        BOUNDARY_OUTER: {},
+        BOUNDARY_INNER: {},
+        BOUNDARY_LATERAL: {},
+    }
+    faces_by_label: Dict[int, List[List[int]]] = {
+        BOUNDARY_OUTER: [],
+        BOUNDARY_INNER: [],
+        BOUNDARY_LATERAL: [],
+    }
+
+    def vertex_index(label: int, vertex: Tuple[int, int, int]) -> int:
+        index_by_vertex = vertex_index_by_label[label]
+        existing = index_by_vertex.get(vertex)
+        if existing is not None:
+            return existing
+        index = len(vertices_by_label[label])
+        index_by_vertex[vertex] = index
+        vertices_by_label[label].append(vertex)
+        return index
+
+    def add_quad(label: int, vertices: Sequence[Tuple[int, int, int]]) -> None:
+        if label not in faces_by_label:
+            return
+        indices = [vertex_index(label, tuple(vertex)) for vertex in vertices]
+        faces_by_label[label].append([indices[0], indices[1], indices[2]])
+        faces_by_label[label].append([indices[2], indices[1], indices[3]])
+
+    def emit(side: str, x: int, y_values: np.ndarray, z_values: np.ndarray) -> None:
+        if len(y_values) == 0:
+            return
+        centers = _voxel_face_centers(side, x, y_values, z_values)
+        labels = _classify_surface_centers(centers, seed_trees)
+        for label, y, z in zip(labels, y_values, z_values):
+            add_quad(int(label), _voxel_face_vertices2(side, x, int(y), int(z)))
+
+    previous = np.zeros(mask.shape[1:], dtype=bool)
+    for x in range(mask.shape[0]):
+        current = np.asarray(mask[x], dtype=bool)
+
+        y_values, z_values = np.nonzero(current & ~previous)
+        emit("x_minus", x, y_values, z_values)
+        if x > 0:
+            y_values, z_values = np.nonzero(previous & ~current)
+            emit("x_plus", x - 1, y_values, z_values)
+
+        z_values = np.nonzero(current[0, :])[0]
+        emit("y_minus", x, np.zeros(len(z_values), dtype=int), z_values)
+        z_values = np.nonzero(current[-1, :])[0]
+        emit("y_plus", x, np.full(len(z_values), current.shape[0] - 1, dtype=int), z_values)
+        y_values, z_values = np.nonzero(current[1:, :] & ~current[:-1, :])
+        emit("y_minus", x, y_values + 1, z_values)
+        y_values, z_values = np.nonzero(current[:-1, :] & ~current[1:, :])
+        emit("y_plus", x, y_values, z_values)
+
+        y_values = np.nonzero(current[:, 0])[0]
+        emit("z_minus", x, y_values, np.zeros(len(y_values), dtype=int))
+        y_values = np.nonzero(current[:, -1])[0]
+        emit("z_plus", x, y_values, np.full(len(y_values), current.shape[1] - 1, dtype=int))
+        y_values, z_values = np.nonzero(current[:, 1:] & ~current[:, :-1])
+        emit("z_minus", x, y_values, z_values + 1)
+        y_values, z_values = np.nonzero(current[:, :-1] & ~current[:, 1:])
+        emit("z_plus", x, y_values, z_values)
+
+        previous = current
+
+    y_values, z_values = np.nonzero(previous)
+    emit("x_plus", mask.shape[0] - 1, y_values, z_values)
+
+    meshes: Dict[str, SurfaceMesh] = {}
+    for label, name in (
+        (BOUNDARY_OUTER, "outer"),
+        (BOUNDARY_INNER, "inner"),
+        (BOUNDARY_LATERAL, "lateral"),
+    ):
+        faces = faces_by_label[label]
+        if not faces:
+            continue
+        vertices = np.asarray(vertices_by_label[label], dtype=float) * 0.5
+        mesh = SurfaceMesh(name=name, vertices=vertices, faces=np.asarray(faces, dtype=np.int32))
+        meshes[name] = _keep_seed_connected_surface_components(
+            mesh,
+            _surface_seed_points_for_label(boundaries, label),
+            max_seed_distance=float(component_seed_distance),
+        )
+
+    if "outer" not in meshes or "inner" not in meshes:
+        missing = ", ".join(name for name in ("outer", "inner") if name not in meshes)
+        raise ValueError(f"Voxel surface build produced no {missing} mesh")
+    return meshes
+
+
+def _count_exposed_voxel_quads(mask: np.ndarray) -> int:
+    previous = np.zeros(mask.shape[1:], dtype=bool)
+    total = 0
+    for x in range(mask.shape[0]):
+        current = np.asarray(mask[x], dtype=bool)
+        total += int(np.count_nonzero(current & ~previous))
+        total += int(np.count_nonzero(previous & ~current))
+        total += int(np.count_nonzero(current[0, :]))
+        total += int(np.count_nonzero(current[-1, :]))
+        total += int(np.count_nonzero(current[1:, :] != current[:-1, :]))
+        total += int(np.count_nonzero(current[:, 0]))
+        total += int(np.count_nonzero(current[:, -1]))
+        total += int(np.count_nonzero(current[:, 1:] != current[:, :-1]))
+        previous = current
+    total += int(np.count_nonzero(previous))
+    return total
+
+
+def _mask_for_annotated_components(
+    mask: np.ndarray,
+    boundaries: Sequence[BoundarySlice],
+    padding: int = 16,
+) -> np.ndarray:
+    seed_points = _surface_seed_points_for_label(boundaries, BOUNDARY_OUTER)
+    inner_points = _surface_seed_points_for_label(boundaries, BOUNDARY_INNER)
+    lateral_points = _surface_seed_points_for_label(boundaries, BOUNDARY_LATERAL)
+    if len(inner_points) > 0:
+        seed_points = np.vstack([seed_points, inner_points]) if len(seed_points) > 0 else inner_points
+    if len(lateral_points) > 0:
+        seed_points = np.vstack([seed_points, lateral_points]) if len(seed_points) > 0 else lateral_points
+    if len(seed_points) == 0:
+        return mask
+
+    slices = _bounding_slices_for_points(seed_points, mask.shape, padding=padding)
+    crop = np.asarray(mask[slices], dtype=bool)
+    if not np.any(crop):
+        return mask
+
+    structure = ndimage.generate_binary_structure(3, 3)
+    components, _component_count = ndimage.label(crop, structure=structure)
+    origin = np.asarray([item.start for item in slices], dtype=float)
+    hits: Dict[int, int] = defaultdict(int)
+    for point in seed_points:
+        label = _nearest_component_label(components, np.asarray(point, dtype=float) - origin)
+        if label > 0:
+            hits[int(label)] += 1
+
+    if not hits:
+        return mask
+
+    min_hits = max(3, int(math.ceil(sum(hits.values()) * 0.01)))
+    keep_labels = [label for label, count in hits.items() if count >= min_hits]
+    if not keep_labels:
+        keep_labels = [max(hits, key=hits.get)]
+
+    selected = np.zeros(mask.shape, dtype=bool)
+    selected[slices] = np.isin(components, np.asarray(keep_labels, dtype=components.dtype))
+    if not np.any(selected):
+        return mask
+    return selected
+
+
+def _bounding_slices_for_points(
+    points: np.ndarray,
+    shape: Sequence[int],
+    padding: int,
+) -> Tuple[slice, slice, slice]:
+    points = np.asarray(points, dtype=float)
+    mins = np.floor(np.nanmin(points, axis=0)).astype(int) - int(padding)
+    maxs = np.ceil(np.nanmax(points, axis=0)).astype(int) + int(padding) + 1
+    starts = np.maximum(mins, 0)
+    stops = np.minimum(maxs, np.asarray(shape, dtype=int))
+    return tuple(slice(int(start), int(stop)) for start, stop in zip(starts, stops))  # type: ignore[return-value]
+
+
+def _nearest_component_label(
+    components: np.ndarray,
+    point: np.ndarray,
+    max_radius: int = 3,
+) -> int:
+    center = np.rint(point).astype(int)
+    shape = np.asarray(components.shape, dtype=int)
+    for radius in range(max_radius + 1):
+        starts = np.maximum(center - radius, 0)
+        stops = np.minimum(center + radius + 1, shape)
+        if np.any(starts >= stops):
+            continue
+        local = components[
+            starts[0] : stops[0],
+            starts[1] : stops[1],
+            starts[2] : stops[2],
+        ]
+        labels, counts = np.unique(local[local > 0], return_counts=True)
+        if len(labels) > 0:
+            return int(labels[int(np.argmax(counts))])
+    return 0
+
+
+def _surface_seed_trees(boundaries: Sequence[BoundarySlice]) -> Dict[int, cKDTree]:
+    seed_points = {
+        BOUNDARY_OUTER: _surface_seed_points_for_label(boundaries, BOUNDARY_OUTER),
+        BOUNDARY_INNER: _surface_seed_points_for_label(boundaries, BOUNDARY_INNER),
+        BOUNDARY_LATERAL: _surface_seed_points_for_label(boundaries, BOUNDARY_LATERAL),
+    }
+    trees = {
+        label: cKDTree(points)
+        for label, points in seed_points.items()
+        if len(points) > 0
+    }
+    if BOUNDARY_OUTER not in trees:
+        raise ValueError("Need outer seed points for mask-constrained surfaces")
+    if BOUNDARY_INNER not in trees:
+        raise ValueError("Need inner seed points for mask-constrained surfaces")
+    return trees
+
+
+def _classify_surface_centers(
+    centers: np.ndarray,
+    seed_trees: Dict[int, cKDTree],
+) -> np.ndarray:
+    if len(centers) == 0:
+        return np.empty(0, dtype=np.uint8)
+
+    labels = [BOUNDARY_OUTER, BOUNDARY_INNER, BOUNDARY_LATERAL]
+    distances = np.full((len(labels), len(centers)), np.inf, dtype=float)
+    for row, label in enumerate(labels):
+        tree = seed_trees.get(label)
+        if tree is None:
+            continue
+        distances[row], _ = tree.query(centers, k=1)
+    best = np.argmin(distances, axis=0)
+    return np.asarray([labels[index] for index in best], dtype=np.uint8)
+
+
+def _surface_seed_points_for_label(
+    boundaries: Sequence[BoundarySlice],
+    label: int,
+) -> np.ndarray:
+    arcs: List[np.ndarray] = []
+    for boundary in boundaries:
+        if label == BOUNDARY_OUTER and len(boundary.outer_arc) > 0:
+            arcs.append(boundary.outer_arc)
+        elif label == BOUNDARY_INNER and len(boundary.inner_arc) > 0:
+            arcs.append(boundary.inner_arc)
+        elif label == BOUNDARY_LATERAL:
+            arcs.extend(boundary.lateral_arcs)
+    return _surface_label_points(arcs)
+
+
+def _keep_seed_connected_surface_components(
+    mesh: SurfaceMesh,
+    seed_points: np.ndarray,
+    max_seed_distance: float,
+) -> SurfaceMesh:
+    if len(mesh.faces) == 0 or len(seed_points) == 0:
+        return mesh
+
+    parent = np.arange(len(mesh.vertices), dtype=np.int32)
+    size = np.ones(len(mesh.vertices), dtype=np.int32)
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = int(parent[index])
+        return int(index)
+
+    def union(left: int, right: int) -> None:
+        left_root = find(int(left))
+        right_root = find(int(right))
+        if left_root == right_root:
+            return
+        if size[left_root] < size[right_root]:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        size[left_root] += size[right_root]
+
+    for a, b, c in mesh.faces:
+        union(int(a), int(b))
+        union(int(a), int(c))
+
+    vertex_roots = np.asarray([find(index) for index in range(len(mesh.vertices))], dtype=np.int32)
+    face_roots = vertex_roots[mesh.faces[:, 0]]
+    seed_tree = cKDTree(np.asarray(seed_points, dtype=float))
+    keep_roots: List[int] = []
+    largest_root = int(face_roots[0])
+    largest_faces = 0
+
+    for root in np.unique(face_roots):
+        face_mask = face_roots == root
+        face_count = int(np.count_nonzero(face_mask))
+        if face_count > largest_faces:
+            largest_faces = face_count
+            largest_root = int(root)
+        used_vertices = np.unique(mesh.faces[face_mask].reshape(-1))
+        distances, _ = seed_tree.query(mesh.vertices[used_vertices], k=1)
+        if float(np.min(distances)) <= max_seed_distance:
+            keep_roots.append(int(root))
+
+    if not keep_roots:
+        keep_roots = [largest_root]
+
+    keep_faces = np.isin(face_roots, np.asarray(keep_roots, dtype=np.int32))
+    return _compact_surface_mesh(mesh.name, mesh.vertices, mesh.faces[keep_faces])
+
+
+def _voxel_face_centers(
+    side: str,
+    x: int,
+    y_values: np.ndarray,
+    z_values: np.ndarray,
+) -> np.ndarray:
+    centers = np.zeros((len(y_values), 3), dtype=float)
+    centers[:, 0] = float(x)
+    centers[:, 1] = y_values.astype(float)
+    centers[:, 2] = z_values.astype(float)
+    if side == "x_minus":
+        centers[:, 0] -= 0.5
+    elif side == "x_plus":
+        centers[:, 0] += 0.5
+    elif side == "y_minus":
+        centers[:, 1] -= 0.5
+    elif side == "y_plus":
+        centers[:, 1] += 0.5
+    elif side == "z_minus":
+        centers[:, 2] -= 0.5
+    elif side == "z_plus":
+        centers[:, 2] += 0.5
+    return centers
+
+
+def _voxel_face_vertices2(side: str, x: int, y: int, z: int) -> List[Tuple[int, int, int]]:
+    x0, x1 = 2 * x - 1, 2 * x + 1
+    y0, y1 = 2 * y - 1, 2 * y + 1
+    z0, z1 = 2 * z - 1, 2 * z + 1
+    xc, yc, zc = 2 * x, 2 * y, 2 * z
+    if side == "x_minus":
+        return [(x0, y0, z0), (x0, y0, z1), (x0, y1, z0), (x0, y1, z1)]
+    if side == "x_plus":
+        return [(x1, y0, z0), (x1, y1, z0), (x1, y0, z1), (x1, y1, z1)]
+    if side == "y_minus":
+        return [(x0, y0, z0), (x1, y0, z0), (x0, y0, z1), (x1, y0, z1)]
+    if side == "y_plus":
+        return [(x0, y1, z0), (x0, y1, z1), (x1, y1, z0), (x1, y1, z1)]
+    if side == "z_minus":
+        return [(x0, y0, z0), (x0, y1, z0), (x1, y0, z0), (x1, y1, z0)]
+    if side == "z_plus":
+        return [(x0, y0, z1), (x1, y0, z1), (x0, y1, z1), (x1, y1, z1)]
+    raise ValueError(f"Unknown voxel face side: {side}")
+
+
+def contour_shell_surface_patches(
+    boundaries: Sequence[BoundarySlice],
+    contours: Sequence[Contour2D],
+    resample_points: int = 80,
+) -> Dict[str, SurfaceMesh]:
+    """Build outer/inner/lateral patches on the real mask contour shell.
+
+    This keeps the final surfaces on the extracted region boundary instead of
+    spanning large topology jumps with free-floating planes.
+    """
+
+    ring_points = min(240, max(96, int(resample_points) * 2))
+    contour_by_key = {(contour.slice_index, contour.contour_id): contour for contour in contours}
+    contours_by_index = contours_by_slice(contours)
+
+    entries: List[Tuple[BoundarySlice, np.ndarray, np.ndarray]] = []
+    previous_ring: Optional[np.ndarray] = None
+    for boundary in sorted(boundaries, key=lambda item: item.slice_index):
+        contour = contour_by_key.get((boundary.slice_index, boundary.contour_id))
+        if contour is None:
+            candidates = contours_by_index.get(boundary.slice_index, [])
+            if not candidates:
+                continue
+            contour = max(candidates, key=lambda item: item.area)
+
+        start_target = _boundary_ring_start_target(boundary, previous_ring)
+        ring = _resampled_contour_ring(contour.points, ring_points, start_target, previous_ring)
+        labels = _label_mask_shell_ring(boundary, ring)
+        entries.append((boundary, ring, labels))
+        previous_ring = ring
+
+    if len(entries) < 2:
+        raise ValueError("Need at least two mask contour rings to build mask-constrained surfaces")
+
+    base_vertices = np.vstack([entry[1] for entry in entries]).astype(float)
+    vertex_labels = np.concatenate([entry[2] for entry in entries]).astype(np.uint8)
+    extra_vertices: List[np.ndarray] = []
+    extra_labels: List[int] = []
+
+    def add_vertex(point: np.ndarray, label: int) -> int:
+        extra_vertices.append(np.asarray(point, dtype=float))
+        extra_labels.append(int(label))
+        return len(base_vertices) + len(extra_vertices) - 1
+
+    faces_by_label: Dict[int, List[List[int]]] = {
+        BOUNDARY_OUTER: [],
+        BOUNDARY_INNER: [],
+        BOUNDARY_LATERAL: [],
+    }
+
+    def vertex_label(index: int) -> int:
+        if index < len(vertex_labels):
+            return int(vertex_labels[index])
+        return int(extra_labels[index - len(vertex_labels)])
+
+    def add_face(face: Sequence[int], label: Optional[int] = None) -> None:
+        if label is None:
+            label = _majority_surface_label([vertex_label(index) for index in face])
+        if label in faces_by_label:
+            faces_by_label[int(label)].append([int(index) for index in face])
+
+    for entry_index, (left, right) in enumerate(zip(entries[:-1], entries[1:])):
+        left_boundary, _left_ring, _left_labels = left
+        right_boundary, _right_ring, _right_labels = right
+        if right_boundary.slice_index - left_boundary.slice_index > 1:
+            continue
+        base = entry_index * ring_points
+        next_base = (entry_index + 1) * ring_points
+        for point_index in range(ring_points):
+            next_point = (point_index + 1) % ring_points
+            a = base + point_index
+            b = base + next_point
+            c = next_base + point_index
+            d = next_base + next_point
+            add_face([a, c, b])
+            add_face([b, c, d])
+
+    _add_mask_shell_cap(entries[0], 0, ring_points, add_vertex, add_face, reverse=True)
+    last_base = (len(entries) - 1) * ring_points
+    _add_mask_shell_cap(entries[-1], last_base, ring_points, add_vertex, add_face, reverse=False)
+
+    vertices = (
+        np.vstack([base_vertices, np.vstack(extra_vertices)]).astype(float)
+        if extra_vertices
+        else base_vertices
+    )
+
+    meshes: Dict[str, SurfaceMesh] = {}
+    for label, name in (
+        (BOUNDARY_OUTER, "outer"),
+        (BOUNDARY_INNER, "inner"),
+        (BOUNDARY_LATERAL, "lateral"),
+    ):
+        faces = faces_by_label[label]
+        if faces:
+            meshes[name] = _compact_surface_mesh(name, vertices, np.asarray(faces, dtype=np.int32))
+
+    if "outer" not in meshes or "inner" not in meshes:
+        missing = ", ".join(name for name in ("outer", "inner") if name not in meshes)
+        raise ValueError(f"Mask-constrained surface build produced no {missing} mesh")
+    return meshes
+
+
+def _boundary_ring_start_target(
+    boundary: BoundarySlice,
+    previous_ring: Optional[np.ndarray],
+) -> np.ndarray:
+    if previous_ring is not None and len(previous_ring) > 0:
+        return previous_ring[0]
+    for curve in (boundary.outer_arc, boundary.inner_arc):
+        if len(curve) > 0:
+            return np.asarray(curve[0], dtype=float)
+    return np.zeros(3, dtype=float)
+
+
+def _resampled_contour_ring(
+    contour_points: np.ndarray,
+    ring_points: int,
+    start_target: np.ndarray,
+    previous_ring: Optional[np.ndarray],
+) -> np.ndarray:
+    points = _normalize_contour(contour_points)
+    if len(points) < 3:
+        raise ValueError("Mask contour needs at least three points")
+
+    candidates = [
+        _sample_contour_ring(points, ring_points, start_target),
+        _sample_contour_ring(points[::-1], ring_points, start_target),
+    ]
+    if previous_ring is None:
+        return candidates[0]
+    scores = [_mean_curve_distance(previous_ring, candidate) for candidate in candidates]
+    return candidates[int(np.argmin(scores))]
+
+
+def _sample_contour_ring(points: np.ndarray, ring_points: int, start_target: np.ndarray) -> np.ndarray:
+    closed = _align_closed_polyline_start(_closed_contour_points(points), start_target)
+    return resample_polyline(closed, ring_points + 1)[:-1]
+
+
+def _label_mask_shell_ring(boundary: BoundarySlice, ring: np.ndarray) -> np.ndarray:
+    mode = normalize_surface_mode(boundary.surface_mode)
+    if mode == SURFACE_MODE_OUTER_ONLY:
+        return np.full(len(ring), BOUNDARY_OUTER, dtype=np.uint8)
+    if mode == SURFACE_MODE_INNER_ONLY:
+        return np.full(len(ring), BOUNDARY_INNER, dtype=np.uint8)
+
+    candidates: List[Tuple[int, np.ndarray]] = []
+    if len(boundary.outer_arc) > 0:
+        candidates.append((BOUNDARY_OUTER, _surface_label_points([boundary.outer_arc])))
+    if len(boundary.inner_arc) > 0:
+        candidates.append((BOUNDARY_INNER, _surface_label_points([boundary.inner_arc])))
+    lateral_points = _surface_label_points(boundary.lateral_arcs)
+    if len(lateral_points) > 0:
+        candidates.append((BOUNDARY_LATERAL, lateral_points))
+    if not candidates:
+        return np.full(len(ring), BOUNDARY_LATERAL, dtype=np.uint8)
+
+    distances = np.full((len(candidates), len(ring)), np.inf, dtype=float)
+    for candidate_index, (_label, points) in enumerate(candidates):
+        if len(points) == 0:
+            continue
+        tree = cKDTree(np.asarray(points, dtype=float))
+        distances[candidate_index], _ = tree.query(ring, k=1)
+    best = np.argmin(distances, axis=0)
+    return np.asarray([candidates[index][0] for index in best], dtype=np.uint8)
+
+
+def _surface_label_points(arcs: Sequence[np.ndarray]) -> np.ndarray:
+    points: List[np.ndarray] = []
+    for arc in arcs:
+        arc = np.asarray(arc, dtype=float)
+        if len(arc) < 2:
+            continue
+        sample_count = max(8, min(160, int(math.ceil(_polyline_length(arc) / 2.0))))
+        points.append(resample_polyline(arc, sample_count))
+    if not points:
+        return np.empty((0, 3), dtype=float)
+    return np.vstack(points)
+
+
+def _majority_surface_label(labels: Sequence[int]) -> int:
+    counts = {
+        BOUNDARY_OUTER: 0,
+        BOUNDARY_INNER: 0,
+        BOUNDARY_LATERAL: 0,
+    }
+    for label in labels:
+        if int(label) in counts:
+            counts[int(label)] += 1
+    return max(counts, key=lambda label: (counts[label], label == BOUNDARY_LATERAL))
+
+
+def _add_mask_shell_cap(
+    entry: Tuple[BoundarySlice, np.ndarray, np.ndarray],
+    base: int,
+    ring_points: int,
+    add_vertex: Callable[[np.ndarray, int], int],
+    add_face: Callable[[Sequence[int], Optional[int]], None],
+    reverse: bool,
+) -> None:
+    _boundary, ring, labels = entry
+    center_label = _majority_surface_label(labels)
+    center_index = add_vertex(np.asarray(ring, dtype=float).mean(axis=0), center_label)
+    for point_index in range(ring_points):
+        next_point = (point_index + 1) % ring_points
+        a = base + point_index
+        b = base + next_point
+        label = int(labels[point_index]) if labels[point_index] == labels[next_point] else None
+        if reverse:
+            add_face([center_index, b, a], label)
+        else:
+            add_face([center_index, a, b], label)
+
+
+def _compact_surface_mesh(name: str, vertices: np.ndarray, faces: np.ndarray) -> SurfaceMesh:
+    used = np.unique(faces.reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used), dtype=np.int64)
+    return SurfaceMesh(
+        name=name,
+        vertices=vertices[used],
+        faces=remap[faces].astype(np.int32),
+    )
 
 
 def _paint_points(volume: np.ndarray, points: np.ndarray, value: int) -> None:
@@ -2360,7 +3236,8 @@ def surface_jump_diagnostics(boundaries: Sequence[BoundarySlice]) -> List[Dict[s
             centroid_jump = float(np.linalg.norm(left_curve.mean(axis=0) - right_curve.mean(axis=0)))
             slice_gap = int(right_boundary.slice_index - left_boundary.slice_index)
             flags = []
-            if float(point_distances.mean()) > 30.0 and centroid_jump > 25.0:
+            has_large_jump = float(point_distances.mean()) > 30.0 and centroid_jump > 25.0
+            if has_large_jump:
                 flags.append("large_curve_jump")
             if slice_gap > 1:
                 flags.append("slice_gap")
@@ -2368,6 +3245,12 @@ def surface_jump_diagnostics(boundaries: Sequence[BoundarySlice]) -> List[Dict[s
                 flags.append("mode_change")
             if _is_closed_polyline(left_curve) != _is_closed_polyline(right_curve):
                 flags.append("open_closed_change")
+            if flags:
+                flags.append("transition_review")
+            if has_large_jump and left_boundary.source == "manual" and right_boundary.source == "manual":
+                flags.append("manual_topology_jump")
+            elif has_large_jump:
+                flags.append("auto_transition")
 
             rows.append(
                 {
@@ -2593,18 +3476,85 @@ def prepare_laminar_project(
 
 
 def _write_surfaces(
+    mask: np.ndarray,
     boundaries: Sequence[BoundarySlice],
+    contours: Sequence[Contour2D],
     output_dir: Path,
     resample_points: int,
+    surface_method: str,
+    slice_axis: int | str,
 ) -> Dict[str, SurfaceMesh]:
     surface_dir = output_dir / "surfaces"
     surface_dir.mkdir(parents=True, exist_ok=True)
+    surface_method = normalize_surface_build_method(surface_method)
+
+    if surface_method == SURFACE_BUILD_FAST_LOFT:
+        meshes = _loft_surface_patches(boundaries, resample_points=resample_points)
+    elif surface_method == SURFACE_BUILD_CONTOUR_SHELL:
+        meshes = contour_shell_surface_patches(
+            boundaries,
+            contours,
+            resample_points=resample_points,
+        )
+    else:
+        meshes = _mask_constrained_surface_patches_with_fallback(
+            mask,
+            boundaries,
+            contours,
+            resample_points=resample_points,
+            slice_axis=slice_axis,
+        )
+
+    for name, mesh in meshes.items():
+        if name == "lateral":
+            write_ply(surface_dir / "target_lateral_boundary.ply", mesh)
+            write_obj(surface_dir / "target_lateral_boundary.obj", mesh)
+        else:
+            write_ply(surface_dir / f"target_{name}_surface.ply", mesh)
+            write_obj(surface_dir / f"target_{name}_surface.obj", mesh)
+    return meshes
+
+
+def _mask_constrained_surface_patches_with_fallback(
+    mask: np.ndarray,
+    boundaries: Sequence[BoundarySlice],
+    contours: Sequence[Contour2D],
+    resample_points: int,
+    slice_axis: int | str,
+) -> Dict[str, SurfaceMesh]:
+    try:
+        return mask_constrained_surface_patches(
+            mask,
+            boundaries,
+            resample_points=resample_points,
+            slice_axis=slice_axis,
+        )
+    except Exception as exc:
+        warnings.warn(
+            f"Voxel surface build failed; falling back to contour-shell surfaces: {exc}",
+            RuntimeWarning,
+        )
+        try:
+            return contour_shell_surface_patches(
+                boundaries,
+                contours,
+                resample_points=resample_points,
+            )
+        except Exception as contour_exc:
+            warnings.warn(
+                f"Contour-shell surface build failed; falling back to curve lofting: {contour_exc}",
+                RuntimeWarning,
+            )
+            return _loft_surface_patches(boundaries, resample_points=resample_points)
+
+
+def _loft_surface_patches(
+    boundaries: Sequence[BoundarySlice],
+    resample_points: int,
+) -> Dict[str, SurfaceMesh]:
     meshes: Dict[str, SurfaceMesh] = {}
     for name in ("outer", "inner"):
-        mesh = loft_surface(boundaries, name, resample_points=resample_points)
-        meshes[name] = mesh
-        write_ply(surface_dir / f"target_{name}_surface.ply", mesh)
-        write_obj(surface_dir / f"target_{name}_surface.obj", mesh)
+        meshes[name] = loft_surface(boundaries, name, resample_points=resample_points)
 
     lateral_meshes: List[SurfaceMesh] = []
     for lateral_index in (0, 1):
@@ -2627,14 +3577,11 @@ def _write_surfaces(
             vertices.append(mesh.vertices)
             faces.append(mesh.faces + offset)
             offset += len(mesh.vertices)
-        lateral = SurfaceMesh(
+        meshes["lateral"] = SurfaceMesh(
             name="lateral",
             vertices=np.vstack(vertices),
             faces=np.vstack(faces),
         )
-        meshes["lateral"] = lateral
-        write_ply(surface_dir / "target_lateral_boundary.ply", lateral)
-        write_obj(surface_dir / "target_lateral_boundary.obj", lateral)
     return meshes
 
 
@@ -2649,6 +3596,7 @@ def run_laminar_boundary_pipeline(
     min_area: float = 20.0,
     largest_only: bool = True,
     resample_points: int = 80,
+    surface_method: str = SURFACE_BUILD_MASK_CONSTRAINED,
     depth_method: str = "auto",
     max_laplace_voxels: int = 250_000,
     boundary_dilation: int = 1,
@@ -2659,6 +3607,7 @@ def run_laminar_boundary_pipeline(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    surface_method = normalize_surface_build_method(surface_method)
     volumes_dir = output_dir / "volumes"
     tables_dir = output_dir / "tables"
     qc_dir = output_dir / "qc"
@@ -2685,8 +3634,17 @@ def run_laminar_boundary_pipeline(
     boundaries = propagate_boundaries(contours, manual_boundaries, resample_points=resample_points)
     save_boundaries_json(boundaries, output_dir / "boundary_annotations.json")
     write_boundary_summary(boundaries, tables_dir / "boundary_summary.csv")
+    target_mask = _mask_for_annotated_components(mask, boundaries)
 
-    _write_surfaces(boundaries, output_dir, resample_points=resample_points)
+    _write_surfaces(
+        target_mask,
+        boundaries,
+        contours,
+        output_dir,
+        resample_points=resample_points,
+        surface_method=surface_method,
+        slice_axis=slice_axis,
+    )
     surface_outputs = {
         "outer_surface": output_dir / "surfaces" / "target_outer_surface.ply",
         "inner_surface": output_dir / "surfaces" / "target_inner_surface.ply",
@@ -2703,7 +3661,10 @@ def run_laminar_boundary_pipeline(
             "swc_paths": [str(path) for path in swc_paths] if swc_paths else [],
             "slice_axis": _slice_axis_to_int(slice_axis),
             "resample_points": resample_points,
+            "surface_method": surface_method,
             "depth_method": "surfaces only",
+            "mask_component_selection": "annotation_connected",
+            "target_mask_voxels": int(np.count_nonzero(target_mask)),
             "volume_format": volume_format,
             "max_laplace_voxels": max_laplace_voxels,
             "depth_outputs": "skipped",
@@ -2728,14 +3689,14 @@ def run_laminar_boundary_pipeline(
             "qc": qc_dir,
         }
 
-    labels = make_boundary_label_volume(mask, boundaries, dilation_iterations=boundary_dilation)
+    labels = make_boundary_label_volume(target_mask, boundaries, dilation_iterations=boundary_dilation)
     depth = compute_laminar_depth(
-        mask,
+        target_mask,
         labels,
         method=depth_method,
         max_laplace_voxels=max_laplace_voxels,
     )
-    normals = compute_layer_normals(depth, mask)
+    normals = compute_layer_normals(depth, target_mask)
 
     volume_format = volume_format.lower().lstrip(".")
     if volume_format not in ("nrrd", "npy", "nii", "nii.gz"):
@@ -2744,7 +3705,7 @@ def run_laminar_boundary_pipeline(
     def volume_path(name: str) -> Path:
         return volumes_dir / f"{name}.{volume_format}"
 
-    save_volume(volume_path("target_mask"), mask.astype(np.uint8), reference=mask_volume)
+    save_volume(volume_path("target_mask"), target_mask.astype(np.uint8), reference=mask_volume)
     save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
     save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
     save_volume(volume_path("layer_normal_x"), normals[..., 0], reference=mask_volume)
@@ -2773,7 +3734,7 @@ def run_laminar_boundary_pipeline(
     write_qc_slice_overlays(
         qc_dir / "qc_slice_overlay",
         boundaries,
-        mask=mask,
+        mask=target_mask,
         template=template,
         slice_axis=slice_axis,
         every=qc_every,
@@ -2787,6 +3748,9 @@ def run_laminar_boundary_pipeline(
         "swc_paths": [str(path) for path in swc_paths] if swc_paths else [],
         "slice_axis": _slice_axis_to_int(slice_axis),
         "resample_points": resample_points,
+        "surface_method": surface_method,
+        "mask_component_selection": "annotation_connected",
+        "target_mask_voxels": int(np.count_nonzero(target_mask)),
         "depth_method": depth_method,
         "volume_format": volume_format,
         "max_laplace_voxels": max_laplace_voxels,

@@ -629,6 +629,12 @@ BUILD_HELP = {
         "Effect: higher values make smoother surfaces but take more work and can overfit noisy landmarks.\n"
         "Recommended: 80 for normal builds; 48 is enough for quick tests.",
     ),
+    "surface_method": (
+        "Surface method",
+        "Purpose: choose how the surface mesh is reconstructed from the mask and landmarks.\n"
+        "Effect: Mask constrained follows the voxel mask shell, then keeps only the side connected to your annotations. Fast loft builds a lighter sheet directly from landmarks.\n"
+        "Recommended: Mask constrained for final surfaces; Fast loft for quick previews.",
+    ),
     "depth_method": (
         "Depth method",
         "Purpose: choose how laminar depth is computed between outer and inner boundaries.\n"
@@ -819,6 +825,14 @@ class ReviewRepairRequest:
     manual_csv: Path
     build_output_dir: Path
     queue_slices: List[int]
+
+
+@dataclass
+class PreviousProjectPaths:
+    project_dir: Path
+    mask_path: Path
+    manual_csv: Path
+    build_output_dir: Path
 
 
 class StreamBuffer(io.StringIO):
@@ -1899,6 +1913,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_preview_worker: Optional[Worker] = None
         self.annotation_preview_request_id = 0
         self.pending_review_request: Optional[ReviewRepairRequest] = None
+        self.pending_previous_csv_load: Optional[Tuple[Path, Path, Path]] = None
         self.progress_dialog: Optional[QProgressDialog] = None
         self.temporary_mask_dir: Optional[tempfile.TemporaryDirectory] = None
         self.annotation_mask_path: Optional[Path] = None
@@ -1946,6 +1961,11 @@ class LaminarBoundaryWindow(QMainWindow):
         box.setFrameShape(QFrame.StyledPanel)
         title = QLabel("Laminar Boundary Builder")
         title.setObjectName("title")
+        self.open_previous_project_button = self._make_button("Open Previous Project", "secondary")
+        self.open_previous_project_button.setToolTip(
+            "Open a saved laminar_boundary_builder_output folder and restore its mask, latest CSV, and build."
+        )
+        self.open_previous_project_button.clicked.connect(self.open_previous_project)
         layout = QVBoxLayout(box)
         layout.setContentsMargins(16, 10, 16, 10)
         layout.setSpacing(0)
@@ -1954,6 +1974,8 @@ class LaminarBoundaryWindow(QMainWindow):
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.addWidget(title)
         title_row.addStretch(1)
+        title_row.addWidget(self.open_previous_project_button)
+        title_row.addSpacing(8)
         title_row.addWidget(self.status_label)
 
         layout.addLayout(title_row)
@@ -1986,6 +2008,8 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _make_menu_bar(self) -> None:
         tools_menu = self.menuBar().addMenu("Tools")
+        open_project_action = tools_menu.addAction("Open Previous Project")
+        open_project_action.triggered.connect(lambda _checked=False: self.open_previous_project())
         demo_action = tools_menu.addAction("Run Demo Test")
         demo_action.triggered.connect(lambda _checked=False: self.show_demo_dialog())
 
@@ -2089,6 +2113,194 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         if show_message:
             QMessageBox.information(self, "Log cleared", "Current log file was cleared.")
+
+    def _default_previous_project_dir(self) -> Path:
+        for text in (
+            self.build_output.text().strip() if hasattr(self, "build_output") else "",
+            self.annotate_output.text().strip() if hasattr(self, "annotate_output") else "",
+        ):
+            if not text:
+                continue
+            path = Path(text).expanduser()
+            if path.name.lower() == "build" or path.name.lower().startswith("build_review_round"):
+                path = path.parent
+            if path.exists():
+                return path
+
+        desktop_project = Path.home() / "Desktop" / "laminar_boundary_builder_output"
+        if desktop_project.exists():
+            return desktop_project
+        return Path.home() / "Desktop"
+
+    @staticmethod
+    def _previous_project_round_key(path: Path) -> tuple[int, float]:
+        match = re.search(r"round(\d+)", path.stem)
+        round_index = int(match.group(1)) if match else 0
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            modified = 0.0
+        return round_index, modified
+
+    @staticmethod
+    def _is_supported_volume_path(path: Path) -> bool:
+        return "".join(path.suffixes).lower() in {
+            ".npy",
+            ".npz",
+            ".nrrd",
+            ".nhdr",
+            ".nii",
+            ".nii.gz",
+        }
+
+    @classmethod
+    def _normalize_previous_project_selection(cls, selected_dir: Path) -> tuple[Path, Optional[Path]]:
+        selected_dir = Path(selected_dir).expanduser()
+        name = selected_dir.name.lower()
+        if name == "build" or name.startswith("build_review_round"):
+            return selected_dir.parent, selected_dir
+        return selected_dir, None
+
+    @classmethod
+    def _find_previous_project_mask(cls, project_dir: Path) -> Optional[Path]:
+        direct_names = ["target_mask.npy", "target_mask.npz", "target_mask.nrrd", "target_mask.nhdr"]
+        direct_paths = [project_dir / "inputs" / name for name in direct_names]
+        direct_paths.extend(project_dir / name for name in direct_names)
+        direct_paths.extend(project_dir / "build" / "volumes" / name for name in direct_names)
+        for path in direct_paths:
+            if path.exists():
+                return path
+
+        candidates: List[Path] = []
+        for folder in (project_dir / "inputs", project_dir):
+            if not folder.exists():
+                continue
+            for path in folder.iterdir():
+                if path.is_file() and "mask" in path.name.lower() and cls._is_supported_volume_path(path):
+                    candidates.append(path)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0.0)
+        return candidates[-1]
+
+    @classmethod
+    def _find_previous_project_manual_csv(cls, project_dir: Path) -> Optional[Path]:
+        review_csvs = [
+            path
+            for path in project_dir.glob("manual_landmarks_review_round*.csv")
+            if path.is_file()
+        ]
+        if review_csvs:
+            return sorted(review_csvs, key=cls._previous_project_round_key)[-1]
+
+        for name in ("manual_landmarks_interactive.csv", "manual_landmarks_autosave.csv"):
+            path = project_dir / name
+            if path.exists():
+                return path
+
+        candidates = [
+            path
+            for path in project_dir.glob("manual_landmarks*.csv")
+            if path.is_file() and "template" not in path.stem.lower()
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0.0)
+        return candidates[-1]
+
+    @classmethod
+    def _find_previous_project_build_dir(
+        cls,
+        project_dir: Path,
+        preferred_build_dir: Optional[Path],
+    ) -> Path:
+        if preferred_build_dir is not None and preferred_build_dir.exists():
+            return preferred_build_dir
+
+        review_dirs = [
+            path
+            for path in project_dir.glob("build_review_round*")
+            if path.is_dir()
+        ]
+        if review_dirs:
+            return sorted(review_dirs, key=cls._previous_project_round_key)[-1]
+        return project_dir / "build"
+
+    @classmethod
+    def _resolve_previous_project_paths(cls, selected_dir: Path) -> PreviousProjectPaths:
+        project_dir, preferred_build_dir = cls._normalize_previous_project_selection(selected_dir)
+        if not project_dir.exists():
+            raise ValueError(f"Folder does not exist:\n{project_dir}")
+
+        mask_path = cls._find_previous_project_mask(project_dir)
+        if mask_path is None:
+            raise ValueError(
+                "Could not find a saved target mask.\n\n"
+                "Expected something like inputs/target_mask.npy inside the project folder."
+            )
+
+        manual_csv = cls._find_previous_project_manual_csv(project_dir)
+        if manual_csv is None:
+            raise ValueError(
+                "Could not find a saved manual landmark CSV.\n\n"
+                "Expected manual_landmarks_interactive.csv or manual_landmarks_review_roundN.csv."
+            )
+
+        build_output_dir = cls._find_previous_project_build_dir(project_dir, preferred_build_dir)
+        return PreviousProjectPaths(
+            project_dir=project_dir,
+            mask_path=mask_path,
+            manual_csv=manual_csv,
+            build_output_dir=build_output_dir,
+        )
+
+    def open_previous_project(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Open previous project",
+            str(self._default_previous_project_dir()),
+        )
+        if not selected:
+            return
+        try:
+            paths = self._resolve_previous_project_paths(Path(selected))
+            self._restore_previous_project(paths)
+        except Exception as exc:
+            self._show_exception_dialog("Open previous project failed", exc)
+
+    def _restore_previous_project(self, paths: PreviousProjectPaths) -> None:
+        self.annotate_output.set_text(paths.project_dir)
+        self.annotate_mask.set_text(paths.mask_path)
+        self.annotate_previous_csv.set_text(paths.manual_csv)
+        self.build_mask.set_text(paths.mask_path)
+        self.build_manual.set_text(paths.manual_csv)
+        self.build_output.set_text(paths.build_output_dir)
+        self.build_boundaries.set_text(paths.build_output_dir / "boundary_annotations.json")
+        self.depth_method.setCurrentText("surfaces only")
+        self._update_annotation_readiness()
+        self._update_build_readiness()
+        self.append_log(
+            "Opened previous project.\n"
+            f"project_dir: {paths.project_dir}\n"
+            f"mask: {paths.mask_path}\n"
+            f"manual_csv: {paths.manual_csv}\n"
+            f"build_output: {paths.build_output_dir}\n"
+        )
+
+        if paths.build_output_dir.exists():
+            self.review_build_qc_slices()
+            return
+
+        self.pending_previous_csv_load = (paths.mask_path, paths.manual_csv, paths.project_dir)
+        self.tabs.setCurrentIndex(0)
+        if self.annotation_mask_data is not None and self.annotation_mask_path is not None:
+            try:
+                if self._same_path(self.annotation_mask_path, paths.mask_path):
+                    self._finish_pending_previous_csv_after_mask_load(paths.mask_path)
+                    return
+            except OSError:
+                pass
+        self.start_annotation_mask_load(paths.mask_path)
 
     def _make_button(self, text: str, role: str = "secondary") -> QPushButton:
         button = QPushButton(text)
@@ -3253,6 +3465,35 @@ class LaminarBoundaryWindow(QMainWindow):
             return []
         return sorted(set(review_slices))
 
+    @staticmethod
+    def _read_surface_jump_details(output_dir: Path) -> List[str]:
+        jump_path = output_dir / "qc" / "surface_jump_diagnostics.csv"
+        if not jump_path.exists():
+            return []
+        details = []
+        try:
+            with jump_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    flags = [
+                        flag.strip()
+                        for flag in str(row.get("flags") or "").split(";")
+                        if flag.strip()
+                    ]
+                    if not flags:
+                        continue
+                    label = (
+                        f"{row.get('arc', 'surface')} "
+                        f"{int(float(row['left_slice']))}-{int(float(row['right_slice']))}"
+                    )
+                    if "manual_topology_jump" in flags:
+                        label += " manual"
+                    elif "auto_transition" in flags:
+                        label += " auto"
+                    details.append(label)
+        except (OSError, ValueError, KeyError):
+            return []
+        return details
+
     @classmethod
     def _read_build_review_slices(cls, output_dir: Path) -> List[int]:
         review_slices = set(cls._read_qc_review_slices(output_dir))
@@ -4127,6 +4368,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 QMessageBox.warning(self, "Mask loaded with warning", warning_text)
             self.append_log(f"\n{result.message}\n")
             self._finish_pending_review_after_mask_load(load_data)
+            self._finish_pending_previous_csv_after_mask_load(load_data.mask_path)
         except Exception as exc:
             self._set_status("Failed", "failed")
             self._show_exception_dialog("Load failed", exc)
@@ -5040,6 +5282,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.resample_points.setValue(80)
         self.resample_points.setButtonSymbols(QSpinBox.NoButtons)
         self.resample_points.setMinimumHeight(28)
+        self.surface_method = CleanComboBox()
+        self.surface_method.addItems(["Mask constrained", "Fast loft"])
+        self.surface_method.setMinimumHeight(28)
         self.depth_method = CleanComboBox()
         self.depth_method.addItems(["surfaces only", "auto", "laplace", "distance"])
         self.depth_method.setMinimumHeight(28)
@@ -5173,6 +5418,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self._add_help_row(advanced_form, "Slice axis", self.build_slice_axis, *BUILD_HELP["slice_axis"])
         self._add_help_row(advanced_form, "Min contour area", self.build_min_area, *BUILD_HELP["min_area"])
         self._add_help_row(advanced_form, "Resample points", self.resample_points, *BUILD_HELP["resample_points"])
+        self._add_help_row(advanced_form, "Surface method", self.surface_method, *BUILD_HELP["surface_method"])
         self._add_help_row(advanced_form, "Depth method", self.depth_method, *BUILD_HELP["depth_method"])
         self._add_help_row(advanced_form, "Volume format", self.volume_format, *BUILD_HELP["volume_format"])
         self._add_help_row(advanced_form, "Max Laplace voxels", self.max_laplace_voxels, *BUILD_HELP["max_laplace_voxels"])
@@ -5428,6 +5674,39 @@ class LaminarBoundaryWindow(QMainWindow):
             self._show_exception_dialog("Review setup failed", exc)
             return
 
+    def _finish_pending_previous_csv_after_mask_load(self, loaded_mask_path: Path) -> None:
+        request = self.pending_previous_csv_load
+        if request is None:
+            return
+        mask_path, csv_path, output_dir = request
+        try:
+            if not self._same_path(loaded_mask_path, mask_path):
+                return
+        except OSError:
+            return
+        self.pending_previous_csv_load = None
+        try:
+            loaded_count, errors = self._load_annotation_rows_from_csv(
+                csv_path,
+                output_dir=output_dir,
+                show_message=False,
+            )
+        except Exception as exc:
+            self._show_exception_dialog("Load previous project annotations failed", exc)
+            return
+
+        skipped_text = f" {len(errors)} rows skipped." if errors else ""
+        self.annotate_status.setText(
+            f"Previous project loaded {loaded_count} manual slices.{skipped_text} "
+            "Run Extract Surfaces when you are ready."
+        )
+        QMessageBox.information(
+            self,
+            "Previous project loaded",
+            f"Loaded {loaded_count} manual slices from:\n{csv_path}\n\n"
+            "No existing build folder was found, so the Build page is ready for Extract Surfaces.",
+        )
+
     def _update_build_result_from_task(self, result: TaskResult) -> None:
         if not hasattr(self, "build_result_label"):
             return
@@ -5669,6 +5948,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 min_area=float(self.build_min_area.value()),
                 largest_only=not self.build_keep_all.isChecked(),
                 resample_points=int(self.resample_points.value()),
+                surface_method=self.surface_method.currentText(),
                 depth_method=self.depth_method.currentText(),
                 max_laplace_voxels=int(self.max_laplace_voxels.value()),
                 boundary_dilation=int(self.boundary_dilation.value()),
@@ -5737,12 +6017,18 @@ class LaminarBoundaryWindow(QMainWindow):
                 for start, end in self._slice_ranges(jump_slices)
             )
             jump_targets = ", ".join(str(value) for value in self._review_targets_from_ranges(jump_slices))
+            jump_details = self._read_surface_jump_details(output_dir)
             lines.extend(
                 [
                     f"Surface topology jumps: {jump_ranges}",
                     f"Suggested topology review targets: {jump_targets}",
                 ]
             )
+            if jump_details:
+                shown = "; ".join(jump_details[:6])
+                if len(jump_details) > 6:
+                    shown += f"; +{len(jump_details) - 6} more"
+                lines.append(f"Topology jump details: {shown}")
         if manual_bad:
             lines.append(
                 "Manual slices with QC flags: "

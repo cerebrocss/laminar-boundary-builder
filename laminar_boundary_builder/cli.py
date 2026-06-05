@@ -54,6 +54,7 @@ def cmd_build(args: argparse.Namespace) -> None:
         min_area=args.min_area,
         largest_only=not args.keep_all_contours,
         resample_points=args.resample_points,
+        surface_method=args.surface_method,
         depth_method=args.depth_method,
         max_laplace_voxels=args.max_laplace_voxels,
         boundary_dilation=args.boundary_dilation,
@@ -181,6 +182,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build.add_argument("--min-area", type=float, default=20.0, help="Small contour filter")
     build.add_argument("--resample-points", type=int, default=80, help="Points per outer/inner curve")
+    build.add_argument(
+        "--surface-method",
+        choices=("mask-constrained", "fast-loft", "contour-shell"),
+        default="mask-constrained",
+        help=(
+            "Surface reconstruction method. mask-constrained follows the voxel shell and keeps "
+            "the side connected to annotations; fast-loft builds a lighter landmark sheet."
+        ),
+    )
     build.add_argument(
         "--depth-method",
         choices=("auto", "laplace", "distance"),
