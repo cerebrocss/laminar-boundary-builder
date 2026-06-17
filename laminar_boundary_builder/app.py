@@ -3586,6 +3586,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_target_slices: List[int] = []
         self.annotation_reference_contours = []
         self.annotation_slice_counts = None
+        self.annotation_extraction_signature = None
+        self.pending_annotation_extraction_signature = None
         self.annotation_picking_active = False
         self.annotation_pick_mode_kind = "shell_cut"
         self.annotation_settings_expanded = True
@@ -5012,6 +5014,32 @@ class LaminarBoundaryWindow(QMainWindow):
         mask_text = self.annotate_mask.text().strip()
         return bool(region) and (not mask_text or self._mask_text_is_current_temporary_mask())
 
+    def _current_annotation_extraction_signature(self, atlas_path: Optional[Path] = None):
+        core = _core()
+        if atlas_path is None:
+            atlas_text = self.annotate_atlas.text() if self.annotate_custom_atlas.isChecked() else ""
+            atlas_path = core.resolve_annotation_path(atlas_text or None)
+        template_text = self.annotate_template.text().strip()
+        return (
+            str(Path(atlas_path).expanduser().resolve()),
+            self.annotate_region.text().strip(),
+            bool(self.annotate_include_children.isChecked()),
+            self.annotate_hemisphere.currentText(),
+            str(Path(template_text).expanduser().resolve()) if template_text else "",
+        )
+
+    def _can_reuse_temporary_annotation_mask(self) -> bool:
+        if self.annotation_extraction_signature is None:
+            return False
+        if not self._mask_text_is_current_temporary_mask():
+            return False
+        if self.annotation_mask_path is None or not Path(self.annotation_mask_path).exists():
+            return False
+        try:
+            return self.annotation_extraction_signature == self._current_annotation_extraction_signature()
+        except Exception:
+            return False
+
     def _cleanup_temporary_mask(self) -> None:
         if self.temporary_mask_dir is not None:
             self.temporary_mask_dir.cleanup()
@@ -5196,6 +5224,7 @@ class LaminarBoundaryWindow(QMainWindow):
         include_children = self.annotate_include_children.isChecked()
         hemisphere = self.annotate_hemisphere.currentText()
         slice_axis_text = self.annotate_slice_axis.currentText()
+        self.pending_annotation_extraction_signature = self._current_annotation_extraction_signature(atlas_path)
 
         def task() -> TaskResult:
             core = _core()
@@ -5258,6 +5287,8 @@ class LaminarBoundaryWindow(QMainWindow):
         extraction, load_data = result.payload
         try:
             self._finish_annotation_load(load_data)
+            self.annotation_extraction_signature = self.pending_annotation_extraction_signature
+            self.pending_annotation_extraction_signature = None
             warning_text = "\n".join(load_data.warnings)
             if warning_text:
                 QMessageBox.warning(self, "Mask extracted with warning", warning_text)
@@ -5270,10 +5301,11 @@ class LaminarBoundaryWindow(QMainWindow):
         self._close_progress_dialog()
         self._set_status("Failed", "failed")
         self._cleanup_temporary_mask()
+        self.pending_annotation_extraction_signature = None
         self.append_log("\n" + trace)
         self._show_error_dialog("Mask extraction failed", trace)
 
-    def start_annotation_mask_load(self, mask_path: Path) -> None:
+    def start_annotation_mask_load(self, mask_path: Path, temporary: bool = False) -> None:
         if self.thread is not None:
             QMessageBox.warning(self, "Task running", "Please wait for the current task to finish.")
             return
@@ -5311,7 +5343,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 mask_data=mask_data,
                 mask_path=mask_path,
                 template_data=template_data,
-                temporary=False,
+                temporary=temporary,
                 slice_axis_text=slice_axis_text,
                 warnings=warnings,
                 progress=print,
@@ -5359,6 +5391,8 @@ class LaminarBoundaryWindow(QMainWindow):
         load_data = result.payload
         try:
             self._finish_annotation_load(load_data)
+            if not load_data.temporary:
+                self.annotation_extraction_signature = None
             if old_temp_dir is not None and load_data.mask_path != old_temp_path:
                 old_temp_dir.cleanup()
                 if old_temp_dir is self.temporary_mask_dir:
@@ -5381,6 +5415,10 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def load_annotation_data(self) -> None:
         try:
+            if self._can_reuse_temporary_annotation_mask():
+                self.append_log("\n--- Reusing current extracted mask ---\n")
+                self.start_annotation_mask_load(Path(self.annotation_mask_path), temporary=True)
+                return
             if self._uses_atlas_extraction():
                 self.start_annotation_mask_extraction()
                 return
