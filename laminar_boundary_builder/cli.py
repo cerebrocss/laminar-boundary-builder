@@ -55,6 +55,8 @@ def cmd_build(args: argparse.Namespace) -> None:
         largest_only=not args.keep_all_contours,
         resample_points=args.resample_points,
         surface_method=args.surface_method,
+        shell_backend=args.shell_backend,
+        cut_curve_json=args.cut_curve_json,
         depth_method=args.depth_method,
         max_laplace_voxels=args.max_laplace_voxels,
         boundary_dilation=args.boundary_dilation,
@@ -77,6 +79,8 @@ def cmd_demo(args: argparse.Namespace) -> None:
         slice_axis=0,
         min_area=20.0,
         resample_points=args.resample_points,
+        surface_method=args.surface_method,
+        shell_backend=args.shell_backend,
         depth_method=args.depth_method,
         max_laplace_voxels=args.max_laplace_voxels,
         qc_every=args.qc_every,
@@ -121,6 +125,28 @@ def cmd_selfcheck(args: argparse.Namespace) -> None:
     if missing:
         raise RuntimeError("Selfcheck output missing: " + ", ".join(missing))
 
+    shell_cut_dir = output_dir / "demo_shell_cut_marching"
+    shell_cut_outputs = run_laminar_boundary_pipeline(
+        mask_path=mask_path,
+        manual_csv=manual_csv,
+        output_dir=shell_cut_dir,
+        slice_axis=0,
+        min_area=20.0,
+        resample_points=24,
+        surface_method="shell-cut",
+        shell_backend="marching-cubes",
+        depth_method="distance",
+        qc_every=4,
+        volume_format="nrrd",
+    )
+    shell_missing = [
+        key
+        for key in ("outer_surface", "inner_surface", "lateral_surface", "qc")
+        if not Path(shell_cut_outputs[key]).exists()
+    ]
+    if shell_missing:
+        raise RuntimeError("Selfcheck shell-cut output missing: " + ", ".join(shell_missing))
+
     try:
         load_volume(output_dir / "missing_input.nrrd")
     except FileNotFoundError:
@@ -131,6 +157,7 @@ def cmd_selfcheck(args: argparse.Namespace) -> None:
     print("Selfcheck finished.")
     print(f"output_dir: {output_dir}")
     print("demo_pipeline: ok")
+    print("shell_cut_marching_cubes: ok")
     print(f"missing_file_error: {missing_file_check}")
 
 
@@ -184,11 +211,26 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--resample-points", type=int, default=80, help="Points per outer/inner curve")
     build.add_argument(
         "--surface-method",
-        choices=("mask-constrained", "fast-loft", "contour-shell"),
-        default="mask-constrained",
+        choices=("shell-cut", "arc-graph", "contour-shell", "mask-constrained", "fast-loft"),
+        default="contour-shell",
         help=(
-            "Surface reconstruction method. mask-constrained follows the voxel shell and keeps "
-            "the side connected to annotations; fast-loft builds a lighter landmark sheet."
+            "Surface method. shell-cut cuts patches from the full mask shell; arc-graph is an "
+            "experimental local-arc stitcher with topology QC; contour-shell and fast-loft are "
+            "legacy contour stitchers; mask-constrained is the older voxel-shell labeler."
+        ),
+    )
+    build.add_argument(
+        "--shell-backend",
+        choices=("voxel", "marching-cubes"),
+        default="voxel",
+        help="Shell backend for shell-cut. voxel is blocky debug baseline; marching-cubes is smoother.",
+    )
+    build.add_argument(
+        "--cut-curve-json",
+        default=None,
+        help=(
+            "Optional shell-cut JSON. Accepts GUI-generated shell_cut_annotations.json "
+            "or explicit cut_curves; legacy patch_seeds are optional."
         ),
     )
     build.add_argument(
@@ -224,6 +266,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     demo.add_argument("--output-dir", required=True, help="Demo output folder")
     demo.add_argument("--resample-points", type=int, default=48, help="Points per curve")
+    demo.add_argument(
+        "--surface-method",
+        choices=("shell-cut", "arc-graph", "contour-shell", "mask-constrained", "fast-loft"),
+        default="contour-shell",
+        help="Surface reconstruction method for the demo.",
+    )
+    demo.add_argument(
+        "--shell-backend",
+        choices=("voxel", "marching-cubes"),
+        default="voxel",
+        help="Shell backend for shell-cut. voxel is blocky debug baseline; marching-cubes is smoother.",
+    )
     demo.add_argument(
         "--depth-method",
         choices=("auto", "laplace", "distance"),

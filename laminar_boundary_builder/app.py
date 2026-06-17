@@ -33,6 +33,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QLayout,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -50,6 +51,11 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    from .gl_view import ShellGLCanvas
+except Exception:
+    ShellGLCanvas = None
 
 APP_STYLESHEET = """
 QMainWindow, QWidget {
@@ -375,6 +381,10 @@ QScrollArea#sideScroll {
     border: 0;
     background: transparent;
 }
+QScrollArea#buildScroll {
+    border: 0;
+    background: transparent;
+}
 QScrollBar:vertical {
     background: #eef5f3;
     width: 9px;
@@ -514,15 +524,15 @@ ANNOTATE_HELP = {
     ),
     "output": (
         "Output folder",
-        "Purpose: choose where the manual landmark CSV will be saved.\n"
-        "Effect: Save CSV And Review Build writes manual_landmarks_interactive.csv here and prepares the Build step.\n"
-        "Recommended: choose a project-specific folder so the CSV is easy to find later.",
+        "Purpose: choose where shell-cut annotations and build inputs will be saved.\n"
+        "Effect: Save Shell Cut And Review Build writes shell_cut_annotations.json plus a derived build CSV.\n"
+        "Recommended: choose a project-specific folder so the annotation files are easy to find later.",
     ),
     "previous_csv": (
-        "Previous manual CSV",
-        "Purpose: reload a saved manual_landmarks_interactive.csv into the annotation workspace.\n"
-        "Effect: accepted slices, points, and arc path choices are restored so you can edit only the bad slices.\n"
-        "Recommended: load the same mask first, then load the previous CSV and revise flagged slices.",
+        "Previous shell-cut JSON",
+        "Purpose: reload a saved shell_cut_annotations.json into the annotation workspace.\n"
+        "Effect: accepted shell-cut slices and points are restored so you can edit only the bad slices.\n"
+        "Recommended: load the same mask first, then load the previous JSON and revise flagged slices.",
     ),
     "slice_axis": (
         "Slice axis",
@@ -550,9 +560,15 @@ ANNOTATE_HELP = {
     ),
     "contour": (
         "Contour",
-        "Purpose: choose which detected contour on the current slice receives your four landmarks.\n"
+        "Purpose: choose which detected contour on the current slice receives your shell-cut points.\n"
         "Effect: landmarks are saved against this contour ID.\n"
         "Recommended: use contour 0 when only one contour is present. Switch if the highlighted contour is not your target boundary.",
+    ),
+    "pick_mode": (
+        "Shell cut points",
+        "Purpose: clicks edit shell-cut boundary points only.\n"
+        "Effect: Shell Cut Boundary stores outer_cut_A/B and inner_cut_A/B in shell_cut_annotations.json.\n"
+        "Recommended: annotate sparse smooth regions and add more slices near sudden shape changes.",
     ),
     "outer_path": (
         "Outer arc path",
@@ -576,10 +592,10 @@ BUILD_HELP = {
         "Recommended: use the mask that was prepared by the Annotate step.",
     ),
     "manual_csv": (
-        "Manual CSV",
-        "Purpose: the landmark CSV saved from the Annotate step.\n"
-        "Effect: these landmark rows define the outer and inner boundary curves used to build surfaces.\n"
-        "Recommended: use manual_landmarks_interactive.csv created by Save CSV And Review Build.",
+        "Derived build CSV",
+        "Purpose: an internal CSV derived from shell-cut annotations.\n"
+        "Effect: the current build pipeline uses these derived rows to prepare propagated boundary curves.\n"
+        "Recommended: use the file created by Save Shell Cut And Review Build.",
     ),
     "boundaries_json": (
         "Boundary JSON",
@@ -613,7 +629,7 @@ BUILD_HELP = {
     ),
     "slice_axis": (
         "Slice axis",
-        "Purpose: match the slice axis used when the manual CSV was created.\n"
+        "Purpose: match the slice axis used when shell-cut annotations were created.\n"
         "Effect: a mismatch makes landmark coordinates and generated surfaces wrong.\n"
         "Recommended: keep the value copied from Annotate.",
     ),
@@ -632,8 +648,14 @@ BUILD_HELP = {
     "surface_method": (
         "Surface method",
         "Purpose: choose how the surface mesh is reconstructed from the mask and landmarks.\n"
-        "Effect: Mask constrained follows the voxel mask shell, then keeps only the side connected to your annotations. Fast loft builds a lighter sheet directly from landmarks.\n"
-        "Recommended: Mask constrained for final surfaces; Fast loft for quick previews.",
+        "Effect: Shell cut builds the full mask shell first, then cuts outer/inner/lateral patches from it. Arc graph is an experimental local-arc stitcher. Contour shell and Fast loft are legacy contour stitchers. Mask constrained is the older voxel-shell labeler.\n"
+        "Recommended: Shell cut for topology-sensitive review; Contour shell for comparing old results.",
+    ),
+    "shell_backend": (
+        "Shell backend",
+        "Purpose: choose the shell geometry used by Shell cut.\n"
+        "Effect: Voxel is the blocky debug baseline. Marching cubes builds a smoother shell before snapping cut curves and flood filling patches.\n"
+        "Recommended: Voxel for debugging; Marching cubes for smoother review once the cut curves look correct.",
     ),
     "depth_method": (
         "Depth method",
@@ -809,6 +831,7 @@ class AnnotationLoadData:
     slice_axis_int: int
     slice_counts: object
     region_slices: List[int]
+    shell_mesh: object
     warnings: List[str]
 
 
@@ -965,12 +988,22 @@ class SliceCanvas(QWidget):
     landmark_changed = pyqtSignal(str)
 
     LANDMARK_ORDER = ("outer_start", "outer_end", "inner_start", "inner_end")
+    SHELL_CUT_ORDER = (
+        "outer_cut_A",
+        "outer_cut_B",
+        "inner_cut_A",
+        "inner_cut_B",
+    )
 
     COLORS = {
         "outer_start": QColor("#1f77b4"),
         "outer_end": QColor("#1f77b4"),
         "inner_start": QColor("#d62728"),
         "inner_end": QColor("#d62728"),
+        "outer_cut_A": QColor("#e64b3c"),
+        "outer_cut_B": QColor("#e64b3c"),
+        "inner_cut_A": QColor("#3973e6"),
+        "inner_cut_B": QColor("#3973e6"),
     }
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -984,7 +1017,8 @@ class SliceCanvas(QWidget):
         self.contours = []
         self.selected_contour_index = 0
         self.landmarks: Dict[str, int] = {}
-        self.mode = "outer_start"
+        self.mode = "outer_cut_A"
+        self.picking_mode_kind = "shell_cut"
         self.outer_path_choice = "auto"
         self.inner_path_choice = "auto"
         self.preview_resample_points = 80
@@ -1026,6 +1060,15 @@ class SliceCanvas(QWidget):
     def set_mode(self, mode: str) -> None:
         self.mode = mode
         self.update()
+
+    def set_picking_mode_kind(self, mode: str) -> None:
+        self.picking_mode_kind = "shell_cut" if str(mode).lower() == "shell_cut" else "boundary"
+        self.update()
+
+    def active_landmark_order(self) -> tuple[str, ...]:
+        if self.picking_mode_kind == "shell_cut":
+            return self.SHELL_CUT_ORDER
+        return self.LANDMARK_ORDER
 
     def set_picking_enabled(self, enabled: bool) -> None:
         self.picking_enabled = enabled
@@ -1174,7 +1217,22 @@ class SliceCanvas(QWidget):
         return indices, endpoints
 
     def _excluded_arc_indices_for_landmark(self, name: str) -> set[int]:
-        if name.startswith("inner"):
+        if self.picking_mode_kind == "shell_cut":
+            if name.startswith("inner_cut"):
+                indices, endpoints = self._arc_indices_for_landmarks(
+                    "outer_cut_A",
+                    "outer_cut_B",
+                    self.outer_path_choice,
+                )
+            elif name.startswith("outer_cut"):
+                indices, endpoints = self._arc_indices_for_landmarks(
+                    "inner_cut_A",
+                    "inner_cut_B",
+                    self.inner_path_choice,
+                )
+            else:
+                return set()
+        elif name.startswith("inner"):
             indices, endpoints = self._arc_indices_for_landmarks(
                 "outer_start",
                 "outer_end",
@@ -1239,6 +1297,8 @@ class SliceCanvas(QWidget):
         return True
 
     def preview_boundary(self):
+        if self.picking_mode_kind == "shell_cut":
+            return None
         contour = self.selected_contour()
         if contour is None:
             return None
@@ -1277,14 +1337,101 @@ class SliceCanvas(QWidget):
         except Exception:
             return None
 
-    def _draw_plane_polyline(self, painter: QPainter, plane_points, color: QColor, width: float) -> None:
+    def _shell_cut_preview_arcs(self, points) -> Dict[str, object]:
+        if not all(name in self.landmarks for name in self.SHELL_CUT_ORDER):
+            arcs = {}
+            outer = self._preview_arc(points, "outer_cut_A", "outer_cut_B", self.outer_path_choice)
+            inner = self._preview_arc(points, "inner_cut_A", "inner_cut_B", self.inner_path_choice)
+            if outer is not None:
+                arcs["outer"] = outer
+            if inner is not None:
+                arcs["inner"] = inner
+            return arcs
+
+        core = _core()
+        try:
+            (
+                outer_arc,
+                _outer_indices,
+                _outer_direction,
+                _outer_score,
+                inner_arc,
+                _inner_indices,
+                _inner_direction,
+                _inner_score,
+            ) = core._choose_outer_inner_arcs(
+                points,
+                self.landmarks["outer_cut_A"],
+                self.landmarks["outer_cut_B"],
+                self.landmarks["inner_cut_A"],
+                self.landmarks["inner_cut_B"],
+                outer_choice=self.outer_path_choice,
+                inner_choice=self.inner_path_choice,
+            )
+            return {"outer": outer_arc, "inner": inner_arc}
+        except Exception:
+            return {}
+
+    def shell_cut_overlap_excess(self) -> int:
+        contour = self.selected_contour()
+        if contour is None or not all(name in self.landmarks for name in self.SHELL_CUT_ORDER):
+            return 0
+        core = _core()
+        points = core._normalize_contour(contour.points)
+        if len(points) < 2:
+            return 0
+        try:
+            (
+                _outer_arc,
+                outer_indices,
+                _outer_direction,
+                _outer_score,
+                _inner_arc,
+                inner_indices,
+                _inner_direction,
+                _inner_score,
+            ) = core._choose_outer_inner_arcs(
+                points,
+                self.landmarks["outer_cut_A"],
+                self.landmarks["outer_cut_B"],
+                self.landmarks["inner_cut_A"],
+                self.landmarks["inner_cut_B"],
+                outer_choice=self.outer_path_choice,
+                inner_choice=self.inner_path_choice,
+            )
+            allowed_overlap = core._shared_endpoint_count(
+                self.landmarks["outer_cut_A"],
+                self.landmarks["outer_cut_B"],
+                self.landmarks["inner_cut_A"],
+                self.landmarks["inner_cut_B"],
+                len(points),
+            )
+            return int(core._arc_overlap_excess(
+                len(points),
+                outer_indices,
+                inner_indices,
+                allowed_overlap,
+            ))
+        except Exception:
+            return 0
+
+    def _draw_plane_polyline(
+        self,
+        painter: QPainter,
+        plane_points,
+        color: QColor,
+        width: float,
+        style=Qt.SolidLine,
+    ) -> None:
         if plane_points is None or len(plane_points) < 2:
             return
-        painter.setPen(QPen(color, width))
+        painter.setPen(QPen(color, width, style))
         for p0, p1 in zip(plane_points[:-1], plane_points[1:]):
             painter.drawLine(self.plane_to_screen(p0), self.plane_to_screen(p1))
 
     def _draw_boundary_preview(self, painter: QPainter, points) -> Optional[object]:
+        if self.picking_mode_kind == "shell_cut":
+            return None
         core = _core()
         outer_arc = self._preview_arc(
             points,
@@ -1327,6 +1474,25 @@ class SliceCanvas(QWidget):
             inner_plane = core._volume_to_plane_points(inner_arc, self.slice_axis)
             self._draw_plane_polyline(painter, inner_plane, QColor("#f15b5b"), 5.0)
         return boundary
+
+    def _draw_shell_cut_preview(self, painter: QPainter, points) -> None:
+        core = _core()
+        arcs = self._shell_cut_preview_arcs(points)
+        for arc_name, color in (
+            ("outer", QColor("#e64b3c")),
+            ("inner", QColor("#3973e6")),
+        ):
+            arc = arcs.get(arc_name)
+            if arc is None:
+                continue
+            arc_plane = core._volume_to_plane_points(arc, self.slice_axis)
+            self._draw_plane_polyline(
+                painter,
+                arc_plane,
+                color,
+                3.5,
+                style=Qt.DashLine,
+            )
 
     def _draw_boundary_preview_label(self, painter: QPainter, boundary) -> None:
         if boundary is None:
@@ -1385,6 +1551,8 @@ class SliceCanvas(QWidget):
             points = core._normalize_contour(contour.points)
             plane = core._volume_to_plane_points(points, self.slice_axis)
             boundary_preview = self._draw_boundary_preview(painter, points)
+            if self.picking_mode_kind == "shell_cut":
+                self._draw_shell_cut_preview(painter, points)
             for name, index in self.landmarks.items():
                 if index < 0 or index >= len(plane):
                     continue
@@ -1402,8 +1570,11 @@ class SliceCanvas(QWidget):
         label = f"Next point: {self.mode.replace('_', ' ')}"
         if not self.picking_enabled:
             label = "Load mask to start point picking"
-        elif all(name in self.landmarks for name in self.LANDMARK_ORDER):
-            label = "All four points set. Enter = accept + next"
+        elif all(name in self.landmarks for name in self.active_landmark_order()):
+            if self.picking_mode_kind == "shell_cut":
+                label = "All shell cut endpoints set. Enter = accept + next"
+            else:
+                label = "All four points set. Enter = accept + next"
         label_rect = QRectF(10, 10, max(260, len(label) * 8), 30)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(18, 24, 23, 205))
@@ -1412,7 +1583,10 @@ class SliceCanvas(QWidget):
         painter.drawText(label_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, label)
 
         if self.picking_enabled and self.show_shortcuts:
-            keys = "Drag pan   S outer only   A inner only   H shortcuts   N suggest   O/I flip   Wheel/+/- zoom   0 reset   X undo"
+            if self.picking_mode_kind == "shell_cut":
+                keys = "Drag pan   S outer only   A inner only   K skip   H shortcuts   N suggest   Wheel/+/- zoom   0 reset   X undo"
+            else:
+                keys = "Drag pan   S outer only   A inner only   H shortcuts   N suggest   O/I flip   Wheel/+/- zoom   0 reset   X undo"
             metrics = painter.fontMetrics()
             keys_width = min(max(560, metrics.horizontalAdvance(keys) + 24), max(120, self.width() - 20))
             keys_rect = QRectF(10, 46, keys_width, 26)
@@ -1465,7 +1639,8 @@ class SliceCanvas(QWidget):
             self.setCursor(Qt.ClosedHandCursor)
             return
 
-        if self.mode in self.LANDMARK_ORDER and self.mode not in self.landmarks:
+        active_order = self.active_landmark_order()
+        if self.mode in active_order and self.mode not in self.landmarks:
             if self._set_landmark_from_pos(self.mode, event.pos()):
                 self._drag_landmark = self.mode
                 self._drag_moved = False
@@ -1479,7 +1654,7 @@ class SliceCanvas(QWidget):
             self._drag_start_pos = QPointF(event.pos())
             return
 
-        if self.mode not in self.LANDMARK_ORDER:
+        if self.mode not in active_order:
             self._drag_pan = True
             self._drag_start_pos = QPointF(event.pos())
             self._pan_start_x = self._pan_x
@@ -1543,23 +1718,40 @@ class SliceCanvas(QWidget):
 
 
 class SurfacePreviewCanvas(QWidget):
+    annotation_changed = pyqtSignal()
+    build_ready_changed = pyqtSignal(bool)
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setMinimumSize(330, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.boundaries = []
         self.current_boundary = None
         self.reference_contours = []
+        self.shell_mesh = None
+        self.closed_curves: List[Dict[str, object]] = []
+        self.active_curve_vertices: List[int] = []
+        self.selected_patches: List[Dict[str, object]] = []
+        self.surface_name = "surface"
+        self.annotation_mode = "curve"
+        self.hover_face: Optional[int] = None
         self.slice_axis = 0
-        self.message = "No surface preview yet"
+        self.message = "Load a mask to start 3D annotation"
         self.rotation_yaw = -0.55
         self.rotation_pitch = 0.38
         self.preview_zoom = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
         self._drag_pos: Optional[QPointF] = None
+        self._press_pos: Optional[QPointF] = None
         self._drag_mode = "rotate"
+        self._drag_moved = False
+        self._projection_cache_key = None
+        self._projection_cache = None
+        self._draw_face_ids = None
+        self._draw_vertex_ids = None
 
     def set_boundaries(
         self,
@@ -1816,14 +2008,14 @@ class SurfacePreviewCanvas(QWidget):
             boundaries,
             "outer",
             transform,
-            QColor(70, 170, 235, 90),
+            QColor(230, 75, 60, 90),
         )
         self._draw_surface_connectors(
             painter,
             boundaries,
             "inner",
             transform,
-            QColor(235, 90, 90, 90),
+            QColor(57, 115, 230, 90),
         )
 
         current_slice = self.current_boundary.slice_index if self.current_boundary is not None else None
@@ -1834,7 +2026,7 @@ class SurfacePreviewCanvas(QWidget):
                 painter,
                 boundary.outer_arc,
                 transform,
-                QColor("#6ec7ff") if is_current else QColor("#2f8fd2"),
+                QColor("#ff756a") if is_current else QColor("#e64b3c"),
                 3.2 if is_current else 2.0,
                 style,
             )
@@ -1842,7 +2034,7 @@ class SurfacePreviewCanvas(QWidget):
                 painter,
                 boundary.inner_arc,
                 transform,
-                QColor("#ff8585") if is_current else QColor("#d64a4a"),
+                QColor("#7ba2ff") if is_current else QColor("#3973e6"),
                 3.2 if is_current else 2.0,
                 style,
             )
@@ -1903,6 +2095,475 @@ class SurfacePreviewCanvas(QWidget):
         self.update()
         event.accept()
 
+    def set_shell_mesh(self, shell_mesh) -> None:
+        self.shell_mesh = shell_mesh
+        self.closed_curves = []
+        self.active_curve_vertices = []
+        self.selected_patches = []
+        self.hover_face = None
+        self.annotation_mode = "curve"
+        self.preview_zoom = 1.15
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._projection_cache_key = None
+        self._projection_cache = None
+        self._draw_face_ids = None
+        self._draw_vertex_ids = None
+        self.message = "3D: click shell points to draw a cut curve" if shell_mesh is not None else "3D shell is not available"
+        self._emit_3d_state()
+        self.update()
+
+    def set_surface_name(self, text: str) -> None:
+        self.surface_name = str(text or "").strip() or "surface"
+
+    def set_curve_mode(self) -> None:
+        self.annotation_mode = "curve"
+        self.message = "3D: click shell points to draw a cut curve"
+        self.update()
+
+    def set_patch_mode(self) -> None:
+        if not self.closed_curves:
+            self.message = "Close at least one cut curve before selecting a surface"
+            self.update()
+            return
+        self.annotation_mode = "patch"
+        self.message = "3D: hover a patch, then click it to save under the current name"
+        self.update()
+
+    def clear_3d_annotations(self) -> None:
+        self.closed_curves = []
+        self.active_curve_vertices = []
+        self.selected_patches = []
+        self.hover_face = None
+        self.annotation_mode = "curve"
+        self.message = "3D: click shell points to draw a cut curve"
+        self._emit_3d_state()
+        self.update()
+
+    def can_build_3d_surfaces(self) -> bool:
+        return bool(self.shell_mesh is not None and self.closed_curves and self.selected_patches)
+
+    def annotation_counts(self) -> tuple[int, int, int]:
+        return (
+            len(self.closed_curves),
+            len(self.active_curve_vertices),
+            len(self.selected_patches),
+        )
+
+    def undo_3d_action(self) -> bool:
+        if self.active_curve_vertices:
+            self.active_curve_vertices.pop()
+            self.annotation_mode = "curve"
+            self._emit_3d_state()
+            self.update()
+            return True
+        if self.selected_patches:
+            self.selected_patches.pop()
+            self._emit_3d_state()
+            self.update()
+            return True
+        if self.closed_curves:
+            curve = self.closed_curves.pop()
+            vertices = [int(value) for value in curve.get("vertices", [])]
+            if len(vertices) > 1 and vertices[0] == vertices[-1]:
+                vertices = vertices[:-1]
+            self.active_curve_vertices = vertices
+            self.annotation_mode = "curve"
+            self._emit_3d_state()
+            self.update()
+            return True
+        return False
+
+    def annotation_payload(self, mask_path: Optional[Path] = None) -> Dict[str, object]:
+        if self.shell_mesh is None:
+            raise ValueError("No 3D shell is loaded")
+        np = _numpy()
+        vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
+        curves = []
+        for index, curve in enumerate(self.closed_curves, start=1):
+            vertex_ids = [int(value) for value in curve.get("vertices", [])]
+            if len(vertex_ids) < 4:
+                continue
+            curves.append(
+                {
+                    "curve_id": str(curve.get("curve_id") or f"cut_curve_{index}"),
+                    "label_left": "selected",
+                    "label_right": "unselected",
+                    "source": "manual_3d",
+                    "control_points": vertices[vertex_ids].round(4).tolist(),
+                }
+            )
+        patches = []
+        for patch in self.selected_patches:
+            patches.append(
+                {
+                    "patch_label": str(patch.get("patch_label") or "surface"),
+                    "source": "manual_3d",
+                    "face_id": int(patch.get("face_id", -1)),
+                    "seed_point": np.asarray(patch.get("seed_point"), dtype=float).round(4).tolist(),
+                }
+            )
+        return {
+            "schema": "laminar_boundary_builder.surface_3d_annotations.v1",
+            "annotation_type": "manual_3d_shell_patch",
+            "mask_path": str(mask_path) if mask_path else None,
+            "cut_curves": curves,
+            "selected_patches": patches,
+        }
+
+    def _emit_3d_state(self) -> None:
+        self.annotation_changed.emit()
+        self.build_ready_changed.emit(self.can_build_3d_surfaces())
+
+    def _3d_vertices(self):
+        if self.shell_mesh is None:
+            return _numpy().empty((0, 3), dtype=float)
+        return _numpy().asarray(self.shell_mesh.vertices, dtype=float)
+
+    def _3d_rotated_points(self, points, center):
+        np = _numpy()
+        coords = np.asarray(points, dtype=float) - center
+        yaw_cos = math.cos(self.rotation_yaw)
+        yaw_sin = math.sin(self.rotation_yaw)
+        pitch_cos = math.cos(self.rotation_pitch)
+        pitch_sin = math.sin(self.rotation_pitch)
+        x = coords[:, 0]
+        y = coords[:, 1]
+        z = coords[:, 2]
+        xz = x * yaw_cos + z * yaw_sin
+        zz = -x * yaw_sin + z * yaw_cos
+        yz = y * pitch_cos - zz * pitch_sin
+        depth = y * pitch_sin + zz * pitch_cos
+        return np.column_stack((xz, yz, depth))
+
+    def _3d_projection(self):
+        np = _numpy()
+        vertices = self._3d_vertices()
+        if len(vertices) == 0:
+            return None
+        face_count = len(getattr(self.shell_mesh, "faces", [])) if self.shell_mesh is not None else 0
+        key = (
+            id(self.shell_mesh),
+            len(vertices),
+            face_count,
+            self.width(),
+            self.height(),
+            round(float(self.rotation_yaw), 5),
+            round(float(self.rotation_pitch), 5),
+            round(float(self.preview_zoom), 5),
+            round(float(self.pan_x), 3),
+            round(float(self.pan_y), 3),
+        )
+        if self._projection_cache_key == key and self._projection_cache is not None:
+            return self._projection_cache
+        center = (vertices.min(axis=0) + vertices.max(axis=0)) * 0.5
+        radius = float(np.linalg.norm(vertices - center.reshape(1, 3), axis=1).max())
+        radius = max(radius, 1.0)
+        margin = 34.0
+        scale = self.preview_zoom * min(
+            max(1.0, self.width() - margin * 2.0),
+            max(1.0, self.height() - margin * 2.0),
+        ) / (2.0 * radius)
+        offset = np.asarray([self.width() * 0.5 + self.pan_x, self.height() * 0.5 + self.pan_y], dtype=float)
+        rotated = self._3d_rotated_points(vertices, center)
+        screen = offset.reshape(1, 2) + rotated[:, :2] * scale
+        self._projection_cache_key = key
+        self._projection_cache = (screen, rotated[:, 2])
+        return self._projection_cache
+
+    def _sample_face_ids_for_display(self, face_depth, max_faces: int = 12000):
+        np = _numpy()
+        if len(face_depth) == 0:
+            return np.empty((0,), dtype=int)
+        draw_order = np.argsort(face_depth)
+        if len(draw_order) > max_faces:
+            step = int(math.ceil(len(draw_order) / max_faces))
+            draw_order = draw_order[::step]
+        return np.asarray(draw_order, dtype=int)
+
+    def _nearest_vertex_id(self, pos, max_distance: float = 16.0) -> Optional[int]:
+        np = _numpy()
+        projection = self._3d_projection()
+        if projection is None:
+            return None
+        screen, _depth = projection
+        click = np.asarray([pos.x(), pos.y()], dtype=float)
+        candidates = self._draw_vertex_ids
+        if candidates is not None and len(candidates):
+            candidates = np.asarray(candidates, dtype=int)
+        else:
+            candidates = np.arange(len(screen), dtype=int)
+        distances = np.linalg.norm(screen[candidates] - click.reshape(1, 2), axis=1)
+        index = int(np.argmin(distances))
+        return int(candidates[index]) if float(distances[index]) <= max_distance else None
+
+    def _nearest_active_vertex_index(self, pos, max_distance: float = 15.0) -> Optional[int]:
+        if not self.active_curve_vertices:
+            return None
+        np = _numpy()
+        projection = self._3d_projection()
+        if projection is None:
+            return None
+        screen, _depth = projection
+        ids = np.asarray(self.active_curve_vertices, dtype=int)
+        click = np.asarray([pos.x(), pos.y()], dtype=float)
+        distances = np.linalg.norm(screen[ids] - click.reshape(1, 2), axis=1)
+        index = int(np.argmin(distances))
+        return index if float(distances[index]) <= max_distance else None
+
+    def _nearest_face_id(self, pos, max_distance: float = 24.0) -> Optional[int]:
+        np = _numpy()
+        if self.shell_mesh is None:
+            return None
+        projection = self._3d_projection()
+        if projection is None:
+            return None
+        screen, _depth = projection
+        faces = np.asarray(self.shell_mesh.faces, dtype=int)
+        if len(faces) == 0:
+            return None
+        candidates = self._draw_face_ids
+        if candidates is not None and len(candidates):
+            candidates = np.asarray(candidates, dtype=int)
+        else:
+            face_depth = _depth[faces].mean(axis=1)
+            candidates = self._sample_face_ids_for_display(face_depth)
+        if len(candidates) == 0:
+            return None
+        centers = screen[faces[candidates]].mean(axis=1)
+        click = np.asarray([pos.x(), pos.y()], dtype=float)
+        distances = np.linalg.norm(centers - click.reshape(1, 2), axis=1)
+        index = int(np.argmin(distances))
+        return int(candidates[index]) if float(distances[index]) <= max_distance else None
+
+    def _nearest_face_vertex_id(self, face_id: int, pos) -> Optional[int]:
+        np = _numpy()
+        if self.shell_mesh is None:
+            return None
+        projection = self._3d_projection()
+        if projection is None:
+            return None
+        screen, _depth = projection
+        faces = np.asarray(self.shell_mesh.faces, dtype=int)
+        if face_id < 0 or face_id >= len(faces):
+            return None
+        face_vertices = np.asarray(faces[int(face_id)], dtype=int)
+        click = np.asarray([pos.x(), pos.y()], dtype=float)
+        distances = np.linalg.norm(screen[face_vertices] - click.reshape(1, 2), axis=1)
+        return int(face_vertices[int(np.argmin(distances))])
+
+    def _close_active_curve(self, vertex_index: int) -> None:
+        vertices = self.active_curve_vertices[int(vertex_index) :] + [self.active_curve_vertices[int(vertex_index)]]
+        if len(set(vertices[:-1])) < 3:
+            self.message = "A closed curve needs at least three different points"
+            return
+        self.closed_curves.append(
+            {
+                "curve_id": f"cut_curve_{len(self.closed_curves) + 1}",
+                "vertices": list(vertices),
+            }
+        )
+        self.active_curve_vertices = []
+        self.annotation_mode = "patch"
+        self.message = "Closed curve saved. Hover and click the surface patch to keep."
+
+    def _add_selected_patch(self, face_id: int) -> None:
+        if self.shell_mesh is None:
+            return
+        if any(int(patch.get("face_id", -1)) == int(face_id) for patch in self.selected_patches):
+            self.message = "That patch seed is already selected"
+            return
+        np = _numpy()
+        face = np.asarray(self.shell_mesh.faces[int(face_id)], dtype=int)
+        seed_point = np.asarray(self.shell_mesh.vertices[face], dtype=float).mean(axis=0)
+        label = self.surface_name or "surface"
+        self.selected_patches.append(
+            {
+                "patch_label": label,
+                "face_id": int(face_id),
+                "seed_point": seed_point,
+            }
+        )
+        self.message = f"Selected patch for surface '{label}'"
+
+    def _handle_shell_click(self, pos) -> None:
+        if self.shell_mesh is None:
+            return
+        if self.annotation_mode == "patch" and self.closed_curves:
+            face_id = self._nearest_face_id(pos, max_distance=30.0)
+            if face_id is not None:
+                self._add_selected_patch(face_id)
+                self._emit_3d_state()
+                self.update()
+                return
+        active_index = self._nearest_active_vertex_index(pos)
+        if active_index is not None and len(self.active_curve_vertices) >= 3:
+            self._close_active_curve(active_index)
+            self._emit_3d_state()
+            self.update()
+            return
+        vertex_id = self._nearest_vertex_id(pos)
+        if vertex_id is None:
+            face_id = self._nearest_face_id(pos, max_distance=42.0)
+            if face_id is not None:
+                vertex_id = self._nearest_face_vertex_id(face_id, pos)
+        if vertex_id is None:
+            self.message = "Click closer to the visible 3D shell"
+            self.update()
+            return
+        self.annotation_mode = "curve"
+        self.active_curve_vertices.append(int(vertex_id))
+        self.message = "Click more points, or click an active point to close the curve"
+        self._emit_3d_state()
+        self.update()
+
+    def _draw_3d_curve(self, painter: QPainter, vertex_ids: List[int], screen, color: QColor, closed: bool) -> None:
+        if not vertex_ids:
+            return
+        points = [QPointF(float(screen[int(value), 0]), float(screen[int(value), 1])) for value in vertex_ids]
+        pen = QPen(color, 3.0 if closed else 2.4)
+        pen.setStyle(Qt.SolidLine if closed else Qt.DashLine)
+        painter.setPen(pen)
+        for left, right in zip(points[:-1], points[1:]):
+            painter.drawLine(left, right)
+        painter.setPen(QPen(QColor("#101817"), 1.0))
+        painter.setBrush(color)
+        for point in points:
+            painter.drawEllipse(point, 4.5, 4.5)
+
+    def paintEvent(self, event) -> None:
+        if self.shell_mesh is None:
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), QColor("#101817"))
+            painter.setPen(QColor("#d4dddd"))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.message)
+            return
+        np = _numpy()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#101817"))
+        projection = self._3d_projection()
+        if projection is None:
+            painter.setPen(QColor("#d4dddd"))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.message)
+            return
+        screen, depth = projection
+        faces = np.asarray(self.shell_mesh.faces, dtype=int)
+        face_depth = depth[faces].mean(axis=1)
+        draw_order = self._sample_face_ids_for_display(face_depth)
+        self._draw_face_ids = draw_order
+        self._draw_vertex_ids = np.unique(faces[draw_order].reshape(-1)) if len(draw_order) else None
+        selected_faces = {int(patch["face_id"]) for patch in self.selected_patches}
+        if len(face_depth):
+            depth_min = float(face_depth.min())
+            depth_span = max(1.0, float(face_depth.max() - depth_min))
+        else:
+            depth_min = 0.0
+            depth_span = 1.0
+        for face_id in draw_order:
+            face_id = int(face_id)
+            face = faces[face_id]
+            polygon = QPolygonF([QPointF(float(screen[i, 0]), float(screen[i, 1])) for i in face])
+            if face_id == self.hover_face:
+                painter.setPen(QPen(QColor("#ffffff"), 1.2))
+                painter.setBrush(QColor(85, 180, 145, 165))
+            elif face_id in selected_faces:
+                painter.setPen(QPen(QColor("#f5c84c"), 1.1))
+                painter.setBrush(QColor(245, 200, 76, 145))
+            else:
+                normalized_depth = (float(face_depth[face_id]) - depth_min) / depth_span
+                shade = int(92 + normalized_depth * 110)
+                painter.setPen(QPen(QColor(190, 230, 220, 45), 0.5))
+                painter.setBrush(QColor(shade, min(255, shade + 34), min(255, shade + 25), 138))
+            painter.drawPolygon(polygon)
+
+        if self._draw_vertex_ids is not None and len(self._draw_vertex_ids):
+            vertex_ids = np.asarray(self._draw_vertex_ids, dtype=int)
+            max_points = 7000
+            if len(vertex_ids) > max_points:
+                vertex_ids = vertex_ids[:: int(math.ceil(len(vertex_ids) / max_points))]
+            painter.setPen(QPen(QColor(232, 255, 247, 150), 1.8))
+            for vertex_id in vertex_ids:
+                point = screen[int(vertex_id)]
+                painter.drawPoint(QPointF(float(point[0]), float(point[1])))
+
+        for index, curve in enumerate(self.closed_curves):
+            color = QColor("#f06a5a") if index % 2 == 0 else QColor("#63a0ff")
+            self._draw_3d_curve(
+                painter,
+                [int(value) for value in curve.get("vertices", [])],
+                screen,
+                color,
+                closed=True,
+            )
+        self._draw_3d_curve(
+            painter,
+            [int(value) for value in self.active_curve_vertices],
+            screen,
+            QColor("#e8f06a"),
+            closed=False,
+        )
+        curve_count, point_count, patch_count = self.annotation_counts()
+        mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
+        self._draw_message(
+            painter,
+            f"{mode_text}: {curve_count} curve(s), {point_count} active point(s), {patch_count} selected patch(es)",
+        )
+
+    def mousePressEvent(self, event) -> None:
+        if self.shell_mesh is None:
+            return
+        if event.button() not in (Qt.LeftButton, Qt.RightButton):
+            return
+        self.setFocus(Qt.MouseFocusReason)
+        self._drag_pos = QPointF(event.pos())
+        self._press_pos = QPointF(event.pos())
+        self._drag_moved = False
+        if event.button() == Qt.RightButton or event.modifiers() & Qt.ShiftModifier:
+            self._drag_mode = "pan"
+        else:
+            self._drag_mode = "pick"
+        self.setCursor(Qt.ClosedHandCursor)
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self.shell_mesh is None:
+            return
+        if self._drag_pos is None:
+            self.hover_face = self._nearest_face_id(event.pos(), max_distance=26.0)
+            self.update()
+            return
+        dx = event.pos().x() - self._drag_pos.x()
+        dy = event.pos().y() - self._drag_pos.y()
+        self._drag_pos = QPointF(event.pos())
+        if self._press_pos is not None:
+            total_dx = event.pos().x() - self._press_pos.x()
+            total_dy = event.pos().y() - self._press_pos.y()
+            if total_dx * total_dx + total_dy * total_dy > 16.0:
+                self._drag_moved = True
+                if self._drag_mode == "pick":
+                    self._drag_mode = "rotate"
+        if self._drag_mode == "pan":
+            self.pan_x += dx
+            self.pan_y += dy
+        elif self._drag_mode == "rotate":
+            self.rotation_yaw = self._wrap_rotation_angle(self.rotation_yaw + dx * 0.01)
+            self.rotation_pitch = self._wrap_rotation_angle(self.rotation_pitch + dy * 0.01)
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.shell_mesh is None:
+            return
+        if event.button() not in (Qt.LeftButton, Qt.RightButton):
+            return
+        if self._drag_mode == "pick" and not self._drag_moved:
+            self._handle_shell_click(event.pos())
+        self._drag_pos = None
+        self._press_pos = None
+        self.unsetCursor()
+        event.accept()
+
 
 class LaminarBoundaryWindow(QMainWindow):
     def __init__(self):
@@ -1931,6 +2592,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.log_file_path = self._prepare_log_file()
         autosave_name = self.log_file_path.stem.replace(LOG_FILE_PREFIX.rstrip("_"), "manual_landmarks_autosave", 1)
         self.annotation_autosave_path = self.log_file_path.with_name(f"{autosave_name}.csv")
+        shell_cut_autosave_name = self.log_file_path.stem.replace(
+            LOG_FILE_PREFIX.rstrip("_"),
+            "shell_cut_annotations_autosave",
+            1,
+        )
+        self.shell_cut_autosave_path = self.log_file_path.with_name(f"{shell_cut_autosave_name}.json")
         self._make_menu_bar()
         self.append_log(
             "Laminar Boundary Builder log started "
@@ -2342,6 +3009,10 @@ class LaminarBoundaryWindow(QMainWindow):
         self.suggest_next_slice_shortcut.setContext(Qt.ApplicationShortcut)
         self.suggest_next_slice_shortcut.activated.connect(self.suggest_next_annotation_slice)
 
+        self.skip_annotation_slice_shortcut = QShortcut(QKeySequence(Qt.Key_K), self)
+        self.skip_annotation_slice_shortcut.setContext(Qt.ApplicationShortcut)
+        self.skip_annotation_slice_shortcut.activated.connect(self.skip_current_annotation_slice)
+
         self.outer_only_annotation_slice_shortcut = QShortcut(QKeySequence(Qt.Key_S), self)
         self.outer_only_annotation_slice_shortcut.setContext(Qt.ApplicationShortcut)
         self.outer_only_annotation_slice_shortcut.activated.connect(
@@ -2587,8 +3258,8 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _make_annotation_hint(self) -> QFrame:
         return self._make_hint(
-            "Choose one input source, then pick four points: outer start/end and inner start/end. "
-            "Enter accepts the slice."
+            "Choose one input source, then pick points directly on the 3D shell. "
+            "Close a curve, select the surface patch, then build."
         )
 
     def _make_annotation_control_panel(self) -> QWidget:
@@ -2628,10 +3299,10 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_include_children.setChecked(True)
         self.annotate_mask = PathRow("Optional existing target mask")
         self.annotate_template = PathRow("Optional template image volume")
-        self.annotate_output = PathRow("Output folder for saved manual CSV", select_file=False)
+        self.annotate_output = PathRow("Output folder for shell-cut annotations", select_file=False)
         self.annotate_previous_csv = PathRow(
-            "Optional previous manual_landmarks_interactive.csv",
-            file_filter="CSV files (*.csv);;All files (*)",
+            "Optional previous shell_cut_annotations.json",
+            file_filter="JSON files (*.json);;All files (*)",
         )
         self.annotate_slice_axis = self._axis_combo()
         self.annotate_min_area = self._min_area_spin()
@@ -2649,6 +3320,15 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_contour = CleanComboBox()
         self.annotate_contour.setMinimumHeight(28)
         self.annotate_contour.currentIndexChanged.connect(self.change_annotation_contour)
+        self.annotate_surface_name = QLineEdit()
+        self.annotate_surface_name.setPlaceholderText("Surface file name, for example layer_outer")
+        self.annotate_surface_name.setText("surface")
+        self.annotate_surface_name.setMinimumHeight(28)
+        self.annotate_surface_name.textChanged.connect(self.on_3d_surface_name_changed)
+        self.annotate_pick_mode = CleanComboBox()
+        self.annotate_pick_mode.addItems(["Shell Cut Boundary"])
+        self.annotate_pick_mode.setMinimumHeight(28)
+        self.annotate_pick_mode.currentIndexChanged.connect(self.on_annotation_pick_mode_changed)
 
         self.annotate_outer_path = CleanComboBox()
         self.annotate_outer_path.addItems(["auto", "forward", "backward"])
@@ -2671,9 +3351,25 @@ class LaminarBoundaryWindow(QMainWindow):
     def _create_annotation_action_buttons(self) -> QWidget:
         self.load_button = self._make_button("Load Source And Start Picking", "primary")
         self.load_button.clicked.connect(self.load_annotation_data)
-        self.load_previous_csv_button = self._make_button("Load Previous CSV", "secondary")
-        self.load_previous_csv_button.setToolTip("Load saved manual landmarks into the annotation workspace.")
+        self.load_previous_csv_button = self._make_button("Load Previous Shell Cut JSON", "secondary")
+        self.load_previous_csv_button.setToolTip("Load saved shell-cut annotations into the annotation workspace.")
         self.load_previous_csv_button.clicked.connect(self.load_previous_annotation_csv)
+        self.draw_curve_button = self._make_button("Draw New Closed Curve", "secondary")
+        self.draw_curve_button.setToolTip("Start or continue a 3D shell cut curve.")
+        self.draw_curve_button.clicked.connect(self.set_3d_curve_mode)
+        self.select_patch_button = self._make_button("Select Surface Patch", "secondary")
+        self.select_patch_button.setToolTip("After at least one closed curve exists, click a surface patch to save.")
+        self.select_patch_button.clicked.connect(self.set_3d_patch_mode)
+        self.undo_3d_button = self._make_button("Undo Last 3D Step (X)", "secondary")
+        self.undo_3d_button.setToolTip("Remove the last point, selected patch, or closed curve.")
+        self.undo_3d_button.clicked.connect(self.undo_3d_annotation_action)
+        self.clear_3d_button = self._make_button("Clear 3D Annotation", "danger")
+        self.clear_3d_button.setToolTip("Clear all 3D cut curves and selected surfaces.")
+        self.clear_3d_button.clicked.connect(self.clear_3d_annotations)
+        self.build_3d_button = self._make_button("Build Selected 3D Surfaces", "primary")
+        self.build_3d_button.setToolTip("Build surfaces from closed 3D cut curves and selected named patches.")
+        self.build_3d_button.setEnabled(False)
+        self.build_3d_button.clicked.connect(self.run_3d_surface_build)
         self.save_slice_button = self._make_button("Accept Slice + Next", "primary")
         self.save_slice_button.setToolTip("Accept landmarks on this slice and move to the next smart target slice.")
         self.save_slice_button.clicked.connect(self.accept_annotation_slice_and_advance)
@@ -2696,14 +3392,14 @@ class LaminarBoundaryWindow(QMainWindow):
         self.inner_only_slice_button.clicked.connect(
             lambda _checked=False: self.mark_current_annotation_cap("inner_only")
         )
-        self.skip_slice_button = self._make_button("Skip Slice", "secondary")
+        self.skip_slice_button = self._make_button("Skip Slice (K)", "secondary")
         self.skip_slice_button.setToolTip("Ignore this slice entirely when the contour is not usable.")
         self.skip_slice_button.clicked.connect(self.skip_current_annotation_slice)
         self.flip_outer_path_button = self._make_button("Flip Outer (O)", "secondary")
-        self.flip_outer_path_button.setToolTip("Use the other contour side between outer_start and outer_end.")
+        self.flip_outer_path_button.setToolTip("Use the other contour side between the outer cut A/B points.")
         self.flip_outer_path_button.clicked.connect(lambda _checked=False: self.flip_annotation_arc("outer"))
         self.flip_inner_path_button = self._make_button("Flip Inner (I)", "secondary")
-        self.flip_inner_path_button.setToolTip("Use the other contour side between inner_start and inner_end.")
+        self.flip_inner_path_button.setToolTip("Use the other contour side between the inner cut A/B points.")
         self.flip_inner_path_button.clicked.connect(lambda _checked=False: self.flip_annotation_arc("inner"))
         self.clear_slice_button = self._make_button("Clear Current Slice", "danger")
         self.clear_slice_button.setToolTip("Clear landmarks on the current slice.")
@@ -2717,9 +3413,10 @@ class LaminarBoundaryWindow(QMainWindow):
         self.rebuild_review_button = self._make_button("Rebuild Review Round", "primary")
         self.rebuild_review_button.setToolTip("Save review landmarks and rebuild into a new review output folder.")
         self.rebuild_review_button.clicked.connect(self.rebuild_review_round)
-        self.export_button = self._make_button("Save CSV And Review Build", "secondary")
-        self.export_button.setToolTip("Save accepted landmarks as a CSV and switch to the Build settings.")
+        self.export_button = self._make_button("Save Shell Cut And Review Build", "secondary")
+        self.export_button.setToolTip("Save accepted shell-cut annotations and switch to the Build settings.")
         self.export_button.clicked.connect(self.export_annotation_csv)
+        self.export_button.hide()
         self.export_mask_button = self._make_button("Export Current Mask", "secondary")
         self.export_mask_button.setToolTip("Save the current temporary extracted mask as a permanent file.")
         self.export_mask_button.clicked.connect(self.export_current_annotation_mask)
@@ -2733,18 +3430,21 @@ class LaminarBoundaryWindow(QMainWindow):
         flip_layout.setSpacing(6)
         flip_layout.addWidget(self.flip_outer_path_button)
         flip_layout.addWidget(self.flip_inner_path_button)
-        action_layout.addWidget(self.save_slice_button)
-        action_layout.addWidget(self.suggest_slice_button)
-        action_layout.addWidget(self.outer_only_slice_button)
-        action_layout.addWidget(self.inner_only_slice_button)
-        action_layout.addWidget(self.skip_slice_button)
-        action_layout.addWidget(flip_row)
-        action_layout.addWidget(self.clear_slice_button)
+        single_surface_row = QWidget()
+        single_surface_layout = QHBoxLayout(single_surface_row)
+        single_surface_layout.setContentsMargins(0, 0, 0, 0)
+        single_surface_layout.setSpacing(6)
+        single_surface_layout.addWidget(self.outer_only_slice_button)
+        single_surface_layout.addWidget(self.inner_only_slice_button)
+        action_layout.addWidget(self.draw_curve_button)
+        action_layout.addWidget(self.select_patch_button)
+        action_layout.addWidget(self.undo_3d_button)
+        action_layout.addWidget(self.clear_3d_button)
         action_layout.addWidget(self.review_ok_button)
         action_layout.addWidget(self.save_review_button)
         action_layout.addWidget(self.rebuild_review_button)
         action_layout.addWidget(self.export_mask_button)
-        action_layout.addWidget(self.export_button)
+        action_layout.addWidget(self.build_3d_button)
         self._apply_review_mode_ui(False)
         return action_row
 
@@ -2754,7 +3454,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_readiness.setWordWrap(True)
         self.annotate_status = QLabel("No mask loaded")
         self.annotate_status.setWordWrap(True)
-        self.next_point_label = QLabel("Next point: outer_start")
+        self.next_point_label = QLabel("Next point: outer_cut_A")
         self.next_point_label.setObjectName("nextPointText")
         self.next_point_label.setWordWrap(True)
         self.annotate_progress = QLabel("Load a mask to see slice count.")
@@ -2813,7 +3513,7 @@ class LaminarBoundaryWindow(QMainWindow):
         save_box, save_form = self._make_form_section("2. Optional Reference And Recovery")
         self._add_help_row(save_form, "Template image", self.annotate_template, *ANNOTATE_HELP["template"])
         self._add_help_row(save_form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
-        self._add_help_row(save_form, "Previous CSV", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
+        self._add_help_row(save_form, "Previous shell-cut JSON", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
         save_form.addRow("", self.load_previous_csv_button)
         controls_layout.addWidget(save_box)
 
@@ -2830,14 +3530,9 @@ class LaminarBoundaryWindow(QMainWindow):
         controls_layout.addWidget(advanced_box)
 
     def _add_annotation_picking_section(self, controls_layout: QVBoxLayout, action_row: QWidget) -> None:
-        picking_box, picking_form = self._make_form_section("3. Pick And Review")
-        self._add_help_row(picking_form, "Slice", self.annotate_slice, *ANNOTATE_HELP["slice"])
-        picking_form.addRow("", self.annotate_slider)
-        self._add_help_row(picking_form, "Contour", self.annotate_contour, *ANNOTATE_HELP["contour"])
-        self._add_help_row(picking_form, "Outer arc path", self.annotate_outer_path, *ANNOTATE_HELP["outer_path"])
-        self._add_help_row(picking_form, "Inner arc path", self.annotate_inner_path, *ANNOTATE_HELP["inner_path"])
-        picking_form.addRow("Next", self.next_point_label)
-        picking_form.addRow("Review slice", self.annotation_review_slice)
+        picking_box, picking_form = self._make_form_section("3. 3D Pick And Build")
+        picking_form.addRow("Surface name", self.annotate_surface_name)
+        picking_form.addRow("State", self.next_point_label)
         picking_form.addRow("Actions", action_row)
         picking_form.addRow("Progress", self.annotate_progress)
         picking_form.addRow("Status", self.annotate_status)
@@ -2846,19 +3541,15 @@ class LaminarBoundaryWindow(QMainWindow):
     def _make_annotation_preview_area(self) -> QSplitter:
         self.slice_canvas = SliceCanvas()
         self.slice_canvas.landmark_changed.connect(self.on_landmark_changed)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.slice_canvas)
+        self.slice_canvas.hide()
 
-        self.surface_preview_canvas = SurfacePreviewCanvas()
-        self.surface_preview_canvas.hide()
+        self.surface_preview_canvas = ShellGLCanvas() if ShellGLCanvas is not None else SurfacePreviewCanvas()
+        self.surface_preview_canvas.annotation_changed.connect(self.on_3d_annotation_changed)
+        self.surface_preview_canvas.build_ready_changed.connect(self.on_3d_build_ready_changed)
         self.annotation_preview_splitter = QSplitter(Qt.Horizontal)
         self.annotation_preview_splitter.setChildrenCollapsible(False)
-        self.annotation_preview_splitter.addWidget(scroll)
         self.annotation_preview_splitter.addWidget(self.surface_preview_canvas)
-        self.annotation_preview_splitter.setStretchFactor(0, 3)
-        self.annotation_preview_splitter.setStretchFactor(1, 2)
-        self.annotation_preview_splitter.setSizes([740, 430])
+        self.annotation_preview_splitter.setStretchFactor(0, 1)
         return self.annotation_preview_splitter
 
     def _make_annotation_settings_button(self) -> QPushButton:
@@ -2885,6 +3576,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_slice_axis_int = 0
         self.annotation_rows: Dict[int, Dict[str, str]] = {}
         self.annotation_landmarks_by_slice: Dict[int, Dict[str, int]] = {}
+        self.shell_cut_rows_by_slice: Dict[int, Dict] = {}
+        self.shell_cut_landmarks_by_slice: Dict[int, Dict[str, int]] = {}
         self.annotation_path_choices_by_slice: Dict[int, Dict[str, str]] = {}
         self.annotation_skipped_slices = set()
         self.annotation_contours_by_slice: Dict[int, list] = {}
@@ -2894,6 +3587,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_reference_contours = []
         self.annotation_slice_counts = None
         self.annotation_picking_active = False
+        self.annotation_pick_mode_kind = "shell_cut"
         self.annotation_settings_expanded = True
         self.review_mode_active = False
         self.review_queue_slices: List[int] = []
@@ -2998,6 +3692,8 @@ class LaminarBoundaryWindow(QMainWindow):
             except Exception:
                 mode = "accepted"
             rows.append((slice_index, f"Accepted slice {slice_index} - {mode}"))
+        for slice_index in sorted(self.shell_cut_rows_by_slice):
+            rows.append((slice_index, f"Shell cut slice {slice_index}"))
         for slice_index in sorted(self.annotation_skipped_slices):
             if slice_index not in self.annotation_rows:
                 rows.append((slice_index, f"Skipped slice {slice_index}"))
@@ -3027,13 +3723,26 @@ class LaminarBoundaryWindow(QMainWindow):
     def _annotation_shortcuts_active(self) -> bool:
         return self.tabs.currentIndex() == 0 and self.annotation_picking_active
 
+    def _annotation_pick_mode_kind_from_ui(self) -> str:
+        return "shell_cut"
+
+    def _active_annotation_landmark_order(self) -> tuple[str, ...]:
+        if self.annotation_pick_mode_kind == "shell_cut":
+            return SliceCanvas.SHELL_CUT_ORDER
+        return SliceCanvas.LANDMARK_ORDER
+
     def _next_annotation_point(self) -> Optional[str]:
-        for name in SliceCanvas.LANDMARK_ORDER:
+        for name in self._active_annotation_landmark_order():
             if name not in self.slice_canvas.landmarks:
                 return name
         return None
 
     def _set_next_annotation_mode(self) -> None:
+        if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
+            self.on_3d_annotation_changed()
+            return
+        if hasattr(self, "slice_canvas"):
+            self.slice_canvas.set_picking_mode_kind(self.annotation_pick_mode_kind)
         next_point = self._next_annotation_point()
         if next_point:
             self.slice_canvas.set_mode(next_point)
@@ -3042,19 +3751,50 @@ class LaminarBoundaryWindow(QMainWindow):
             )
         else:
             self.slice_canvas.set_mode("")
-            self.next_point_label.setText(
-                "All four points are set. Press Enter or click Accept Slice + Next."
-            )
+            if self.annotation_pick_mode_kind == "shell_cut":
+                self.next_point_label.setText(
+                    "All four shell-cut endpoints are set. Press Enter or click Accept Slice + Next."
+                )
+            else:
+                self.next_point_label.setText(
+                    "All four points are set. Press Enter or click Accept Slice + Next."
+                )
         self.slice_canvas.set_picking_enabled(self.annotation_picking_active)
+
+    def _store_current_canvas_landmarks(self) -> None:
+        if self.annotation_mask_data is None or not hasattr(self, "slice_canvas"):
+            return
+        slice_index = int(self.annotate_slice.value())
+        if self.annotation_pick_mode_kind == "shell_cut":
+            self.shell_cut_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
+        else:
+            self.annotation_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
+
+    def on_annotation_pick_mode_changed(self, *_args) -> None:
+        if not hasattr(self, "slice_canvas"):
+            return
+        self._store_current_canvas_landmarks()
+        self.annotation_pick_mode_kind = self._annotation_pick_mode_kind_from_ui()
+        self.annotate_outer_path.setEnabled(True)
+        self.annotate_inner_path.setEnabled(True)
+        self.outer_only_slice_button.setEnabled(True)
+        self.inner_only_slice_button.setEnabled(True)
+        self.flip_outer_path_button.setEnabled(True)
+        self.flip_inner_path_button.setEnabled(True)
+        self.refresh_annotation_slice()
 
     def enter_annotation_picking_mode(self) -> None:
         self.annotation_picking_active = True
-        self.annotation_settings_expanded = False
-        self.annotate_settings_button.show()
+        is_3d = hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None
+        self.annotation_settings_expanded = True if is_3d else False
+        self.annotate_settings_button.setVisible(not is_3d)
         self._set_annotation_parameter_widgets_enabled(False)
         self._apply_annotation_settings_panel_state()
         self._set_next_annotation_mode()
-        self.slice_canvas.setFocus(Qt.OtherFocusReason)
+        if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
+            self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+        else:
+            self.slice_canvas.setFocus(Qt.OtherFocusReason)
 
     def exit_annotation_picking_mode(self) -> None:
         if self.tabs.currentIndex() != 0:
@@ -3078,11 +3818,124 @@ class LaminarBoundaryWindow(QMainWindow):
         self._apply_annotation_settings_panel_state()
 
     def _apply_annotation_settings_panel_state(self) -> None:
-        expanded = self.annotation_settings_expanded or not self.annotation_picking_active
+        is_3d = hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None
+        expanded = is_3d or self.annotation_settings_expanded or not self.annotation_picking_active
         self.annotate_controls_scroll.setVisible(expanded)
         self.annotate_settings_button.setText("‹" if expanded else "›")
         if hasattr(self, "surface_preview_canvas"):
             self.surface_preview_canvas.setVisible(self.annotation_picking_active)
+
+    def _has_3d_annotation_shell(self) -> bool:
+        return bool(
+            hasattr(self, "surface_preview_canvas")
+            and self.surface_preview_canvas.shell_mesh is not None
+        )
+
+    def on_3d_surface_name_changed(self, text: str) -> None:
+        if hasattr(self, "surface_preview_canvas"):
+            self.surface_preview_canvas.set_surface_name(text)
+
+    def on_3d_build_ready_changed(self, ready: bool) -> None:
+        if hasattr(self, "build_3d_button"):
+            self.build_3d_button.setEnabled(bool(ready))
+
+    def on_3d_annotation_changed(self) -> None:
+        if not hasattr(self, "surface_preview_canvas") or not hasattr(self, "next_point_label"):
+            return
+        curve_count, point_count, patch_count = self.surface_preview_canvas.annotation_counts()
+        if self.surface_preview_canvas.shell_mesh is None:
+            text = "3D shell is not ready."
+        elif point_count:
+            text = f"Drawing curve: {point_count} point(s). Click an active point to close. X = undo."
+        elif curve_count and patch_count:
+            text = f"Ready: {curve_count} closed curve(s), {patch_count} selected surface patch(es)."
+        elif curve_count:
+            text = f"{curve_count} closed curve(s). Hover and click a surface patch to keep."
+        else:
+            text = "Click shell points to draw a closed curve."
+        self.next_point_label.setText(text)
+        self.on_3d_build_ready_changed(self.surface_preview_canvas.can_build_3d_surfaces())
+
+    def set_3d_curve_mode(self) -> None:
+        if hasattr(self, "surface_preview_canvas"):
+            self.surface_preview_canvas.set_curve_mode()
+            self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+            self.on_3d_annotation_changed()
+
+    def set_3d_patch_mode(self) -> None:
+        if hasattr(self, "surface_preview_canvas"):
+            self.surface_preview_canvas.set_patch_mode()
+            self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+            self.on_3d_annotation_changed()
+
+    def undo_3d_annotation_action(self) -> None:
+        if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.undo_3d_action():
+            self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+            self.on_3d_annotation_changed()
+            return
+        self.annotate_status.setText("Nothing to undo in the 3D annotation.")
+
+    def clear_3d_annotations(self) -> None:
+        if not hasattr(self, "surface_preview_canvas"):
+            return
+        self.surface_preview_canvas.clear_3d_annotations()
+        self.annotate_status.setText("3D annotation cleared.")
+        self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+
+    def _surface_3d_annotations_payload(self) -> Dict[str, object]:
+        if not hasattr(self, "surface_preview_canvas"):
+            raise ValueError("3D annotation canvas is not ready")
+        return self.surface_preview_canvas.annotation_payload(mask_path=self.annotation_mask_path)
+
+    def _write_surface_3d_annotations_json(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._surface_3d_annotations_payload()
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def run_3d_surface_build(self) -> None:
+        if self.annotation_mask_path is None:
+            QMessageBox.warning(self, "No mask", "Load a mask before building 3D surfaces.")
+            return
+        if not hasattr(self, "surface_preview_canvas") or not self.surface_preview_canvas.can_build_3d_surfaces():
+            QMessageBox.warning(
+                self,
+                "3D annotation incomplete",
+                "Close at least one cut curve and select at least one surface patch first.",
+            )
+            return
+
+        try:
+            annotation_output_dir = self._auto_build_output_dir()
+            if not self.annotate_output.text().strip():
+                self.annotate_output.set_text(annotation_output_dir)
+            build_dir = annotation_output_dir / "build_3d"
+            annotations_path = annotation_output_dir / "surface_3d_annotations.json"
+            self._write_surface_3d_annotations_json(annotations_path)
+            self.build_mask.set_text(self.annotation_mask_path)
+            self.build_output.set_text(build_dir)
+            self.surface_method.setCurrentText("Shell cut")
+            self.depth_method.setCurrentText("surfaces only")
+            shell_backend = getattr(self.surface_preview_canvas.shell_mesh, "backend", None) or self.shell_backend.currentText()
+            if str(shell_backend).startswith("voxel_preview"):
+                shell_backend = _core().SHELL_BACKEND_VOXEL
+        except Exception as exc:
+            self._show_exception_dialog("Save 3D annotation failed", exc)
+            return
+
+        def task() -> TaskResult:
+            core = _core()
+            outputs = core.run_3d_shell_patch_pipeline(
+                mask_path=self.annotation_mask_path,
+                cut_curve_json=annotations_path,
+                output_dir=build_dir,
+                shell_backend=shell_backend,
+            )
+            lines = ["3D surface build finished."]
+            lines.extend(f"{key}: {value}" for key, value in outputs.items())
+            return TaskResult("Build finished", "\n".join(lines), output_dir=build_dir)
+
+        self.start_task("build", task)
 
     def _update_custom_atlas_visibility(self, checked: bool) -> None:
         if hasattr(self, "annotate_atlas_row"):
@@ -3114,11 +3967,15 @@ class LaminarBoundaryWindow(QMainWindow):
             if hasattr(self, name):
                 getattr(self, name).setVisible(active)
         if hasattr(self, "export_button"):
-            self.export_button.setVisible(not active)
+            self.export_button.hide()
 
     def _path_choices_for_slice(self, slice_index: int) -> Dict[str, str]:
         choices = {"outer_path": "auto", "inner_path": "auto"}
-        row = self.annotation_rows.get(slice_index)
+        row = (
+            self.shell_cut_rows_by_slice.get(slice_index)
+            if self.annotation_pick_mode_kind == "shell_cut"
+            else self.annotation_rows.get(slice_index)
+        )
         if row is not None:
             choices["outer_path"] = self._normalize_annotation_path_choice(row.get("outer_path"))
             choices["inner_path"] = self._normalize_annotation_path_choice(row.get("inner_path"))
@@ -3172,6 +4029,29 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _sync_current_path_choices_to_row(self, note: str = "path_edit") -> Optional[Path]:
         slice_index = int(self.annotate_slice.value())
+        if self.annotation_pick_mode_kind == "shell_cut":
+            row = self.shell_cut_rows_by_slice.get(slice_index)
+            if row is None:
+                return None
+            outer_path = self.annotate_outer_path.currentText()
+            inner_path = self.annotate_inner_path.currentText()
+            row["outer_path"] = outer_path
+            row["inner_path"] = inner_path
+            row["note"] = note
+            annotation_row = self.annotation_rows.get(slice_index)
+            if annotation_row is not None:
+                annotation_row["outer_path"] = outer_path
+                annotation_row["inner_path"] = inner_path
+                annotation_row["note"] = f"derived_from_shell_cut_{note}"
+                self.annotation_boundary_cache.pop(slice_index, None)
+            self.annotation_path_choices_by_slice[slice_index] = {
+                "outer_path": outer_path,
+                "inner_path": inner_path,
+            }
+            shell_path = self._autosave_shell_cut_annotations()
+            self._autosave_annotation_rows()
+            return shell_path
+
         row = self.annotation_rows.get(slice_index)
         if row is None:
             return None
@@ -3194,8 +4074,12 @@ class LaminarBoundaryWindow(QMainWindow):
         if contour is None:
             return None
         landmarks = self.slice_canvas.landmarks
-        start_name = f"{arc_name}_start"
-        end_name = f"{arc_name}_end"
+        if self.annotation_pick_mode_kind == "shell_cut":
+            start_name = f"{arc_name}_cut_A"
+            end_name = f"{arc_name}_cut_B"
+        else:
+            start_name = f"{arc_name}_start"
+            end_name = f"{arc_name}_end"
         if start_name not in landmarks or end_name not in landmarks:
             return None
         path_choice = (
@@ -3219,8 +4103,12 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         if arc_name not in ("outer", "inner"):
             return
-        start_name = f"{arc_name}_start"
-        end_name = f"{arc_name}_end"
+        if self.annotation_pick_mode_kind == "shell_cut":
+            start_name = f"{arc_name}_cut_A"
+            end_name = f"{arc_name}_cut_B"
+        else:
+            start_name = f"{arc_name}_start"
+            end_name = f"{arc_name}_end"
         if start_name not in self.slice_canvas.landmarks or end_name not in self.slice_canvas.landmarks:
             self.annotate_status.setText(
                 f"Set {start_name} and {end_name} before flipping the {arc_name} path."
@@ -3243,7 +4131,7 @@ class LaminarBoundaryWindow(QMainWindow):
         slice_index = int(self.annotate_slice.value())
         saved = f" Autosaved: {autosave_path}" if autosave_path is not None else ""
         self.annotate_status.setText(
-            f"Slice {slice_index}: {arc_name} path flipped to {new_choice}.{saved}"
+            f"Slice {slice_index}: {arc_name} contour side flipped to {new_choice}.{saved}"
         )
         self.slice_canvas.setFocus(Qt.OtherFocusReason)
 
@@ -3570,6 +4458,9 @@ class LaminarBoundaryWindow(QMainWindow):
             return []
         target_count = min(len(viable), max(8, min(72, (len(viable) + 7) // 8)))
         picked = set(self._pick_evenly_spaced_slices(viable, target_count))
+        if self.annotation_region_slices:
+            picked.add(int(self.annotation_region_slices[0]))
+            picked.add(int(self.annotation_region_slices[-1]))
 
         features = self._slice_shape_features(viable)
         for slice_index in self._tail_anchor_slices(viable, features):
@@ -3594,23 +4485,23 @@ class LaminarBoundaryWindow(QMainWindow):
         if not target_slices:
             return None, "No annotation target slice is available yet."
 
-        accepted = sorted(slice_index for slice_index in self.annotation_rows if slice_index in target_slices)
+        accepted = sorted(slice_index for slice_index in self.shell_cut_rows_by_slice if slice_index in target_slices)
         first_slice = target_slices[0]
         last_slice = target_slices[-1]
         if not accepted:
-            return first_slice, "Start the suggested set from the first stable slice."
+            return first_slice, "Start the suggested set from the first region slice."
 
-        if first_slice not in self.annotation_rows:
-            return first_slice, "Add the first stable slice in the suggested set."
-        if last_slice not in self.annotation_rows:
-            return last_slice, "Add the last stable slice in the suggested set."
+        if first_slice not in self.shell_cut_rows_by_slice:
+            return first_slice, "Add the first region slice in the suggested set."
+        if last_slice not in self.shell_cut_rows_by_slice:
+            return last_slice, "Add the last region slice in the suggested set."
 
         best_target = None
         best_gap = -1
         best_pair = None
         for left, right in zip(accepted[:-1], accepted[1:]):
             between = [slice_index for slice_index in target_slices if left < slice_index < right]
-            candidates = [slice_index for slice_index in between if slice_index not in self.annotation_rows]
+            candidates = [slice_index for slice_index in between if slice_index not in self.shell_cut_rows_by_slice]
             if not candidates:
                 continue
             gap = len(between) + 1
@@ -3625,7 +4516,7 @@ class LaminarBoundaryWindow(QMainWindow):
             left, right = best_pair
             return best_target, f"Fill the widest unchecked gap between accepted slices {left} and {right}."
 
-        missing = [slice_index for slice_index in target_slices if slice_index not in self.annotation_rows]
+        missing = [slice_index for slice_index in target_slices if slice_index not in self.shell_cut_rows_by_slice]
         if missing:
             current = int(self.annotate_slice.value())
             target = min(missing, key=lambda slice_index: (abs(slice_index - current), slice_index))
@@ -3658,6 +4549,9 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         slice_index = int(self.annotate_slice.value())
         self.annotation_skipped_slices.add(slice_index)
+        if self.annotation_pick_mode_kind == "shell_cut":
+            self.shell_cut_landmarks_by_slice.pop(slice_index, None)
+            self.shell_cut_rows_by_slice.pop(slice_index, None)
         self.annotation_rows.pop(slice_index, None)
         self.annotation_landmarks_by_slice.pop(slice_index, None)
         self.annotation_path_choices_by_slice.pop(slice_index, None)
@@ -3667,6 +4561,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self._set_next_annotation_mode()
         self.refresh_annotation_preview()
         self._update_annotation_status()
+        if self.annotation_pick_mode_kind == "shell_cut":
+            self._autosave_shell_cut_annotations()
         autosave_path = self._autosave_annotation_rows()
         saved = f" Autosaved: {autosave_path}" if autosave_path is not None else ""
         self.append_log(f"Skipped slice {slice_index}: unusable contour.{saved}\n")
@@ -3692,6 +4588,10 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         slice_index = int(self.annotate_slice.value())
         row = self._annotation_row_from_cap(contour, mode, note=f"{mode}_interactive")
+        if self.annotation_pick_mode_kind == "shell_cut":
+            shell_row = self._shell_cut_row_from_cap(contour, mode, note=f"{mode}_manual_2d")
+            self.shell_cut_rows_by_slice[slice_index] = shell_row
+            self.shell_cut_landmarks_by_slice.pop(slice_index, None)
         self.annotation_rows[slice_index] = row
         self.annotation_landmarks_by_slice.pop(slice_index, None)
         self.annotation_path_choices_by_slice[slice_index] = {
@@ -3705,8 +4605,15 @@ class LaminarBoundaryWindow(QMainWindow):
         self._set_next_annotation_mode()
         self.refresh_annotation_preview()
         self._update_annotation_status()
+        shell_autosave_path = (
+            self._autosave_shell_cut_annotations()
+            if self.annotation_pick_mode_kind == "shell_cut"
+            else None
+        )
         autosave_path = self._autosave_annotation_rows()
         saved = f" Autosaved: {autosave_path}" if autosave_path is not None else ""
+        if shell_autosave_path is not None:
+            saved += f" Shell-cut autosaved: {shell_autosave_path}"
         label = self._surface_mode_label(mode)
         self.append_log(f"Marked slice {slice_index} as {label}.{saved}\n")
 
@@ -3717,13 +4624,20 @@ class LaminarBoundaryWindow(QMainWindow):
         self._go_to_next_annotation_slice()
 
     def undo_annotation_point(self) -> None:
+        if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
+            self.undo_3d_annotation_action()
+            return
         if not self._annotation_shortcuts_active():
             return
-        for name in reversed(SliceCanvas.LANDMARK_ORDER):
+        order = SliceCanvas.SHELL_CUT_ORDER if self.annotation_pick_mode_kind == "shell_cut" else SliceCanvas.LANDMARK_ORDER
+        for name in reversed(order):
             if name in self.slice_canvas.landmarks:
                 self.slice_canvas.landmarks.pop(name, None)
                 slice_index = int(self.annotate_slice.value())
-                self.annotation_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
+                if self.annotation_pick_mode_kind == "shell_cut":
+                    self.shell_cut_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
+                else:
+                    self.annotation_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
                 self._set_next_annotation_mode()
                 self._update_annotation_status()
                 self.slice_canvas.update()
@@ -3732,9 +4646,16 @@ class LaminarBoundaryWindow(QMainWindow):
     def navigate_annotation_history(self, direction: int) -> None:
         if not self._annotation_shortcuts_active():
             return
-        accepted_slices = sorted(self.annotation_rows)
+        accepted_slices = (
+            sorted(self.shell_cut_rows_by_slice)
+            if self.annotation_pick_mode_kind == "shell_cut"
+            else sorted(self.annotation_rows)
+        )
         if not accepted_slices:
-            self.annotate_status.setText("No accepted slices yet.")
+            if self.annotation_pick_mode_kind == "shell_cut":
+                self.annotate_status.setText("No accepted shell-cut slices yet.")
+            else:
+                self.annotate_status.setText("No accepted slices yet.")
             return
 
         current = int(self.annotate_slice.value())
@@ -3747,12 +4668,29 @@ class LaminarBoundaryWindow(QMainWindow):
 
         self.annotate_slice.setValue(target)
         self.slice_canvas.setFocus(Qt.OtherFocusReason)
-        self.annotate_status.setText(f"Showing accepted slice {target}. Click a point to move it.")
+        if self.annotation_pick_mode_kind == "shell_cut":
+            self.annotate_status.setText(f"Showing accepted shell-cut slice {target}. Click a point to move it.")
+        else:
+            self.annotate_status.setText(f"Showing accepted slice {target}. Click a point to move it.")
 
     def accept_annotation_slice_and_advance(self) -> None:
+        if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
+            if self.surface_preview_canvas.can_build_3d_surfaces():
+                self.run_3d_surface_build()
+            else:
+                self.annotate_status.setText(
+                    "Close at least one 3D cut curve and select a surface patch before building."
+                )
+            return
         if not self._annotation_shortcuts_active():
             return
         if self.accept_annotation_slice(show_success=False):
+            if self.annotation_pick_mode_kind == "shell_cut":
+                if self._annotation_target_set_complete():
+                    self.finish_annotation_and_run_build()
+                    return
+                self._go_to_next_annotation_slice()
+                return
             if self.review_mode_active:
                 self.review_checked_slices.add(int(self.annotate_slice.value()))
                 self._update_annotation_progress()
@@ -3769,7 +4707,7 @@ class LaminarBoundaryWindow(QMainWindow):
         target_slices = self._target_annotation_slices()
         if not target_slices:
             return False
-        return all(slice_index in self.annotation_rows for slice_index in target_slices)
+        return all(slice_index in self.shell_cut_rows_by_slice for slice_index in target_slices)
 
     def _auto_build_output_dir(self) -> Path:
         output_text = self.annotate_output.text().strip()
@@ -3781,7 +4719,7 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def finish_annotation_and_run_build(self) -> None:
         target_slices = self._target_annotation_slices()
-        missing = [slice_index for slice_index in target_slices if slice_index not in self.annotation_rows]
+        missing = [slice_index for slice_index in target_slices if slice_index not in self.shell_cut_rows_by_slice]
         if missing:
             self.annotate_slice.setValue(missing[0])
             self.annotate_status.setText(f"Still missing suggested slice {missing[0]}.")
@@ -3791,8 +4729,11 @@ class LaminarBoundaryWindow(QMainWindow):
             if not self.annotate_output.text().strip():
                 self.annotate_output.set_text(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
+            self._sync_derived_annotation_rows_from_shell_cut()
             csv_path = output_dir / "manual_landmarks_interactive.csv"
             self._write_annotation_rows_csv(csv_path)
+            shell_cut_path = output_dir / "shell_cut_annotations.json"
+            self._write_shell_cut_annotations_json(shell_cut_path)
             self._sync_build_from_annotation(csv_path, output_dir)
             self.annotation_picking_active = False
             self.annotation_settings_expanded = True
@@ -3802,9 +4743,11 @@ class LaminarBoundaryWindow(QMainWindow):
             self.tabs.setCurrentIndex(1)
             self.append_log(
                 f"Suggested annotation set complete: {len(target_slices)} slices.\n"
-                f"Saved manual landmarks: {csv_path}\n"
+                f"Saved shell-cut annotations: {shell_cut_path}\n"
+                f"Saved derived build CSV: {csv_path}\n"
                 "Build settings are ready for review.\n"
             )
+            self.append_log(f"Saved shell-cut annotations: {shell_cut_path}\n")
             reply = QMessageBox.question(
                 self,
                 "Annotation saved",
@@ -3827,14 +4770,14 @@ class LaminarBoundaryWindow(QMainWindow):
                 next_slice = slice_index
                 break
         if next_slice is None:
-            missing = [slice_index for slice_index in target_slices if slice_index not in self.annotation_rows]
+            missing = [slice_index for slice_index in target_slices if slice_index not in self.shell_cut_rows_by_slice]
             if missing:
                 next_slice = missing[0]
             elif self.annotation_target_slices:
                 self.annotate_status.setText("Reached the last suggested slice. Press Enter to build.")
                 return
             else:
-                self.annotate_status.setText("Reached the last region slice. Save CSV when you are done.")
+                self.annotate_status.setText("Reached the last region slice. Save shell-cut annotations when you are done.")
                 return
 
         self.annotate_slice.setValue(next_slice)
@@ -3965,6 +4908,8 @@ class LaminarBoundaryWindow(QMainWindow):
     def start_annotation_preview_cache_warmup(self, current_slice: int) -> None:
         if self.annotation_mask_data is None or self.annotation_preview_thread is not None:
             return
+        if self._has_3d_annotation_shell():
+            return
 
         self.annotation_preview_request_id += 1
         request_id = self.annotation_preview_request_id
@@ -4072,6 +5017,26 @@ class LaminarBoundaryWindow(QMainWindow):
             self.temporary_mask_dir.cleanup()
             self.temporary_mask_dir = None
 
+    @staticmethod
+    def _preview_shell_mask(prepared_mask, max_dim: int = 260):
+        np = _numpy()
+        mask = np.asarray(prepared_mask, dtype=bool)
+        if mask.ndim != 3 or max(mask.shape) <= max_dim:
+            return mask, np.ones(3, dtype=float)
+        stride = int(math.ceil(max(mask.shape) / float(max_dim)))
+        stride = max(1, stride)
+        pad_width = [(0, (-dim) % stride) for dim in mask.shape]
+        padded = np.pad(mask, pad_width, mode="constant", constant_values=False)
+        reduced = padded.reshape(
+            padded.shape[0] // stride,
+            stride,
+            padded.shape[1] // stride,
+            stride,
+            padded.shape[2] // stride,
+            stride,
+        ).max(axis=(1, 3, 5))
+        return reduced, np.asarray([stride, stride, stride], dtype=float)
+
     def _prepare_annotation_load_data(
         self,
         mask_data,
@@ -4100,6 +5065,31 @@ class LaminarBoundaryWindow(QMainWindow):
         )
         slice_counts = np.asarray(slice_counts, dtype=np.int64)
         region_slices = [int(index) for index in np.flatnonzero(slice_counts)]
+        load_warnings = list(warnings or [])
+        shell_mesh = None
+        shell_errors = []
+        preview_mask, preview_scale = self._preview_shell_mask(prepared_mask)
+        for backend in (core.SHELL_BACKEND_VOXEL,):
+            try:
+                scale_label = (
+                    f", preview downsample x{int(preview_scale[0])}"
+                    if int(preview_scale[0]) > 1
+                    else ""
+                )
+                emit(f"Building fast 3D shell preview (voxel shell{scale_label})...")
+                shell_mesh = core.build_shell_mesh(
+                    preview_mask,
+                    shell_backend=backend,
+                    max_surface_quads=1_500_000,
+                )
+                if int(preview_scale[0]) > 1:
+                    shell_mesh.vertices = np.asarray(shell_mesh.vertices, dtype=float) * preview_scale.reshape(1, 3)
+                    shell_mesh.backend = f"voxel_preview_x{int(preview_scale[0])}"
+                break
+            except Exception as exc:
+                shell_errors.append(f"{backend}: {exc}")
+        if shell_mesh is None and shell_errors:
+            load_warnings.append("3D shell preview failed. " + " | ".join(shell_errors))
         emit(f"Mask ready with {len(region_slices)} non-empty slices.")
         return AnnotationLoadData(
             mask_data=prepared_mask,
@@ -4109,7 +5099,8 @@ class LaminarBoundaryWindow(QMainWindow):
             slice_axis_int=slice_axis_int,
             slice_counts=slice_counts,
             region_slices=region_slices,
-            warnings=list(warnings or []),
+            shell_mesh=shell_mesh,
+            warnings=load_warnings,
         )
 
     def _finish_annotation_load(
@@ -4122,12 +5113,17 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_mask_path = load_data.mask_path
         self.annotation_mask_is_temporary = load_data.temporary
         self.annotate_mask.set_text(self.annotation_mask_path)
+        self.annotation_pick_mode_kind = "shell_cut"
+        if hasattr(self, "annotate_pick_mode"):
+            self.annotate_pick_mode.setCurrentText("Shell Cut Boundary")
 
         max_slice = self.annotation_mask_data.shape[self.annotation_slice_axis_int] - 1
         self.annotation_slice_counts = load_data.slice_counts
         self.annotation_region_slices = list(load_data.region_slices)
         self.annotation_landmarks_by_slice.clear()
         self.annotation_rows.clear()
+        self.shell_cut_landmarks_by_slice.clear()
+        self.shell_cut_rows_by_slice.clear()
         self.annotation_path_choices_by_slice.clear()
         self.annotation_skipped_slices.clear()
         self.annotation_contours_by_slice.clear()
@@ -4158,8 +5154,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_slice.blockSignals(False)
         if hasattr(self, "surface_preview_canvas"):
             self.surface_preview_canvas.set_reference_contours([], self.annotation_slice_axis_int)
+            self.surface_preview_canvas.set_shell_mesh(load_data.shell_mesh)
         self._set_annotation_path_widgets("auto", "auto")
-        self.refresh_annotation_slice()
+        if load_data.shell_mesh is None:
+            self.refresh_annotation_slice()
+        else:
+            self._update_annotation_status()
         self._update_annotation_readiness()
         self.enter_annotation_picking_mode()
         self.start_annotation_preview_cache_warmup(initial_slice)
@@ -4408,7 +5408,7 @@ class LaminarBoundaryWindow(QMainWindow):
     def _prune_annotation_contour_cache(self, current_slice: int) -> None:
         if len(self.annotation_contours_by_slice) <= ANNOTATION_CONTOUR_CACHE_LIMIT:
             return
-        protected = set(self.annotation_rows)
+        protected = set(self.annotation_rows) | set(self.shell_cut_rows_by_slice)
         protected.add(current_slice)
         removable = [
             slice_index
@@ -4433,6 +5433,8 @@ class LaminarBoundaryWindow(QMainWindow):
         previous_index = max(0, self.annotate_contour.currentIndex())
         selected_index = previous_index
         accepted_row = self.annotation_rows.get(slice_index)
+        if self.annotation_pick_mode_kind == "shell_cut":
+            accepted_row = self.shell_cut_rows_by_slice.get(slice_index)
         if accepted_row is not None:
             try:
                 contour_id = int(float(accepted_row.get("contour_id", "")))
@@ -4453,7 +5455,10 @@ class LaminarBoundaryWindow(QMainWindow):
             self.annotate_contour.setCurrentIndex(min(selected_index, len(contours) - 1))
         self.annotate_contour.blockSignals(False)
 
-        landmarks = self.annotation_landmarks_by_slice.get(slice_index, {})
+        if self.annotation_pick_mode_kind == "shell_cut":
+            landmarks = self.shell_cut_landmarks_by_slice.get(slice_index, {})
+        else:
+            landmarks = self.annotation_landmarks_by_slice.get(slice_index, {})
         path_choices = self._path_choices_for_slice(slice_index)
         self._set_annotation_path_widgets(path_choices["outer_path"], path_choices["inner_path"])
         image = self._annotation_image_for_slice(slice_index)
@@ -4514,6 +5519,30 @@ class LaminarBoundaryWindow(QMainWindow):
             "note": note,
         }
 
+    def _boundary_landmarks_from_shell_cut(self, shell_landmarks: Dict[str, int]) -> Dict[str, int]:
+        return {
+            "outer_start": int(shell_landmarks["outer_cut_A"]),
+            "outer_end": int(shell_landmarks["outer_cut_B"]),
+            "inner_start": int(shell_landmarks["inner_cut_A"]),
+            "inner_end": int(shell_landmarks["inner_cut_B"]),
+        }
+
+    def _annotation_row_from_shell_cut_landmarks(
+        self,
+        contour,
+        shell_landmarks: Dict[str, int],
+        note: str = "derived_from_shell_cut",
+        outer_path: Optional[str] = None,
+        inner_path: Optional[str] = None,
+    ) -> Dict[str, str]:
+        return self._annotation_row_from_landmarks(
+            contour,
+            self._boundary_landmarks_from_shell_cut(shell_landmarks),
+            note=note,
+            outer_path=outer_path if outer_path is not None else self.annotate_outer_path.currentText(),
+            inner_path=inner_path if inner_path is not None else self.annotate_inner_path.currentText(),
+        )
+
     def _annotation_row_from_cap(
         self,
         contour,
@@ -4567,6 +5596,139 @@ class LaminarBoundaryWindow(QMainWindow):
             writer.writeheader()
             for slice_index in sorted(self.annotation_rows):
                 writer.writerow(self.annotation_rows[slice_index])
+
+    def _shell_cut_row_from_landmarks(
+        self,
+        contour,
+        landmarks: Dict[str, int],
+        note: str = "manual_2d",
+    ) -> Dict:
+        core = _core()
+        points = core._normalize_contour(contour.points)
+        point_rows = {}
+        for name in SliceCanvas.SHELL_CUT_ORDER:
+            index = int(landmarks[name])
+            point = points[index]
+            point_rows[name] = {
+                "index": index,
+                "point": [float(point[0]), float(point[1]), float(point[2])],
+            }
+        return {
+            "slice_index": int(contour.slice_index),
+            "contour_id": int(contour.contour_id),
+            "source": "manual_2d",
+            "note": note,
+            "outer_path": self._normalize_annotation_path_choice(self.annotate_outer_path.currentText()),
+            "inner_path": self._normalize_annotation_path_choice(self.annotate_inner_path.currentText()),
+            "points": point_rows,
+        }
+
+    def _shell_cut_row_from_cap(
+        self,
+        contour,
+        surface_mode: str,
+        note: str = "manual_2d_cap",
+    ) -> Dict:
+        mode = _core().normalize_surface_mode(surface_mode)
+        return {
+            "slice_index": int(contour.slice_index),
+            "contour_id": int(contour.contour_id),
+            "source": "manual_2d",
+            "surface_mode": mode,
+            "note": note,
+            "outer_path": "whole" if mode == "outer_only" else "",
+            "inner_path": "whole" if mode == "inner_only" else "",
+            "points": {},
+        }
+
+    def _sync_derived_annotation_rows_from_shell_cut(self) -> None:
+        self.annotation_rows.clear()
+        self.annotation_landmarks_by_slice.clear()
+        self.annotation_path_choices_by_slice.clear()
+        self.annotation_boundary_cache.clear()
+        core = _core()
+        for slice_index in sorted(self.shell_cut_rows_by_slice):
+            row = self.shell_cut_rows_by_slice[slice_index]
+            contours = self.annotation_contours_by_slice.get(slice_index)
+            if contours is None:
+                contours = self._extract_contours_for_annotation_slice(slice_index)
+                self.annotation_contours_by_slice[slice_index] = contours
+                self._prune_annotation_contour_cache(slice_index)
+            contour = core._select_contour_for_row(row, contours)
+            surface_mode = core.normalize_surface_mode(row.get("surface_mode"))
+            if surface_mode != "normal":
+                self.annotation_rows[slice_index] = self._annotation_row_from_cap(
+                    contour,
+                    surface_mode,
+                    note=row.get("note") or "derived_from_shell_cut_cap",
+                )
+                self.annotation_landmarks_by_slice.pop(slice_index, None)
+                self.annotation_path_choices_by_slice[slice_index] = {
+                    "outer_path": row.get("outer_path", ""),
+                    "inner_path": row.get("inner_path", ""),
+                }
+                continue
+            points = row.get("points", {})
+            shell_landmarks = {
+                name: int(points[name]["index"])
+                for name in SliceCanvas.SHELL_CUT_ORDER
+                if name in points and isinstance(points[name], dict) and points[name].get("index") is not None
+            }
+            if not all(name in shell_landmarks for name in SliceCanvas.SHELL_CUT_ORDER):
+                continue
+            boundary_landmarks = self._boundary_landmarks_from_shell_cut(shell_landmarks)
+            outer_path = self._normalize_annotation_path_choice(row.get("outer_path"))
+            inner_path = self._normalize_annotation_path_choice(row.get("inner_path"))
+            self.annotation_rows[slice_index] = self._annotation_row_from_shell_cut_landmarks(
+                contour,
+                shell_landmarks,
+                note="derived_from_shell_cut",
+                outer_path=outer_path,
+                inner_path=inner_path,
+            )
+            self.annotation_landmarks_by_slice[slice_index] = boundary_landmarks
+            self.annotation_path_choices_by_slice[slice_index] = {
+                "outer_path": outer_path,
+                "inner_path": inner_path,
+            }
+
+    def _shell_cut_annotations_payload(self) -> Dict:
+        return {
+            "schema": "laminar_boundary_builder.shell_cut_annotations.v1",
+            "annotation_type": "manual_2d_shell_cut_boundary",
+            "slice_axis": int(self.annotation_slice_axis_int),
+            "mask_path": str(self.annotation_mask_path) if self.annotation_mask_path else None,
+            "rows": [
+                self.shell_cut_rows_by_slice[slice_index]
+                for slice_index in sorted(self.shell_cut_rows_by_slice)
+            ],
+        }
+
+    def _write_shell_cut_annotations_json(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._shell_cut_annotations_payload()
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+    def _autosave_shell_cut_annotations(self) -> Optional[Path]:
+        if not self.shell_cut_rows_by_slice:
+            return None
+        saved_path = None
+        try:
+            self._write_shell_cut_annotations_json(self.shell_cut_autosave_path)
+            saved_path = self.shell_cut_autosave_path
+        except Exception as exc:
+            self.append_log(f"Shell-cut autosave failed: {exc}\n")
+
+        output_text = self.annotate_output.text().strip()
+        if output_text:
+            try:
+                output_path = Path(output_text).expanduser() / "shell_cut_annotations.json"
+                self._write_shell_cut_annotations_json(output_path)
+                saved_path = output_path
+            except Exception as exc:
+                self.append_log(f"Output shell-cut autosave failed: {exc}\n")
+        return saved_path
 
     def _autosave_annotation_rows(self) -> Optional[Path]:
         if not self.annotation_rows:
@@ -4668,6 +5830,11 @@ class LaminarBoundaryWindow(QMainWindow):
         if contour is None:
             return None
         landmarks = dict(self.slice_canvas.landmarks)
+        if self.annotation_pick_mode_kind == "shell_cut":
+            if not all(name in landmarks for name in SliceCanvas.SHELL_CUT_ORDER):
+                return None
+            row = self._annotation_row_from_shell_cut_landmarks(contour, landmarks, note="live_shell_cut")
+            return _core().make_boundary_from_landmark_row(contour, row, resample_points=64)
         if not all(name in landmarks for name in SliceCanvas.LANDMARK_ORDER):
             return None
         row = self._annotation_row_from_landmarks(contour, landmarks, note="live")
@@ -4681,6 +5848,9 @@ class LaminarBoundaryWindow(QMainWindow):
             self.annotate_inner_path.currentText(),
         )
         if not hasattr(self, "surface_preview_canvas"):
+            return
+        if self._has_3d_annotation_shell():
+            self.surface_preview_canvas.update()
             return
         if self.annotation_mask_data is None:
             self.surface_preview_canvas.set_reference_contours(
@@ -4744,6 +5914,54 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def on_landmark_changed(self, mode: str) -> None:
         slice_index = int(self.annotate_slice.value())
+        if self.annotation_pick_mode_kind == "shell_cut":
+            self.shell_cut_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
+            landmarks = self.shell_cut_landmarks_by_slice[slice_index]
+            existing_row = self.shell_cut_rows_by_slice.get(slice_index)
+            if (
+                existing_row is not None
+                and _core().normalize_surface_mode(existing_row.get("surface_mode")) != "normal"
+            ):
+                self.shell_cut_rows_by_slice.pop(slice_index, None)
+                self.annotation_rows.pop(slice_index, None)
+                self.annotation_path_choices_by_slice.pop(slice_index, None)
+                self.annotation_boundary_cache.pop(slice_index, None)
+            is_complete = all(name in landmarks for name in SliceCanvas.SHELL_CUT_ORDER)
+            if slice_index in self.shell_cut_rows_by_slice and is_complete:
+                contour = self.slice_canvas.selected_contour()
+                if contour is not None:
+                    row = self._shell_cut_row_from_landmarks(
+                        contour,
+                        landmarks,
+                        note="manual_2d_edit",
+                    )
+                    outer_path = self._normalize_annotation_path_choice(row.get("outer_path"))
+                    inner_path = self._normalize_annotation_path_choice(row.get("inner_path"))
+                    self.shell_cut_rows_by_slice[slice_index] = row
+                    self.annotation_rows[slice_index] = self._annotation_row_from_shell_cut_landmarks(
+                        contour,
+                        landmarks,
+                        note="derived_from_shell_cut_edit",
+                        outer_path=outer_path,
+                        inner_path=inner_path,
+                    )
+                    self.annotation_landmarks_by_slice[slice_index] = self._boundary_landmarks_from_shell_cut(landmarks)
+                    self.annotation_path_choices_by_slice[slice_index] = {
+                        "outer_path": outer_path,
+                        "inner_path": inner_path,
+                    }
+                    self.annotation_boundary_cache.pop(slice_index, None)
+                    autosave_path = self._autosave_shell_cut_annotations()
+                    if autosave_path is not None:
+                        self.append_log(
+                            f"Updated shell-cut slice {slice_index}; autosaved: {autosave_path}\n"
+                        )
+                    self._autosave_annotation_rows()
+            self._set_next_annotation_mode()
+            self._update_annotation_status()
+            self.refresh_annotation_preview()
+            return
+
         self.annotation_landmarks_by_slice[slice_index] = dict(self.slice_canvas.landmarks)
         landmarks = self.annotation_landmarks_by_slice[slice_index]
         is_complete = all(name in landmarks for name in SliceCanvas.LANDMARK_ORDER)
@@ -4770,7 +5988,66 @@ class LaminarBoundaryWindow(QMainWindow):
             self.slice_canvas.set_progress_text("")
             self._update_annotation_review_slice_choices()
             return
+        if self._has_3d_annotation_shell():
+            curve_count, point_count, patch_count = self.surface_preview_canvas.annotation_counts()
+            if point_count:
+                status = f"3D shell ready. Drawing curve with {point_count} point(s). Click an active point to close."
+            elif curve_count and patch_count:
+                status = (
+                    f"3D shell ready. {curve_count} closed curve(s), "
+                    f"{patch_count} selected surface patch(es). Build is ready."
+                )
+            elif curve_count:
+                status = f"3D shell ready. {curve_count} closed curve(s). Hover and click a surface patch to keep."
+            else:
+                status = "3D shell ready. Click the shaded shell surface to draw the first closed curve."
+            self.annotate_status.setText(status)
+            self._update_annotation_progress()
+            self._update_annotation_review_slice_choices()
+            self.on_3d_annotation_changed()
+            return
         slice_index = int(self.annotate_slice.value())
+        if self.annotation_pick_mode_kind == "shell_cut":
+            landmarks = self.shell_cut_landmarks_by_slice.get(slice_index, self.slice_canvas.landmarks)
+            missing = [name for name in SliceCanvas.SHELL_CUT_ORDER if name not in landmarks]
+            accepted_count = len(self.shell_cut_rows_by_slice)
+            contour_text = "no contour" if not self.slice_canvas.contours else f"contour {self.slice_canvas.selected_contour_index}"
+            row = self.shell_cut_rows_by_slice.get(slice_index)
+            if slice_index in self.annotation_skipped_slices:
+                self.annotate_status.setText(
+                    f"Shell Cut Boundary, slice {slice_index} is skipped because its contour is not usable. "
+                    "Clear Current Slice if you want to annotate it."
+                )
+            elif row is not None and _core().normalize_surface_mode(row.get("surface_mode")) != "normal":
+                label = self._surface_mode_label(row.get("surface_mode", "normal"))
+                self.annotate_status.setText(
+                    f"Shell Cut Boundary, slice {slice_index}, {contour_text}. Marked as {label}. "
+                    "Clear Current Slice if you want four-point shell-cut annotation. "
+                    f"Accepted shell-cut slices: {accepted_count}."
+                )
+            elif missing:
+                prefix = "Editing accepted shell-cut slice. " if slice_index in self.shell_cut_rows_by_slice else ""
+                self.annotate_status.setText(
+                    f"{prefix}Shell Cut Boundary, slice {slice_index}, {contour_text}. "
+                    f"Missing: {', '.join(missing)}. Accepted shell-cut slices: {accepted_count}."
+                )
+            elif self.slice_canvas.shell_cut_overlap_excess() > 0:
+                self.annotate_status.setText(
+                    f"Shell Cut Boundary, slice {slice_index}, {contour_text}. "
+                    "Outer and inner arcs overlap. Move the inner points outside the outer arc, "
+                    "or use Flip Outer / Flip Inner. "
+                    f"Accepted shell-cut slices: {accepted_count}."
+                )
+            else:
+                self.annotate_status.setText(
+                    f"Shell Cut Boundary, slice {slice_index}, {contour_text}. "
+                    f"All four endpoints are set. Press Enter or click Accept Slice + Next. "
+                    f"Accepted shell-cut slices: {accepted_count}."
+                )
+            self._update_annotation_progress()
+            self._update_annotation_review_slice_choices()
+            return
+
         landmarks = self.annotation_landmarks_by_slice.get(slice_index, self.slice_canvas.landmarks)
         missing = [
             name
@@ -4821,20 +6098,28 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _update_annotation_progress(self) -> None:
         region_total = len(self.annotation_region_slices)
+        if self._has_3d_annotation_shell():
+            curve_count, point_count, patch_count = self.surface_preview_canvas.annotation_counts()
+            shell_mesh = self.surface_preview_canvas.shell_mesh
+            vertex_count = len(getattr(shell_mesh, "vertices", []))
+            face_count = len(getattr(shell_mesh, "faces", []))
+            backend = getattr(shell_mesh, "backend", "voxel")
+            if region_total:
+                first_slice = self.annotation_region_slices[0]
+                last_slice = self.annotation_region_slices[-1]
+                range_text = f"{region_total} non-empty slices ({first_slice}-{last_slice})"
+            else:
+                range_text = "0 non-empty slices"
+            self.annotate_progress.setText(
+                f"3D shell: {vertex_count:,} points, {face_count:,} faces ({backend}). "
+                f"Mask: {range_text}. "
+                f"Closed curves: {curve_count}. Active points: {point_count}. Selected patches: {patch_count}."
+            )
+            self.slice_canvas.set_progress_text("")
+            return
         target_slices = self._target_annotation_slices()
         target_total = len(target_slices)
-        accepted = len([slice_index for slice_index in self.annotation_rows if slice_index in target_slices])
-        skipped = len(self.annotation_skipped_slices)
-        outer_only = sum(
-            1
-            for row in self.annotation_rows.values()
-            if _core().normalize_surface_mode(row.get("surface_mode")) == "outer_only"
-        )
-        inner_only = sum(
-            1
-            for row in self.annotation_rows.values()
-            if _core().normalize_surface_mode(row.get("surface_mode")) == "inner_only"
-        )
+        accepted = len([slice_index for slice_index in self.shell_cut_rows_by_slice if slice_index in target_slices])
         if region_total == 0:
             self.annotate_progress.setText("Region slices: 0. No annotation target yet.")
             self.slice_canvas.set_progress_text("Progress: no region slice found.")
@@ -4864,7 +6149,8 @@ class LaminarBoundaryWindow(QMainWindow):
             )
             return
         target = self._recommended_annotation_count()
-        all_accepted = len(self.annotation_rows)
+        all_accepted = len(self.shell_cut_rows_by_slice)
+        shell_cut_count = len(self.shell_cut_rows_by_slice)
         if self.annotation_target_slices:
             remaining = max(0, target_total - accepted)
             extra_slices = max(0, all_accepted - accepted)
@@ -4898,18 +6184,20 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_progress.setText(
             f"Region slices: {region_total} ({first_slice}-{last_slice}). "
             f"{progress_line} "
-            f"Outer-only: {outer_only}. Inner-only: {inner_only}. Skipped: {skipped}."
+            f"Shell-cut slices: {shell_cut_count}."
         )
         self.slice_canvas.set_progress_text(
             f"{canvas_line}\n"
             f"Current target slice: {current_position}/{target_total} (slice {current_slice})\n"
-            f"Region range: {first_slice}-{last_slice}, outer-only {outer_only}, inner-only {inner_only}, skipped {skipped}"
+            f"Region range: {first_slice}-{last_slice}, shell-cut {shell_cut_count}"
         )
 
     def accept_annotation_slice(self, show_success: bool = True) -> bool:
         if self.annotation_mask_data is None:
             QMessageBox.warning(self, "No mask", "Load a mask first.")
             return False
+        if self.annotation_pick_mode_kind == "shell_cut":
+            return self.accept_shell_cut_annotation_slice(show_success=show_success)
         contour = self.slice_canvas.selected_contour()
         if contour is None:
             QMessageBox.warning(self, "No contour", "No usable contour is available on this slice.")
@@ -4944,8 +6232,90 @@ class LaminarBoundaryWindow(QMainWindow):
             self.slice_canvas.setFocus(Qt.OtherFocusReason)
         return True
 
+    def accept_shell_cut_annotation_slice(self, show_success: bool = True) -> bool:
+        if self.annotation_mask_data is None:
+            QMessageBox.warning(self, "No mask", "Load a mask first.")
+            return False
+        contour = self.slice_canvas.selected_contour()
+        if contour is None:
+            QMessageBox.warning(self, "No contour", "No usable contour is available on this slice.")
+            return False
+        slice_index = int(self.annotate_slice.value())
+        landmarks = dict(self.slice_canvas.landmarks)
+        existing_row = self.shell_cut_rows_by_slice.get(slice_index)
+        if (
+            existing_row is not None
+            and _core().normalize_surface_mode(existing_row.get("surface_mode")) != "normal"
+        ):
+            self._update_annotation_status()
+            self.refresh_annotation_preview()
+            return True
+        missing = [name for name in SliceCanvas.SHELL_CUT_ORDER if name not in landmarks]
+        if missing:
+            QMessageBox.warning(self, "Missing shell-cut points", "Please set: " + ", ".join(missing))
+            return False
+        overlap_excess = self.slice_canvas.shell_cut_overlap_excess()
+        if overlap_excess > 0:
+            QMessageBox.warning(
+                self,
+                "Overlapping cut arcs",
+                (
+                    "Outer and inner cut arcs overlap on this contour.\n\n"
+                    "Move the inner points outside the outer arc, or use Flip Outer / Flip Inner "
+                    "so the two arcs only share endpoints."
+                ),
+            )
+            return False
+
+        row = self._shell_cut_row_from_landmarks(contour, landmarks)
+        outer_path = self._normalize_annotation_path_choice(row.get("outer_path"))
+        inner_path = self._normalize_annotation_path_choice(row.get("inner_path"))
+        self.shell_cut_rows_by_slice[slice_index] = row
+        self.shell_cut_landmarks_by_slice[slice_index] = landmarks
+        self.annotation_rows[slice_index] = self._annotation_row_from_shell_cut_landmarks(
+            contour,
+            landmarks,
+            outer_path=outer_path,
+            inner_path=inner_path,
+        )
+        self.annotation_landmarks_by_slice[slice_index] = self._boundary_landmarks_from_shell_cut(landmarks)
+        self.annotation_path_choices_by_slice[slice_index] = {
+            "outer_path": outer_path,
+            "inner_path": inner_path,
+        }
+        self.annotation_boundary_cache.pop(slice_index, None)
+        self.annotation_skipped_slices.discard(slice_index)
+        self._update_annotation_status()
+        self.refresh_annotation_preview()
+        self.append_log(f"Accepted shell-cut boundary points for slice {slice_index}\n")
+        autosave_path = self._autosave_shell_cut_annotations()
+        if autosave_path is not None:
+            self.append_log(f"Autosaved shell-cut annotations: {autosave_path}\n")
+        csv_autosave_path = self._autosave_annotation_rows()
+        if csv_autosave_path is not None:
+            self.append_log(f"Autosaved derived build CSV: {csv_autosave_path}\n")
+        if show_success:
+            self.slice_canvas.setFocus(Qt.OtherFocusReason)
+        return True
+
     def clear_annotation_slice(self) -> None:
         slice_index = int(self.annotate_slice.value())
+        if self.annotation_pick_mode_kind == "shell_cut":
+            self.shell_cut_landmarks_by_slice.pop(slice_index, None)
+            self.shell_cut_rows_by_slice.pop(slice_index, None)
+            self.annotation_landmarks_by_slice.pop(slice_index, None)
+            self.annotation_rows.pop(slice_index, None)
+            self.annotation_path_choices_by_slice.pop(slice_index, None)
+            self.annotation_boundary_cache.pop(slice_index, None)
+            self.annotation_skipped_slices.discard(slice_index)
+            self.slice_canvas.landmarks = {}
+            self._set_next_annotation_mode()
+            self.slice_canvas.update()
+            self._update_annotation_status()
+            self.refresh_annotation_preview()
+            self._autosave_shell_cut_annotations()
+            self._autosave_annotation_rows()
+            return
         self.annotation_landmarks_by_slice.pop(slice_index, None)
         self.annotation_rows.pop(slice_index, None)
         self.annotation_path_choices_by_slice.pop(slice_index, None)
@@ -5030,33 +6400,134 @@ class LaminarBoundaryWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Load mask first",
-                "Load the same target mask before loading a previous manual CSV.",
+                "Load the same target mask before loading previous shell-cut annotations.",
             )
             return
 
         try:
-            csv_path = self._require_path("Previous CSV", self.annotate_previous_csv.text())
-            self._load_annotation_rows_from_csv(csv_path, show_message=True)
+            json_path = self._require_path("Previous shell-cut JSON", self.annotate_previous_csv.text())
+            self._load_shell_cut_rows_from_json(json_path, show_message=True)
         except Exception as exc:
-            self._show_exception_dialog("Load previous CSV failed", exc)
+            self._show_exception_dialog("Load previous shell-cut JSON failed", exc)
+
+    def _load_shell_cut_rows_from_json(
+        self,
+        json_path: Path,
+        output_dir: Optional[Path] = None,
+        show_message: bool = True,
+        sync_build: bool = True,
+    ) -> tuple[int, List[str]]:
+        with Path(json_path).open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("schema") != "laminar_boundary_builder.shell_cut_annotations.v1":
+            raise ValueError("Expected shell_cut_annotations.json from the Shell Cut Boundary workflow.")
+        rows = data.get("rows", [])
+        if not rows:
+            raise ValueError("No shell-cut rows found in JSON.")
+
+        loaded_rows: Dict[int, Dict] = {}
+        loaded_landmarks: Dict[int, Dict[str, int]] = {}
+        errors: List[str] = []
+        for row in rows:
+            try:
+                slice_index = int(row["slice_index"])
+                contours = self.annotation_contours_by_slice.get(slice_index)
+                if contours is None:
+                    contours = self._extract_contours_for_annotation_slice(slice_index)
+                    self.annotation_contours_by_slice[slice_index] = contours
+                    self._prune_annotation_contour_cache(slice_index)
+                _core()._select_contour_for_row(row, contours)
+                surface_mode = _core().normalize_surface_mode(row.get("surface_mode"))
+                row["surface_mode"] = surface_mode
+                if surface_mode != "normal":
+                    row["points"] = {}
+                    row["outer_path"] = "whole" if surface_mode == "outer_only" else ""
+                    row["inner_path"] = "whole" if surface_mode == "inner_only" else ""
+                    loaded_rows[slice_index] = row
+                    continue
+                points = row.get("points", {})
+                landmarks = {
+                    name: int(points[name]["index"])
+                    for name in SliceCanvas.SHELL_CUT_ORDER
+                    if name in points and isinstance(points[name], dict) and points[name].get("index") is not None
+                }
+                missing = [name for name in SliceCanvas.SHELL_CUT_ORDER if name not in landmarks]
+                if missing:
+                    raise ValueError("missing " + ", ".join(missing))
+                row["outer_path"] = self._normalize_annotation_path_choice(row.get("outer_path"))
+                row["inner_path"] = self._normalize_annotation_path_choice(row.get("inner_path"))
+            except Exception as exc:
+                errors.append(f"slice {row.get('slice_index', '?')}: {exc}")
+                continue
+            loaded_rows[slice_index] = row
+            loaded_landmarks[slice_index] = landmarks
+
+        if not loaded_rows:
+            detail = "\n".join(errors[:8])
+            raise ValueError("No usable shell-cut rows were loaded." + (f"\n{detail}" if detail else ""))
+
+        self.shell_cut_rows_by_slice = loaded_rows
+        self.shell_cut_landmarks_by_slice = loaded_landmarks
+        self.annotation_skipped_slices.clear()
+        self.annotation_target_slices = sorted(loaded_rows)
+        self.annotate_previous_csv.set_text(json_path)
+        if output_dir is None:
+            output_dir = Path(self.annotate_output.text()).expanduser() if self.annotate_output.text().strip() else json_path.parent
+        if not self.annotate_output.text().strip():
+            self.annotate_output.set_text(output_dir)
+        self._sync_derived_annotation_rows_from_shell_cut()
+
+        if sync_build:
+            csv_path = output_dir / "manual_landmarks_interactive.csv"
+            self._write_annotation_rows_csv(csv_path)
+            self._sync_build_from_annotation(csv_path, output_dir)
+
+        first_slice = self.annotation_target_slices[0]
+        current_slice = int(self.annotate_slice.value())
+        target = current_slice if current_slice in loaded_rows else first_slice
+        self.annotate_slice.setValue(target)
+        self.refresh_annotation_slice()
+        self.enter_annotation_picking_mode()
+        autosave_path = self._autosave_shell_cut_annotations()
+        self._autosave_annotation_rows()
+
+        message = f"Loaded {len(loaded_rows)} shell-cut slice(s) from:\n{json_path}"
+        if errors:
+            message += f"\n\nSkipped {len(errors)} row(s). See Log > View Current Log for details."
+            self.append_log("Shell-cut JSON load skipped rows:\n" + "\n".join(errors) + "\n")
+        if autosave_path is not None:
+            message += f"\n\nAutosaved editable copy:\n{autosave_path}"
+        self.annotate_status.setText(
+            f"Loaded {len(loaded_rows)} shell-cut slice(s). Edit points or continue marking slices."
+        )
+        self.append_log(f"Loaded previous shell-cut JSON: {json_path}\n")
+        if show_message:
+            QMessageBox.information(self, "Shell-cut JSON loaded", message)
+        return len(loaded_rows), errors
 
     def export_annotation_csv(self) -> None:
-        if not self.annotation_rows:
+        if not self.shell_cut_rows_by_slice:
             QMessageBox.warning(self, "No accepted slices", "Accept at least one slice before saving.")
             return
         try:
             output_dir = self._require_path("Output folder", self.annotate_output.text())
             output_dir.mkdir(parents=True, exist_ok=True)
+            self._sync_derived_annotation_rows_from_shell_cut()
             csv_path = output_dir / "manual_landmarks_interactive.csv"
             self._write_annotation_rows_csv(csv_path)
+            shell_cut_path = output_dir / "shell_cut_annotations.json"
+            self._write_shell_cut_annotations_json(shell_cut_path)
             self._sync_build_from_annotation(csv_path, output_dir)
             self.tabs.setCurrentIndex(1)
             QMessageBox.information(
                 self,
-                "Manual CSV saved",
-                f"Saved:\n{csv_path}\n\nReview the Build settings, then run Extract Surfaces.",
+                "Annotations saved",
+                f"Saved shell-cut annotations:\n{shell_cut_path}\n\n"
+                f"Saved derived build CSV:\n{csv_path}\n\n"
+                "Review the Build settings.",
             )
-            self.append_log(f"Saved interactive manual CSV: {csv_path}\n")
+            self.append_log(f"Saved shell-cut annotations: {shell_cut_path}\n")
+            self.append_log(f"Saved derived build CSV: {csv_path}\n")
         except Exception as exc:
             self._show_exception_dialog("Save failed", exc)
 
@@ -5149,6 +6620,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.build_slice_axis.setCurrentText(self.annotate_slice_axis.currentText())
         self.build_min_area.setValue(self.annotate_min_area.value())
         self.build_keep_all.setChecked(self.annotate_keep_all.isChecked())
+        if self.shell_cut_rows_by_slice:
+            self.surface_method.setCurrentText("Shell cut")
         self.depth_method.setCurrentText("surfaces only")
         self.tabs.setCurrentIndex(1)
 
@@ -5157,7 +6630,7 @@ class LaminarBoundaryWindow(QMainWindow):
         if not self.build_mask.text().strip():
             missing.append("Mask")
         if not self.build_manual.text().strip() and not needs_boundaries:
-            missing.append("Manual CSV")
+            missing.append("Derived build CSV")
         if not self.build_output.text().strip():
             missing.append("Output folder")
         if missing:
@@ -5172,7 +6645,7 @@ class LaminarBoundaryWindow(QMainWindow):
             ("Mask", self.build_mask.text()),
         ]
         if not needs_boundaries:
-            path_checks.append(("Manual CSV", self.build_manual.text()))
+            path_checks.append(("Derived build CSV", self.build_manual.text()))
         if self.build_template.text().strip():
             path_checks.append(("Template image", self.build_template.text()))
         if self.build_cell_csv.text().strip():
@@ -5237,23 +6710,37 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _make_build_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 8, 0, 0)
-        layout.setSpacing(12)
-        layout.addWidget(self._make_build_hint())
+        page_layout = QVBoxLayout(tab)
+        page_layout.setContentsMargins(0, 8, 0, 0)
+        page_layout.setSpacing(10)
+        page_layout.addWidget(self._make_build_hint())
 
         self._create_build_input_fields()
-        layout.addWidget(self._make_build_required_section())
-        layout.addWidget(self._make_build_optional_section())
-        layout.addWidget(self._make_build_advanced_section())
-        layout.addLayout(self._make_build_button_row())
-        layout.addWidget(self._make_build_result_section())
-        layout.addStretch(1)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        content_layout.setSizeConstraint(QLayout.SetMinAndMaxSize)
+        content_layout.addWidget(self._make_build_required_section())
+        content_layout.addWidget(self._make_build_optional_section())
+        content_layout.addWidget(self._make_build_advanced_section())
+        content_layout.addLayout(self._make_build_button_row())
+        content_layout.addWidget(self._make_build_result_section())
+        content_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("buildScroll")
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll, 1)
         return tab
 
     def _make_build_hint(self) -> QFrame:
         return self._make_hint(
-            "Check the saved mask, landmark CSV, and output folder before extracting surfaces."
+            "Check Mask, derived build CSV, and Output folder. Extract surfaces first; depth unlocks after Boundary JSON exists."
         )
 
     def _create_build_input_fields(self) -> None:
@@ -5283,8 +6770,13 @@ class LaminarBoundaryWindow(QMainWindow):
         self.resample_points.setButtonSymbols(QSpinBox.NoButtons)
         self.resample_points.setMinimumHeight(28)
         self.surface_method = CleanComboBox()
-        self.surface_method.addItems(["Mask constrained", "Fast loft"])
+        self.surface_method.addItems(["Shell cut", "Contour shell", "Arc graph", "Mask constrained", "Fast loft"])
+        self.surface_method.setCurrentText("Contour shell")
         self.surface_method.setMinimumHeight(28)
+        self.shell_backend = CleanComboBox()
+        self.shell_backend.addItems(["Voxel", "Marching cubes"])
+        self.shell_backend.setCurrentText("Voxel")
+        self.shell_backend.setMinimumHeight(28)
         self.depth_method = CleanComboBox()
         self.depth_method.addItems(["surfaces only", "auto", "laplace", "distance"])
         self.depth_method.setMinimumHeight(28)
@@ -5315,16 +6807,9 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _make_build_required_section(self) -> QGroupBox:
         required_box, required_form = self._make_form_section("Required Build Inputs")
-        required_form.addRow(
-            "",
-            self._make_note_label(
-                "These are filled automatically after Save CSV And Review Build. "
-                "Check them, then run the surface build."
-            ),
-        )
-        required_form.addRow("Build checklist", self.build_readiness)
+        required_form.addRow("Status", self.build_readiness)
         self._add_help_row(required_form, "Mask", self.build_mask, *BUILD_HELP["mask"])
-        self._add_help_row(required_form, "Manual CSV", self.build_manual, *BUILD_HELP["manual_csv"])
+        self._add_help_row(required_form, "Derived build CSV", self.build_manual, *BUILD_HELP["manual_csv"])
         self._add_help_row(required_form, "Output folder", self.build_output, *BUILD_HELP["output"])
         return required_box
 
@@ -5356,9 +6841,9 @@ class LaminarBoundaryWindow(QMainWindow):
             missing.append("Mask file")
 
         if not manual_text:
-            missing.append("Manual CSV")
+            missing.append("Derived build CSV")
         elif self._resolved_existing_input_path(manual_text) is None:
-            missing.append("Manual CSV file")
+            missing.append("Derived build CSV file")
 
         if not output_text:
             missing.append("Output folder")
@@ -5402,10 +6887,15 @@ class LaminarBoundaryWindow(QMainWindow):
             self.review_qc_button.setEnabled(review_ready)
 
     def _make_build_optional_section(self) -> QGroupBox:
-        optional_box, optional_form = self._make_form_section("Optional Measurements")
+        optional_box, optional_form = self._make_form_section(
+            "Optional Measurements",
+            checkable=True,
+            checked=False,
+        )
         self._add_help_row(optional_form, "Template image", self.build_template, *BUILD_HELP["template"])
         self._add_help_row(optional_form, "Cell CSV", self.build_cell_csv, *BUILD_HELP["cell_csv"])
         self._add_help_row(optional_form, "SWC glob", self.build_swc_glob, *BUILD_HELP["swc_glob"])
+        self._set_collapsible_form_visible(optional_box, optional_form, False)
         return optional_box
 
     def _make_build_advanced_section(self) -> QGroupBox:
@@ -5419,6 +6909,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self._add_help_row(advanced_form, "Min contour area", self.build_min_area, *BUILD_HELP["min_area"])
         self._add_help_row(advanced_form, "Resample points", self.resample_points, *BUILD_HELP["resample_points"])
         self._add_help_row(advanced_form, "Surface method", self.surface_method, *BUILD_HELP["surface_method"])
+        self._add_help_row(advanced_form, "Shell backend", self.shell_backend, *BUILD_HELP["shell_backend"])
         self._add_help_row(advanced_form, "Depth method", self.depth_method, *BUILD_HELP["depth_method"])
         self._add_help_row(advanced_form, "Volume format", self.volume_format, *BUILD_HELP["volume_format"])
         self._add_help_row(advanced_form, "Max Laplace voxels", self.max_laplace_voxels, *BUILD_HELP["max_laplace_voxels"])
@@ -5504,7 +6995,7 @@ class LaminarBoundaryWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Review inputs missing",
-                "Build review needs an existing Mask and Manual CSV.",
+                "Build review needs an existing Mask and derived build CSV.",
             )
             return
 
@@ -5519,7 +7010,7 @@ class LaminarBoundaryWindow(QMainWindow):
             queue_slices = self._manual_slices_from_csv(manual_csv)
             if queue_slices:
                 self.append_log(
-                    "Review & Repair found no QC targets; reviewing manual CSV slices: "
+                    "Review & Repair found no QC targets; reviewing derived build CSV slices: "
                     + ", ".join(str(value) for value in queue_slices)
                     + "\n"
                 )
@@ -5939,7 +7430,7 @@ class LaminarBoundaryWindow(QMainWindow):
             core = _core()
             outputs = core.run_laminar_boundary_pipeline(
                 mask_path=self._require_path("Mask", self.build_mask.text()),
-                manual_csv=self._require_path("Manual CSV", self.build_manual.text()),
+                manual_csv=self._require_path("Derived build CSV", self.build_manual.text()),
                 output_dir=output_dir,
                 template_path=self.build_template.text() or None,
                 cell_csv=self.build_cell_csv.text() or None,
@@ -5949,6 +7440,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 largest_only=not self.build_keep_all.isChecked(),
                 resample_points=int(self.resample_points.value()),
                 surface_method=self.surface_method.currentText(),
+                shell_backend=self.shell_backend.currentText(),
                 depth_method=self.depth_method.currentText(),
                 max_laplace_voxels=int(self.max_laplace_voxels.value()),
                 boundary_dilation=int(self.boundary_dilation.value()),
@@ -6128,6 +7620,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_template_data = None
         self.annotation_contours_by_slice.clear()
         self.annotation_landmarks_by_slice.clear()
+        self.shell_cut_landmarks_by_slice.clear()
+        self.shell_cut_rows_by_slice.clear()
         self.annotation_rows.clear()
         self.annotation_path_choices_by_slice.clear()
         self.annotation_skipped_slices.clear()
