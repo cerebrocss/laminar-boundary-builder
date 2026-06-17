@@ -3,3 +3,4 @@ pillow
 scipy
 pynrrd
 PyQt5
+PyOpenGL
