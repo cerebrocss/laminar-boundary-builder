@@ -3857,6 +3857,8 @@ class LaminarBoundaryWindow(QMainWindow):
             text = "Click shell points to draw a closed curve."
         self.next_point_label.setText(text)
         self.on_3d_build_ready_changed(self.surface_preview_canvas.can_build_3d_surfaces())
+        if hasattr(self, "annotate_progress"):
+            self._update_annotation_progress()
 
     def set_3d_curve_mode(self) -> None:
         if hasattr(self, "surface_preview_canvas"):

@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from OpenGL.GL import (
     GL_BACK,
+    GL_BLEND,
     GL_COLOR_BUFFER_BIT,
     GL_CULL_FACE,
     GL_DEPTH_BUFFER_BIT,
@@ -17,11 +18,15 @@ from OpenGL.GL import (
     GL_FLOAT,
     GL_LEQUAL,
     GL_LINES,
+    GL_ONE_MINUS_SRC_ALPHA,
+    GL_SRC_ALPHA,
     GL_TRIANGLES,
+    glBlendFunc,
     glClear,
     glClearColor,
     glCullFace,
     glDepthFunc,
+    glDisable,
     glDrawArrays,
     glEnable,
     glLineWidth,
@@ -52,6 +57,7 @@ class ShellGLCanvas(QOpenGLWidget):
 
     MAX_DISPLAY_FACES = 180000
     MAX_HOVER_FACES = 30000
+    MAX_EDGE_SEGMENTS = 32000
     CLICK_MOVE_TOLERANCE_SQ = 81.0
 
     def __init__(self, parent=None):
@@ -356,9 +362,12 @@ class ShellGLCanvas(QOpenGLWidget):
         )
         edges = np.sort(edges, axis=1)
         edges = np.unique(edges, axis=0)
+        if len(edges) > self.MAX_EDGE_SEGMENTS:
+            edge_ids = np.linspace(0, len(edges) - 1, self.MAX_EDGE_SEGMENTS, dtype=np.int64)
+            edges = edges[edge_ids]
         edge_vertices = self._normalized_vertices[edges.reshape(-1)]
         edge_normals = vertex_normals[edges.reshape(-1)]
-        return (edge_vertices + edge_normals * 0.0025).astype(np.float32)
+        return (edge_vertices + edge_normals * 0.0015).astype(np.float32)
 
     @staticmethod
     def _face_ids_to_colors(face_ids: np.ndarray) -> np.ndarray:
@@ -424,9 +433,9 @@ class ShellGLCanvas(QOpenGLWidget):
                 vec3 n = normalize(v_normal);
                 float diffuse = max(dot(n, normalize(light_dir)), 0.0);
                 float back = max(dot(n, normalize(vec3(-0.45, -0.20, 0.70))), 0.0);
-                float rim = pow(1.0 - abs(n.z), 1.35) * 0.16;
-                float shade = 0.30 + diffuse * 0.58 + back * 0.14 + rim;
-                vec3 color = base_color * shade + vec3(rim * 0.35);
+                float rim = pow(1.0 - abs(n.z), 1.35) * 0.10;
+                float shade = 0.46 + diffuse * 0.46 + back * 0.10 + rim;
+                vec3 color = base_color * shade + vec3(rim * 0.18);
                 gl_FragColor = vec4(color, 1.0);
             }
         """
@@ -487,7 +496,7 @@ class ShellGLCanvas(QOpenGLWidget):
         if self._vbo is None or self._surface_program is None:
             return
         glEnable(GL_DEPTH_TEST)
-        glEnable(GL_CULL_FACE)
+        glDisable(GL_CULL_FACE)
         program = self._surface_program
         program.bind()
         program.setUniformValue("mvp", self._mvp_matrix())
@@ -512,10 +521,12 @@ class ShellGLCanvas(QOpenGLWidget):
             self._upload_mesh()
         glEnable(GL_DEPTH_TEST)
         glLineWidth(1.0)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         program = self._line_program
         program.bind()
         program.setUniformValue("mvp", self._mvp_matrix())
-        program.setUniformValue("line_color", QVector4D(0.12, 0.24, 0.21, 1.0))
+        program.setUniformValue("line_color", QVector4D(0.03, 0.10, 0.09, 0.26))
         self._edge_vbo.bind()
         program.enableAttributeArray("position")
         program.setAttributeBuffer("position", GL_FLOAT, 0, 3, 3 * 4)
@@ -523,6 +534,7 @@ class ShellGLCanvas(QOpenGLWidget):
         self._edge_vbo.release()
         program.disableAttributeArray("position")
         program.release()
+        glDisable(GL_BLEND)
 
     def _mvp_matrix(self) -> QMatrix4x4:
         width = max(1, self.width())
@@ -802,15 +814,35 @@ class ShellGLCanvas(QOpenGLWidget):
         if not vertex_ids or len(screen) == 0:
             return
         points = [QPointF(float(screen[int(value), 0]), float(screen[int(value), 1])) for value in vertex_ids]
-        pen = QPen(color, 3.6 if closed else 2.8)
+        line_width = 4.6 if closed else 4.0
+        shadow = QPen(QColor(1, 8, 7, 210), line_width + 4.0)
+        shadow.setStyle(Qt.SolidLine if closed else Qt.DashLine)
+        painter.setPen(shadow)
+        for left, right in zip(points[:-1], points[1:]):
+            painter.drawLine(left, right)
+
+        pen = QPen(color, line_width)
         pen.setStyle(Qt.SolidLine if closed else Qt.DashLine)
         painter.setPen(pen)
         for left, right in zip(points[:-1], points[1:]):
             painter.drawLine(left, right)
-        painter.setPen(QPen(QColor("#101817"), 1.0))
-        painter.setBrush(color)
-        for point in points:
-            painter.drawEllipse(point, 5.5, 5.5)
+        self._draw_curve_points(painter, points, color, active=not closed)
+
+    def _draw_curve_points(self, painter: QPainter, points: List[QPointF], color: QColor, active: bool) -> None:
+        radius = 9.0 if active else 7.5
+        for index, point in enumerate(points):
+            painter.setPen(QPen(QColor(1, 8, 7, 230), 2.5))
+            painter.setBrush(QColor(1, 8, 7, 180))
+            painter.drawEllipse(point, radius + 4.5, radius + 4.5)
+
+            painter.setPen(QPen(QColor("#ffffff"), 3.0))
+            painter.setBrush(color)
+            painter.drawEllipse(point, radius, radius)
+
+            if active and index == len(points) - 1:
+                painter.setPen(QPen(QColor("#ffffff"), 2.0))
+                painter.setBrush(QColor("#ff6a3d"))
+                painter.drawEllipse(point, radius * 0.48, radius * 0.48)
 
     def _draw_message(self, painter: QPainter, text: str) -> None:
         metrics = painter.fontMetrics()
