@@ -16,6 +16,7 @@ from OpenGL.GL import (
     GL_DEPTH_TEST,
     GL_FLOAT,
     GL_LEQUAL,
+    GL_LINES,
     GL_TRIANGLES,
     glClear,
     glClearColor,
@@ -23,6 +24,7 @@ from OpenGL.GL import (
     glDepthFunc,
     glDrawArrays,
     glEnable,
+    glLineWidth,
     glViewport,
 )
 from PyQt5.QtCore import QPointF, Qt, pyqtSignal
@@ -37,6 +39,7 @@ from PyQt5.QtGui import (
     QPolygonF,
     QSurfaceFormat,
     QVector3D,
+    QVector4D,
 )
 from PyQt5.QtWidgets import QOpenGLWidget, QSizePolicy
 
@@ -47,8 +50,9 @@ class ShellGLCanvas(QOpenGLWidget):
     annotation_changed = pyqtSignal()
     build_ready_changed = pyqtSignal(bool)
 
-    MAX_DISPLAY_FACES = 70000
-    MAX_HOVER_FACES = 18000
+    MAX_DISPLAY_FACES = 180000
+    MAX_HOVER_FACES = 30000
+    CLICK_MOVE_TOLERANCE_SQ = 81.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -83,16 +87,21 @@ class ShellGLCanvas(QOpenGLWidget):
 
         self._gl_ready = False
         self._surface_program: Optional[QOpenGLShaderProgram] = None
+        self._line_program: Optional[QOpenGLShaderProgram] = None
         self._vbo: Optional[QOpenGLBuffer] = None
+        self._edge_vbo: Optional[QOpenGLBuffer] = None
         self._mesh_dirty = False
         self._vertex_count = 0
+        self._edge_vertex_count = 0
         self._interleaved = np.empty((0, 9), dtype=np.float32)
+        self._edge_vertices = np.empty((0, 3), dtype=np.float32)
 
         self._vertices = np.empty((0, 3), dtype=np.float32)
         self._faces = np.empty((0, 3), dtype=np.int64)
         self._center = np.zeros(3, dtype=np.float32)
         self._radius = 1.0
         self._normalized_vertices = np.empty((0, 3), dtype=np.float32)
+        self._display_vertex_normals = np.empty((0, 3), dtype=np.float32)
         self._display_face_ids = np.empty((0,), dtype=np.int64)
         self._display_triangles = np.empty((0, 3), dtype=np.int64)
         self._display_centers = np.empty((0, 3), dtype=np.float32)
@@ -230,10 +239,13 @@ class ShellGLCanvas(QOpenGLWidget):
 
     def _clear_mesh_buffers(self) -> None:
         self._interleaved = np.empty((0, 9), dtype=np.float32)
+        self._edge_vertices = np.empty((0, 3), dtype=np.float32)
         self._vertex_count = 0
+        self._edge_vertex_count = 0
         self._vertices = np.empty((0, 3), dtype=np.float32)
         self._faces = np.empty((0, 3), dtype=np.int64)
         self._normalized_vertices = np.empty((0, 3), dtype=np.float32)
+        self._display_vertex_normals = np.empty((0, 3), dtype=np.float32)
         self._display_face_ids = np.empty((0,), dtype=np.int64)
         self._display_triangles = np.empty((0, 3), dtype=np.int64)
         self._display_centers = np.empty((0, 3), dtype=np.float32)
@@ -265,20 +277,27 @@ class ShellGLCanvas(QOpenGLWidget):
 
         positions = self._normalized_vertices[triangles.reshape(-1)]
         tri_points = positions.reshape(-1, 3, 3)
-        normals = np.cross(tri_points[:, 1] - tri_points[:, 0], tri_points[:, 2] - tri_points[:, 0])
-        lengths = np.linalg.norm(normals, axis=1)
+        face_normals = np.cross(tri_points[:, 1] - tri_points[:, 0], tri_points[:, 2] - tri_points[:, 0])
+        centers = tri_points.mean(axis=1)
+        inward = np.sum(face_normals * centers, axis=1) < 0
+        face_normals[inward] *= -1.0
+        lengths = np.linalg.norm(face_normals, axis=1)
         lengths[lengths == 0] = 1.0
-        normals = (normals / lengths.reshape(-1, 1)).astype(np.float32)
-        repeated_normals = np.repeat(normals, 3, axis=0)
+        face_normals = (face_normals / lengths.reshape(-1, 1)).astype(np.float32)
+        vertex_normals = self._smooth_vertex_normals(triangles, face_normals)
+        repeated_normals = vertex_normals[triangles.reshape(-1)]
 
         colors = self._face_ids_to_colors(triangle_face_ids)
         repeated_colors = np.repeat(colors, 3, axis=0)
         self._interleaved = np.column_stack((positions, repeated_normals, repeated_colors)).astype(np.float32)
+        self._edge_vertices = self._triangle_edge_vertices(triangles, vertex_normals)
         self._vertex_count = len(self._interleaved)
+        self._edge_vertex_count = len(self._edge_vertices)
         self._display_face_ids = np.asarray(triangle_face_ids, dtype=np.int64)
         self._display_triangles = np.asarray(triangles, dtype=np.int64)
         self._display_centers = self._normalized_vertices[triangles].mean(axis=1).astype(np.float32)
         self._display_center_face_ids = np.asarray(triangle_face_ids, dtype=np.int64)
+        self._display_vertex_normals = vertex_normals
         self._screen_cache_key = None
         self._screen_cache = None
         self._mesh_dirty = True
@@ -306,6 +325,41 @@ class ShellGLCanvas(QOpenGLWidget):
             return np.empty((0, 3), dtype=np.int64), np.empty((0,), dtype=np.int64)
         return np.asarray(triangles, dtype=np.int64), np.asarray(triangle_face_ids, dtype=np.int64)
 
+    def _smooth_vertex_normals(self, triangles: np.ndarray, face_normals: np.ndarray) -> np.ndarray:
+        normals = np.zeros_like(self._normalized_vertices, dtype=np.float32)
+        if len(triangles) == 0:
+            return normals
+        np.add.at(normals, triangles[:, 0], face_normals)
+        np.add.at(normals, triangles[:, 1], face_normals)
+        np.add.at(normals, triangles[:, 2], face_normals)
+        lengths = np.linalg.norm(normals, axis=1)
+        empty = lengths <= 1e-8
+        if np.any(empty):
+            fallback = np.asarray(self._normalized_vertices[empty], dtype=np.float32)
+            fallback_lengths = np.linalg.norm(fallback, axis=1)
+            fallback_lengths[fallback_lengths <= 1e-8] = 1.0
+            normals[empty] = fallback / fallback_lengths.reshape(-1, 1)
+            lengths = np.linalg.norm(normals, axis=1)
+        lengths[lengths <= 1e-8] = 1.0
+        return (normals / lengths.reshape(-1, 1)).astype(np.float32)
+
+    def _triangle_edge_vertices(self, triangles: np.ndarray, vertex_normals: np.ndarray) -> np.ndarray:
+        if len(triangles) == 0:
+            return np.empty((0, 3), dtype=np.float32)
+        edges = np.concatenate(
+            (
+                triangles[:, [0, 1]],
+                triangles[:, [1, 2]],
+                triangles[:, [2, 0]],
+            ),
+            axis=0,
+        )
+        edges = np.sort(edges, axis=1)
+        edges = np.unique(edges, axis=0)
+        edge_vertices = self._normalized_vertices[edges.reshape(-1)]
+        edge_normals = vertex_normals[edges.reshape(-1)]
+        return (edge_vertices + edge_normals * 0.0025).astype(np.float32)
+
     @staticmethod
     def _face_ids_to_colors(face_ids: np.ndarray) -> np.ndarray:
         codes = np.asarray(face_ids, dtype=np.uint32) + np.uint32(1)
@@ -322,8 +376,11 @@ class ShellGLCanvas(QOpenGLWidget):
             glEnable(GL_CULL_FACE)
             glCullFace(GL_BACK)
             self._surface_program = self._create_surface_program()
+            self._line_program = self._create_line_program()
             self._vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
             self._vbo.create()
+            self._edge_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+            self._edge_vbo.create()
             self._gl_ready = True
             self._upload_mesh()
         except Exception as exc:
@@ -340,6 +397,7 @@ class ShellGLCanvas(QOpenGLWidget):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         if self._gl_ready and self._vertex_count and self._surface_program is not None:
             self._draw_surface()
+            self._draw_edges()
         self._draw_overlay()
 
     def _create_surface_program(self) -> QOpenGLShaderProgram:
@@ -380,6 +438,29 @@ class ShellGLCanvas(QOpenGLWidget):
             raise RuntimeError(program.log())
         return program
 
+    def _create_line_program(self) -> QOpenGLShaderProgram:
+        program = QOpenGLShaderProgram(self)
+        vertex_shader = """
+            attribute vec3 position;
+            uniform mat4 mvp;
+            void main() {
+                gl_Position = mvp * vec4(position, 1.0);
+            }
+        """
+        fragment_shader = """
+            uniform vec4 line_color;
+            void main() {
+                gl_FragColor = line_color;
+            }
+        """
+        if not program.addShaderFromSourceCode(QOpenGLShader.Vertex, vertex_shader):
+            raise RuntimeError(program.log())
+        if not program.addShaderFromSourceCode(QOpenGLShader.Fragment, fragment_shader):
+            raise RuntimeError(program.log())
+        if not program.link():
+            raise RuntimeError(program.log())
+        return program
+
     def _upload_mesh(self) -> None:
         if not self._gl_ready or self._vbo is None or not self._vbo.isCreated():
             return
@@ -390,6 +471,14 @@ class ShellGLCanvas(QOpenGLWidget):
         else:
             self._vbo.allocate(b"", 0)
         self._vbo.release()
+        if self._edge_vbo is not None and self._edge_vbo.isCreated():
+            self._edge_vbo.bind()
+            if self._edge_vertices.size:
+                edge_data = np.ascontiguousarray(self._edge_vertices, dtype=np.float32)
+                self._edge_vbo.allocate(edge_data.tobytes(), int(edge_data.nbytes))
+            else:
+                self._edge_vbo.allocate(b"", 0)
+            self._edge_vbo.release()
         self._mesh_dirty = False
 
     def _draw_surface(self) -> None:
@@ -414,6 +503,25 @@ class ShellGLCanvas(QOpenGLWidget):
         self._vbo.release()
         program.disableAttributeArray("position")
         program.disableAttributeArray("normal")
+        program.release()
+
+    def _draw_edges(self) -> None:
+        if not self._edge_vertex_count or self._edge_vbo is None or self._line_program is None:
+            return
+        if self._mesh_dirty:
+            self._upload_mesh()
+        glEnable(GL_DEPTH_TEST)
+        glLineWidth(1.0)
+        program = self._line_program
+        program.bind()
+        program.setUniformValue("mvp", self._mvp_matrix())
+        program.setUniformValue("line_color", QVector4D(0.12, 0.24, 0.21, 1.0))
+        self._edge_vbo.bind()
+        program.enableAttributeArray("position")
+        program.setAttributeBuffer("position", GL_FLOAT, 0, 3, 3 * 4)
+        glDrawArrays(GL_LINES, 0, int(self._edge_vertex_count))
+        self._edge_vbo.release()
+        program.disableAttributeArray("position")
         program.release()
 
     def _mvp_matrix(self) -> QMatrix4x4:
@@ -488,7 +596,7 @@ class ShellGLCanvas(QOpenGLWidget):
         index = int(np.argmin(distances))
         return index if float(distances[index]) <= max_distance else None
 
-    def _nearest_display_face_id(self, pos, max_distance: float = 36.0) -> Optional[int]:
+    def _nearest_display_face_center_id(self, pos, max_distance: float = 36.0) -> Optional[int]:
         if len(self._display_centers) == 0:
             return None
         rotated = self._rotated_points(self._display_centers)
@@ -516,6 +624,71 @@ class ShellGLCanvas(QOpenGLWidget):
             return None
         best = near[np.lexsort((distances[near], -depth_to_search[near]))][0]
         return int(face_ids_to_search[int(best)])
+
+    def _pick_display_face_id(
+        self,
+        pos,
+        max_distance: float = 36.0,
+        max_triangles: Optional[int] = None,
+    ) -> Optional[int]:
+        if len(self._display_triangles) == 0:
+            return None
+        screen, depth = self._screen_cache_data()
+        triangles = self._display_triangles
+        face_ids = self._display_face_ids
+        if max_triangles is not None and len(triangles) > max_triangles:
+            step = int(math.ceil(len(triangles) / float(max_triangles)))
+            sample_ids = np.arange(0, len(triangles), step, dtype=np.int64)
+            triangles = triangles[sample_ids]
+            face_ids = face_ids[sample_ids]
+
+        click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
+        points = screen[triangles]
+        margin = 2.0
+        inside_bounds = (
+            (points[:, :, 0].min(axis=1) <= click[0] + margin)
+            & (points[:, :, 0].max(axis=1) >= click[0] - margin)
+            & (points[:, :, 1].min(axis=1) <= click[1] + margin)
+            & (points[:, :, 1].max(axis=1) >= click[1] - margin)
+        )
+        candidates = np.flatnonzero(inside_bounds)
+        if len(candidates) == 0:
+            return self._nearest_display_face_center_id(pos, max_distance=max_distance)
+
+        p0 = points[candidates, 0, :]
+        p1 = points[candidates, 1, :]
+        p2 = points[candidates, 2, :]
+        den = (
+            (p1[:, 1] - p2[:, 1]) * (p0[:, 0] - p2[:, 0])
+            + (p2[:, 0] - p1[:, 0]) * (p0[:, 1] - p2[:, 1])
+        )
+        valid = np.abs(den) > 1e-6
+        if not np.any(valid):
+            return self._nearest_display_face_center_id(pos, max_distance=max_distance)
+        candidate_ids = candidates[valid]
+        p0 = p0[valid]
+        p1 = p1[valid]
+        p2 = p2[valid]
+        den = den[valid]
+
+        bary0 = (
+            (p1[:, 1] - p2[:, 1]) * (click[0] - p2[:, 0])
+            + (p2[:, 0] - p1[:, 0]) * (click[1] - p2[:, 1])
+        ) / den
+        bary1 = (
+            (p2[:, 1] - p0[:, 1]) * (click[0] - p2[:, 0])
+            + (p0[:, 0] - p2[:, 0]) * (click[1] - p2[:, 1])
+        ) / den
+        bary2 = 1.0 - bary0 - bary1
+        inside = (bary0 >= -0.02) & (bary1 >= -0.02) & (bary2 >= -0.02)
+        if not np.any(inside):
+            return self._nearest_display_face_center_id(pos, max_distance=max_distance)
+
+        hit_ids = candidate_ids[inside]
+        hit_triangles = triangles[hit_ids]
+        hit_depth = depth[hit_triangles].mean(axis=1)
+        best = int(hit_ids[int(np.argmax(hit_depth))])
+        return int(face_ids[best])
 
     def _nearest_face_vertex_id(self, face_id: int, pos) -> Optional[int]:
         if len(self._faces) == 0 or face_id < 0 or face_id >= len(self._faces):
@@ -567,7 +740,7 @@ class ShellGLCanvas(QOpenGLWidget):
         if self.shell_mesh is None:
             return
         if self.annotation_mode == "patch" and self.closed_curves:
-            face_id = self._nearest_display_face_id(pos, max_distance=44.0)
+            face_id = self._pick_display_face_id(pos, max_distance=44.0)
             if face_id is not None:
                 self._add_selected_patch(face_id)
                 self._emit_3d_state()
@@ -579,7 +752,7 @@ class ShellGLCanvas(QOpenGLWidget):
             self._emit_3d_state()
             self.update()
             return
-        face_id = self._nearest_display_face_id(pos, max_distance=48.0)
+        face_id = self._pick_display_face_id(pos, max_distance=48.0)
         vertex_id = self._nearest_face_vertex_id(face_id, pos) if face_id is not None else None
         if vertex_id is None:
             self.message = "Click closer to the visible 3D shell"
@@ -676,7 +849,11 @@ class ShellGLCanvas(QOpenGLWidget):
         if self._drag_pos is None:
             now = time.monotonic()
             if self.annotation_mode == "patch" and now - self._last_hover_at > 0.035:
-                self.hover_face = self._nearest_display_face_id(event.pos(), max_distance=38.0)
+                self.hover_face = self._pick_display_face_id(
+                    event.pos(),
+                    max_distance=38.0,
+                    max_triangles=self.MAX_HOVER_FACES,
+                )
                 self._last_hover_at = now
                 self.update()
             return
@@ -686,7 +863,7 @@ class ShellGLCanvas(QOpenGLWidget):
         if self._press_pos is not None:
             total_dx = event.pos().x() - self._press_pos.x()
             total_dy = event.pos().y() - self._press_pos.y()
-            if total_dx * total_dx + total_dy * total_dy > 16.0:
+            if total_dx * total_dx + total_dy * total_dy > self.CLICK_MOVE_TOLERANCE_SQ:
                 self._drag_moved = True
                 if self._drag_mode == "pick":
                     self._drag_mode = "rotate"
@@ -706,7 +883,12 @@ class ShellGLCanvas(QOpenGLWidget):
             return
         if event.button() not in (Qt.LeftButton, Qt.RightButton):
             return
-        if self._drag_mode == "pick" and not self._drag_moved:
+        moved_distance_sq = 0.0
+        if self._press_pos is not None:
+            total_dx = event.pos().x() - self._press_pos.x()
+            total_dy = event.pos().y() - self._press_pos.y()
+            moved_distance_sq = total_dx * total_dx + total_dy * total_dy
+        if event.button() == Qt.LeftButton and moved_distance_sq <= self.CLICK_MOVE_TOLERANCE_SQ:
             self._handle_shell_click(event.pos())
         self._drag_pos = None
         self._press_pos = None

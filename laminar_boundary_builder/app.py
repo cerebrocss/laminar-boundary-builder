@@ -3918,9 +3918,15 @@ class LaminarBoundaryWindow(QMainWindow):
             self.build_output.set_text(build_dir)
             self.surface_method.setCurrentText("Shell cut")
             self.depth_method.setCurrentText("surfaces only")
-            shell_backend = getattr(self.surface_preview_canvas.shell_mesh, "backend", None) or self.shell_backend.currentText()
-            if str(shell_backend).startswith("voxel_preview"):
+            shell_backend = (
+                getattr(self.surface_preview_canvas.shell_mesh, "backend", None)
+                or self.shell_backend.currentText()
+            )
+            shell_backend_text = str(shell_backend)
+            if shell_backend_text.startswith("voxel_preview"):
                 shell_backend = _core().SHELL_BACKEND_VOXEL
+            elif shell_backend_text.startswith("marching_cubes_preview"):
+                shell_backend = _core().SHELL_BACKEND_MARCHING_CUBES
         except Exception as exc:
             self._show_exception_dialog("Save 3D annotation failed", exc)
             return
@@ -5097,22 +5103,30 @@ class LaminarBoundaryWindow(QMainWindow):
         shell_mesh = None
         shell_errors = []
         preview_mask, preview_scale = self._preview_shell_mask(prepared_mask)
-        for backend in (core.SHELL_BACKEND_VOXEL,):
+        for backend in (core.SHELL_BACKEND_MARCHING_CUBES, core.SHELL_BACKEND_VOXEL):
             try:
                 scale_label = (
                     f", preview downsample x{int(preview_scale[0])}"
                     if int(preview_scale[0]) > 1
                     else ""
                 )
-                emit(f"Building fast 3D shell preview (voxel shell{scale_label})...")
+                shell_label = (
+                    "smooth triangle shell"
+                    if backend == core.SHELL_BACKEND_MARCHING_CUBES
+                    else "voxel shell"
+                )
+                emit(f"Building fast 3D shell preview ({shell_label}{scale_label})...")
                 shell_mesh = core.build_shell_mesh(
                     preview_mask,
                     shell_backend=backend,
                     max_surface_quads=1_500_000,
                 )
                 if int(preview_scale[0]) > 1:
-                    shell_mesh.vertices = np.asarray(shell_mesh.vertices, dtype=float) * preview_scale.reshape(1, 3)
-                    shell_mesh.backend = f"voxel_preview_x{int(preview_scale[0])}"
+                    shell_mesh.vertices = (
+                        np.asarray(shell_mesh.vertices, dtype=float)
+                        * preview_scale.reshape(1, 3)
+                    )
+                    shell_mesh.backend = f"{backend}_preview_x{int(preview_scale[0])}"
                 break
             except Exception as exc:
                 shell_errors.append(f"{backend}: {exc}")
