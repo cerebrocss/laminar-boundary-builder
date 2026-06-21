@@ -3493,8 +3493,11 @@ class LaminarBoundaryWindow(QMainWindow):
         self.clear_3d_button = self._make_button("Clear 3D Annotation", "danger")
         self.clear_3d_button.setToolTip("Clear all 3D cut curves and selected surfaces.")
         self.clear_3d_button.clicked.connect(self.clear_3d_annotations)
-        self.build_3d_button = self._make_button("Build Selected 3D Surfaces", "primary")
-        self.build_3d_button.setToolTip("Build surfaces from closed 3D cut curves and selected named patches.")
+        self.build_3d_button = self._make_button("Build Current 3D Surface", "primary")
+        self.build_3d_button.setToolTip(
+            "Build one named surface from the current closed curves and selected seed patches. "
+            "The annotations are saved with the output, then cleared for the next surface."
+        )
         self.build_3d_button.setEnabled(False)
         self.build_3d_button.clicked.connect(self.run_3d_surface_build)
         self.save_slice_button = self._make_button("Accept Slice + Next", "primary")
@@ -3979,7 +3982,11 @@ class LaminarBoundaryWindow(QMainWindow):
         elif point_count:
             text = f"Drawing curve: {point_count} point(s). Click an active point to close. X = undo."
         elif curve_count and patch_count:
-            text = f"Ready: {curve_count} closed curve(s), {patch_count} selected surface patch(es)."
+            surface_name = self.annotate_surface_name.text().strip() or "surface"
+            text = (
+                f"Ready to build '{surface_name}': "
+                f"{curve_count} closed curve(s), {patch_count} seed patch(es)."
+            )
         elif curve_count:
             text = f"{curve_count} closed curve(s). Hover and click a surface patch to keep."
         else:
@@ -4039,11 +4046,14 @@ class LaminarBoundaryWindow(QMainWindow):
             return
 
         try:
+            core = _core()
             annotation_output_dir = self._auto_build_output_dir()
             if not self.annotate_output.text().strip():
                 self.annotate_output.set_text(annotation_output_dir)
-            build_dir = annotation_output_dir / "build_3d"
-            annotations_path = annotation_output_dir / "surface_3d_annotations.json"
+            surface_name = self.annotate_surface_name.text().strip() or "surface"
+            surface_slug = core.safe_surface_name(surface_name, fallback="surface")
+            build_dir = annotation_output_dir / "build_3d" / surface_slug
+            annotations_path = build_dir / "surface_3d_annotations.json"
             self._write_surface_3d_annotations_json(annotations_path)
             self.build_mask.set_text(self.annotation_mask_path)
             self.build_output.set_text(build_dir)
@@ -4055,9 +4065,9 @@ class LaminarBoundaryWindow(QMainWindow):
             )
             shell_backend_text = str(shell_backend)
             if shell_backend_text.startswith("voxel_preview"):
-                shell_backend = _core().SHELL_BACKEND_VOXEL
+                shell_backend = core.SHELL_BACKEND_VOXEL
             elif shell_backend_text.startswith("marching_cubes_preview"):
-                shell_backend = _core().SHELL_BACKEND_MARCHING_CUBES
+                shell_backend = core.SHELL_BACKEND_MARCHING_CUBES
         except Exception as exc:
             self._show_exception_dialog("Save 3D annotation failed", exc)
             return
@@ -4073,7 +4083,16 @@ class LaminarBoundaryWindow(QMainWindow):
             )
             lines = ["3D surface build finished."]
             lines.extend(f"{key}: {value}" for key, value in outputs.items())
-            return TaskResult("Build finished", "\n".join(lines), output_dir=build_dir)
+            return TaskResult(
+                "Build finished",
+                "\n".join(lines),
+                output_dir=build_dir,
+                payload={
+                    "clear_3d_annotations": True,
+                    "surface_name": surface_name,
+                    "annotations_path": annotations_path,
+                },
+            )
 
         self.start_task("build", task, accepts_progress=True)
 
@@ -7583,7 +7602,23 @@ class LaminarBoundaryWindow(QMainWindow):
         self.append_log(f"\n{result.message}\n")
         self._finish_task_progress(label, result)
         self._update_build_result_from_task(result)
+        self._apply_successful_task_result(result)
         self._show_task_result(result)
+
+    def _apply_successful_task_result(self, result: TaskResult) -> None:
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        if not payload.get("clear_3d_annotations"):
+            return
+        if not hasattr(self, "surface_preview_canvas"):
+            return
+        surface_name = str(payload.get("surface_name") or "surface")
+        annotations_path = payload.get("annotations_path")
+        self.surface_preview_canvas.clear_3d_annotations()
+        message = f"Built '{surface_name}'. 3D annotation cleared for the next surface."
+        if annotations_path:
+            message += f" Saved markers: {annotations_path}"
+        self.annotate_status.setText(message)
+        self.on_3d_annotation_changed()
 
     def _show_task_result(self, result: TaskResult) -> None:
         summary = result.message.splitlines()[0] if result.message else result.title

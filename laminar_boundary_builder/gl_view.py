@@ -236,6 +236,7 @@ class ShellGLCanvas(QOpenGLWidget):
         if self.shell_mesh is None:
             raise ValueError("No 3D shell is loaded")
         vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
+        surface_label = self.surface_name or "surface"
         curves = []
         for index, curve in enumerate(self.closed_curves, start=1):
             vertex_ids = [int(value) for value in curve.get("vertices", [])]
@@ -254,7 +255,7 @@ class ShellGLCanvas(QOpenGLWidget):
         for patch in self.selected_patches:
             patches.append(
                 {
-                    "patch_label": str(patch.get("patch_label") or "surface"),
+                    "patch_label": surface_label,
                     "source": "manual_3d",
                     "face_id": int(patch.get("face_id", -1)),
                     "seed_point": np.asarray(patch.get("seed_point"), dtype=float).round(4).tolist(),
