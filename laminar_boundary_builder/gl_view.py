@@ -1028,41 +1028,75 @@ class ShellGLCanvas(QOpenGLWidget):
             previous = current
         return inside
 
-    @staticmethod
-    def _orientation_2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-        return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+    def _curve_path_sets(self, vertex_ids: List[int], closed: bool = True) -> Tuple[set[int], set[Tuple[int, int]]]:
+        path = self._curve_vertex_path(vertex_ids, closed=closed)
+        vertices = {int(value) for value in path}
+        edges = {
+            self._edge_key(left, right)
+            for left, right in zip(path[:-1], path[1:])
+            if int(left) != int(right)
+        }
+        return vertices, edges
 
-    @classmethod
-    def _segments_intersect_2d(cls, a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> bool:
-        if max(a[0], b[0]) + 1e-6 < min(c[0], d[0]) or max(c[0], d[0]) + 1e-6 < min(a[0], b[0]):
+    def _closed_curve_reuses_path(self, vertex_ids: List[int]) -> bool:
+        path = self._curve_vertex_path(vertex_ids, closed=True)
+        if len(path) < 4:
             return False
-        if max(a[1], b[1]) + 1e-6 < min(c[1], d[1]) or max(c[1], d[1]) + 1e-6 < min(a[1], b[1]):
-            return False
-        o1 = cls._orientation_2d(a, b, c)
-        o2 = cls._orientation_2d(a, b, d)
-        o3 = cls._orientation_2d(c, d, a)
-        o4 = cls._orientation_2d(c, d, b)
-        return (o1 * o2 < -1e-6) and (o3 * o4 < -1e-6)
+        open_path = path[:-1] if path[0] == path[-1] else path
+        if len(set(open_path)) != len(open_path):
+            return True
+        edges = [
+            self._edge_key(left, right)
+            for left, right in zip(path[:-1], path[1:])
+            if int(left) != int(right)
+        ]
+        return len(set(edges)) != len(edges)
 
-    @classmethod
-    def _closed_polyline_self_intersects_2d(cls, points: np.ndarray) -> bool:
-        polygon = np.asarray(points, dtype=float).reshape(-1, 2)
-        if len(polygon) >= 2 and np.allclose(polygon[0], polygon[-1]):
-            polygon = polygon[:-1]
-        if len(polygon) < 4:
+    def _curve_intersects_closed_curves(
+        self,
+        vertex_ids: List[int],
+        ignored_curve_index: Optional[int] = None,
+    ) -> bool:
+        candidate_vertices, candidate_edges = self._curve_path_sets(vertex_ids, closed=True)
+        if not candidate_vertices:
             return False
-        segments = [(polygon[index], polygon[(index + 1) % len(polygon)]) for index in range(len(polygon))]
-        for left_index, (a, b) in enumerate(segments):
-            for right_index in range(left_index + 1, len(segments)):
-                if right_index == left_index:
-                    continue
-                if abs(right_index - left_index) == 1:
-                    continue
-                if left_index == 0 and right_index == len(segments) - 1:
-                    continue
-                c, d = segments[right_index]
-                if cls._segments_intersect_2d(a, b, c, d):
-                    return True
+        for curve_index, curve in enumerate(self.closed_curves):
+            if ignored_curve_index is not None and curve_index == ignored_curve_index:
+                continue
+            existing_ids = [int(value) for value in curve.get("vertices", [])]
+            existing_vertices, existing_edges = self._curve_path_sets(existing_ids, closed=True)
+            if candidate_edges & existing_edges:
+                return True
+            if candidate_vertices & existing_vertices:
+                return True
+        return False
+
+    def _active_segment_hits_closed_curve(self, vertex_id: int) -> bool:
+        if not self.active_curve_vertices:
+            return False
+        segment = self._curve_segment_path(int(self.active_curve_vertices[-1]), int(vertex_id))
+        segment_vertices = {int(value) for value in segment}
+        segment_edges = {
+            self._edge_key(left, right)
+            for left, right in zip(segment[:-1], segment[1:])
+            if int(left) != int(right)
+        }
+        for curve in self.closed_curves:
+            existing_ids = [int(value) for value in curve.get("vertices", [])]
+            existing_vertices, existing_edges = self._curve_path_sets(existing_ids, closed=True)
+            if segment_edges & existing_edges:
+                return True
+            if segment_vertices & existing_vertices:
+                return True
+        return False
+
+    def _vertex_hits_closed_curve(self, vertex_id: int) -> bool:
+        vertex_id = int(vertex_id)
+        for curve in self.closed_curves:
+            existing_ids = [int(value) for value in curve.get("vertices", [])]
+            existing_vertices, _existing_edges = self._curve_path_sets(existing_ids, closed=True)
+            if vertex_id in existing_vertices:
+                return True
         return False
 
     def _closed_curve_vertices_after_drag(
@@ -1121,9 +1155,12 @@ class ShellGLCanvas(QOpenGLWidget):
         if len(set(replacement[:-1])) < 3:
             self._last_drag_reject_reason = "A closed curve needs at least three different points"
             return False
-        replacement_path = self._closed_curve_screen_path(replacement)
-        if self._closed_polyline_self_intersects_2d(replacement_path):
+        if self._closed_curve_reuses_path(replacement):
             self._last_drag_reject_reason = "Drag rejected: it would make the closed curve cross itself"
+            return False
+        curve_index = int(point_ref[1])
+        if self._curve_intersects_closed_curves(replacement, ignored_curve_index=curve_index):
+            self._last_drag_reject_reason = "Drag rejected: closed curves cannot intersect"
             return False
         return True
 
@@ -1188,6 +1225,12 @@ class ShellGLCanvas(QOpenGLWidget):
         if len(set(vertices[:-1])) < 3:
             self.message = "A closed curve needs at least three different points"
             return
+        if self._closed_curve_reuses_path(vertices):
+            self.message = "Closed curve rejected: it crosses itself"
+            return
+        if self._curve_intersects_closed_curves(vertices):
+            self.message = "Closed curve rejected: it intersects an existing closed curve"
+            return
         self.closed_curves.append(
             {
                 "curve_id": f"cut_curve_{len(self.closed_curves) + 1}",
@@ -1238,6 +1281,13 @@ class ShellGLCanvas(QOpenGLWidget):
         vertex_id = self._nearest_face_vertex_id(face_id, pos) if face_id is not None else None
         if vertex_id is None:
             self.message = "Click closer to the visible 3D shell"
+            self.update()
+            return
+        if (
+            (not self.active_curve_vertices and self._vertex_hits_closed_curve(int(vertex_id)))
+            or self._active_segment_hits_closed_curve(int(vertex_id))
+        ):
+            self.message = "Point rejected: closed curves cannot intersect"
             self.update()
             return
         self.annotation_mode = "curve"
