@@ -1858,6 +1858,8 @@ class SurfacePreviewCanvas(QWidget):
         self.active_curve_vertices: List[int] = []
         self.selected_patches: List[Dict[str, object]] = []
         self.surface_name = "surface"
+        self.surface_names: List[str] = []
+        self.active_surface_index = 0
         self.annotation_mode = "curve"
         self.hover_face: Optional[int] = None
         self.slice_axis = 0
@@ -2223,6 +2225,9 @@ class SurfacePreviewCanvas(QWidget):
         self.closed_curves = []
         self.active_curve_vertices = []
         self.selected_patches = []
+        self.surface_names = []
+        self.active_surface_index = 0
+        self.surface_name = "surface"
         self.hover_face = None
         self.annotation_mode = "curve"
         self.preview_zoom = 1.15
@@ -2237,7 +2242,23 @@ class SurfacePreviewCanvas(QWidget):
         self.update()
 
     def set_surface_name(self, text: str) -> None:
-        self.surface_name = str(text or "").strip() or "surface"
+        self._sync_surface_queue()
+        name = str(text or "").strip() or self._default_surface_name(self.active_surface_index)
+        if self.surface_names:
+            self.surface_names[self.active_surface_index] = name
+        self.surface_name = name
+        self._emit_3d_state()
+
+    def set_active_surface_index(self, index: int) -> None:
+        self._sync_surface_queue()
+        if not self.surface_names:
+            self.active_surface_index = 0
+            self.surface_name = "surface"
+            self._emit_3d_state()
+            return
+        self.active_surface_index = max(0, min(int(index), len(self.surface_names) - 1))
+        self.surface_name = self.surface_names[self.active_surface_index]
+        self._emit_3d_state()
 
     def set_curve_mode(self) -> None:
         self.annotation_mode = "curve"
@@ -2257,6 +2278,9 @@ class SurfacePreviewCanvas(QWidget):
         self.closed_curves = []
         self.active_curve_vertices = []
         self.selected_patches = []
+        self.surface_names = []
+        self.active_surface_index = 0
+        self.surface_name = "surface"
         self.hover_face = None
         self.annotation_mode = "curve"
         self.message = "3D: click shell points to draw a cut curve"
@@ -2264,7 +2288,15 @@ class SurfacePreviewCanvas(QWidget):
         self.update()
 
     def can_build_3d_surfaces(self) -> bool:
-        return bool(self.shell_mesh is not None and self.closed_curves and self.selected_patches)
+        if self.shell_mesh is None or not self.closed_curves:
+            return False
+        self._sync_surface_queue()
+        seeded = {
+            int(patch.get("surface_index", 0))
+            for patch in self.selected_patches
+            if 0 <= int(patch.get("surface_index", 0)) < len(self.surface_names)
+        }
+        return bool(seeded) and all(index in seeded for index in range(len(self.surface_names)))
 
     def annotation_counts(self) -> tuple[int, int, int]:
         return (
@@ -2272,6 +2304,47 @@ class SurfacePreviewCanvas(QWidget):
             len(self.active_curve_vertices),
             len(self.selected_patches),
         )
+
+    @staticmethod
+    def _default_surface_name(index: int) -> str:
+        return f"surface_{int(index) + 1}"
+
+    def _sync_surface_queue(self) -> None:
+        while len(self.surface_names) < len(self.closed_curves):
+            if not self.surface_names and self.surface_name.strip() and self.surface_name != "surface":
+                self.surface_names.append(self.surface_name.strip())
+            else:
+                self.surface_names.append(self._default_surface_name(len(self.surface_names)))
+        if len(self.surface_names) > len(self.closed_curves):
+            self.surface_names = self.surface_names[: len(self.closed_curves)]
+        if not self.surface_names:
+            self.active_surface_index = 0
+            self.selected_patches = []
+            return
+        self.selected_patches = [
+            patch
+            for patch in self.selected_patches
+            if 0 <= int(patch.get("surface_index", 0)) < len(self.surface_names)
+        ]
+        self.active_surface_index = max(0, min(int(self.active_surface_index), len(self.surface_names) - 1))
+        self.surface_name = self.surface_names[self.active_surface_index]
+
+    def surface_queue(self) -> List[Dict[str, object]]:
+        self._sync_surface_queue()
+        seed_counts = {index: 0 for index in range(len(self.surface_names))}
+        for patch in self.selected_patches:
+            index = int(patch.get("surface_index", 0))
+            if index in seed_counts:
+                seed_counts[index] += 1
+        return [
+            {
+                "index": index,
+                "name": name,
+                "seed_count": seed_counts.get(index, 0),
+                "active": index == self.active_surface_index,
+            }
+            for index, name in enumerate(self.surface_names)
+        ]
 
     def undo_3d_action(self) -> bool:
         if self.active_curve_vertices:
@@ -2287,6 +2360,7 @@ class SurfacePreviewCanvas(QWidget):
             return True
         if self.closed_curves:
             curve = self.closed_curves.pop()
+            self._sync_surface_queue()
             vertices = [int(value) for value in curve.get("vertices", [])]
             if len(vertices) > 1 and vertices[0] == vertices[-1]:
                 vertices = vertices[:-1]
@@ -2301,6 +2375,7 @@ class SurfacePreviewCanvas(QWidget):
         if self.shell_mesh is None:
             raise ValueError("No 3D shell is loaded")
         np = _numpy()
+        self._sync_surface_queue()
         vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
         curves = []
         for index, curve in enumerate(self.closed_curves, start=1):
@@ -2318,9 +2393,15 @@ class SurfacePreviewCanvas(QWidget):
             )
         patches = []
         for patch in self.selected_patches:
+            surface_index = int(patch.get("surface_index", 0))
+            if 0 <= surface_index < len(self.surface_names):
+                surface_label = self.surface_names[surface_index]
+            else:
+                surface_label = str(patch.get("patch_label") or "surface")
             patches.append(
                 {
-                    "patch_label": str(patch.get("patch_label") or "surface"),
+                    "patch_label": surface_label,
+                    "surface_index": surface_index,
                     "source": "manual_3d",
                     "face_id": int(patch.get("face_id", -1)),
                     "seed_point": np.asarray(patch.get("seed_point"), dtype=float).round(4).tolist(),
@@ -2486,9 +2567,12 @@ class SurfacePreviewCanvas(QWidget):
                 "vertices": list(vertices),
             }
         )
+        self._sync_surface_queue()
+        self.active_surface_index = len(self.closed_curves) - 1
+        self.surface_name = self.surface_names[self.active_surface_index]
         self.active_curve_vertices = []
         self.annotation_mode = "patch"
-        self.message = "Closed curve saved. Hover and click the surface patch to keep."
+        self.message = f"Closed curve saved for '{self.surface_name}'. Click its seed patch."
 
     def _add_selected_patch(self, face_id: int) -> None:
         if self.shell_mesh is None:
@@ -2496,13 +2580,18 @@ class SurfacePreviewCanvas(QWidget):
         if any(int(patch.get("face_id", -1)) == int(face_id) for patch in self.selected_patches):
             self.message = "That patch seed is already selected"
             return
+        self._sync_surface_queue()
+        if not self.surface_names:
+            self.message = "Close a curve before selecting a surface seed"
+            return
         np = _numpy()
         face = np.asarray(self.shell_mesh.faces[int(face_id)], dtype=int)
         seed_point = np.asarray(self.shell_mesh.vertices[face], dtype=float).mean(axis=0)
-        label = self.surface_name or "surface"
+        label = self.surface_names[self.active_surface_index]
         self.selected_patches.append(
             {
                 "patch_label": label,
+                "surface_index": int(self.active_surface_index),
                 "face_id": int(face_id),
                 "seed_point": seed_point,
             }
@@ -3444,9 +3533,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_contour = CleanComboBox()
         self.annotate_contour.setMinimumHeight(28)
         self.annotate_contour.currentIndexChanged.connect(self.change_annotation_contour)
+        self.annotate_surface_queue = CleanComboBox()
+        self.annotate_surface_queue.setMinimumHeight(28)
+        self.annotate_surface_queue.currentIndexChanged.connect(self.on_3d_surface_queue_changed)
         self.annotate_surface_name = QLineEdit()
-        self.annotate_surface_name.setPlaceholderText("Surface file name, for example layer_outer")
-        self.annotate_surface_name.setText("surface")
+        self.annotate_surface_name.setPlaceholderText("Selected surface name, for example layer_outer")
+        self.annotate_surface_name.setText("surface_1")
         self.annotate_surface_name.setMinimumHeight(28)
         self.annotate_surface_name.textChanged.connect(self.on_3d_surface_name_changed)
         self.annotate_pick_mode = CleanComboBox()
@@ -3493,10 +3585,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.clear_3d_button = self._make_button("Clear 3D Annotation", "danger")
         self.clear_3d_button.setToolTip("Clear all 3D cut curves and selected surfaces.")
         self.clear_3d_button.clicked.connect(self.clear_3d_annotations)
-        self.build_3d_button = self._make_button("Build Current 3D Surface", "primary")
+        self.build_3d_button = self._make_button("Build Queued 3D Surfaces", "primary")
         self.build_3d_button.setToolTip(
-            "Build one named surface from the current closed curves and selected seed patches. "
-            "The annotations are saved with the output, then cleared for the next surface."
+            "Build all queued surfaces. Each closed curve creates one queue item; choose the item, name it, then select its seed patch."
         )
         self.build_3d_button.setEnabled(False)
         self.build_3d_button.clicked.connect(self.run_3d_surface_build)
@@ -3662,6 +3753,7 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _add_annotation_picking_section(self, controls_layout: QVBoxLayout, action_row: QWidget) -> None:
         picking_box, picking_form = self._make_form_section("3. 3D Pick And Build")
+        picking_form.addRow("Surface queue", self.annotate_surface_queue)
         picking_form.addRow("Surface name", self.annotate_surface_name)
         picking_form.addRow("State", self.next_point_label)
         picking_form.addRow("Actions", action_row)
@@ -3969,24 +4061,63 @@ class LaminarBoundaryWindow(QMainWindow):
         if hasattr(self, "surface_preview_canvas"):
             self.surface_preview_canvas.set_surface_name(text)
 
+    def on_3d_surface_queue_changed(self, index: int) -> None:
+        if not hasattr(self, "surface_preview_canvas"):
+            return
+        surface_index = self.annotate_surface_queue.itemData(index)
+        if surface_index is None:
+            return
+        self.surface_preview_canvas.set_active_surface_index(int(surface_index))
+        self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+
     def on_3d_build_ready_changed(self, ready: bool) -> None:
         if hasattr(self, "build_3d_button"):
             self.build_3d_button.setEnabled(bool(ready))
+
+    def _sync_3d_surface_queue_controls(self) -> List[Dict[str, object]]:
+        if not hasattr(self, "surface_preview_canvas") or not hasattr(self, "annotate_surface_queue"):
+            return []
+        queue = self.surface_preview_canvas.surface_queue()
+        active_index = int(getattr(self.surface_preview_canvas, "active_surface_index", 0))
+
+        self.annotate_surface_queue.blockSignals(True)
+        self.annotate_surface_queue.clear()
+        if not queue:
+            self.annotate_surface_queue.addItem("No closed curve yet", None)
+        else:
+            for item in queue:
+                index = int(item["index"])
+                name = str(item["name"])
+                seed_count = int(item["seed_count"])
+                self.annotate_surface_queue.addItem(
+                    f"{index + 1}. {name}  ({seed_count} seed{'s' if seed_count != 1 else ''})",
+                    index,
+                )
+            self.annotate_surface_queue.setCurrentIndex(max(0, min(active_index, self.annotate_surface_queue.count() - 1)))
+        self.annotate_surface_queue.blockSignals(False)
+
+        active_name = str(queue[active_index]["name"]) if queue else "surface_1"
+        self.annotate_surface_name.blockSignals(True)
+        self.annotate_surface_name.setText(active_name)
+        self.annotate_surface_name.setEnabled(bool(queue))
+        self.annotate_surface_queue.setEnabled(bool(queue))
+        self.annotate_surface_name.blockSignals(False)
+        return queue
 
     def on_3d_annotation_changed(self) -> None:
         if not hasattr(self, "surface_preview_canvas") or not hasattr(self, "next_point_label"):
             return
         curve_count, point_count, patch_count = self.surface_preview_canvas.annotation_counts()
+        queue = self._sync_3d_surface_queue_controls()
         if self.surface_preview_canvas.shell_mesh is None:
             text = "3D shell is not ready."
         elif point_count:
             text = f"Drawing curve: {point_count} point(s). Click an active point to close. X = undo."
-        elif curve_count and patch_count:
-            surface_name = self.annotate_surface_name.text().strip() or "surface"
-            text = (
-                f"Ready to build '{surface_name}': "
-                f"{curve_count} closed curve(s), {patch_count} seed patch(es)."
-            )
+        elif curve_count and self.surface_preview_canvas.can_build_3d_surfaces():
+            text = f"Ready to build {len(queue)} queued surface(s) from {curve_count} closed curve(s)."
+        elif queue:
+            missing = [str(int(item["index"]) + 1) for item in queue if int(item["seed_count"]) == 0]
+            text = f"{curve_count} queued surface(s). Select seed patch for surface {', '.join(missing)}."
         elif curve_count:
             text = f"{curve_count} closed curve(s). Hover and click a surface patch to keep."
         else:
@@ -4041,7 +4172,7 @@ class LaminarBoundaryWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "3D annotation incomplete",
-                "Close at least one cut curve and select at least one surface patch first.",
+                "Close at least one cut curve, then select one seed patch for every queued surface.",
             )
             return
 
@@ -4050,10 +4181,17 @@ class LaminarBoundaryWindow(QMainWindow):
             annotation_output_dir = self._auto_build_output_dir()
             if not self.annotate_output.text().strip():
                 self.annotate_output.set_text(annotation_output_dir)
-            surface_name = self.annotate_surface_name.text().strip() or "surface"
-            surface_slug = core.safe_surface_name(surface_name, fallback="surface")
-            build_dir = annotation_output_dir / "build_3d" / surface_slug
-            annotations_path = build_dir / "surface_3d_annotations.json"
+            surface_queue = self.surface_preview_canvas.surface_queue()
+            surface_names = [str(item["name"]) for item in surface_queue]
+            build_dir = annotation_output_dir / "build_3d"
+            surface_slugs = [
+                core.safe_surface_name(name, fallback=f"surface_{index + 1}")
+                for index, name in enumerate(surface_names)
+            ]
+            annotation_suffix = "_".join(surface_slugs[:3])
+            if len(surface_slugs) > 3:
+                annotation_suffix = f"{annotation_suffix}_and_{len(surface_slugs) - 3}_more"
+            annotations_path = build_dir / f"surface_3d_annotations_{annotation_suffix or 'surface'}.json"
             self._write_surface_3d_annotations_json(annotations_path)
             self.build_mask.set_text(self.annotation_mask_path)
             self.build_output.set_text(build_dir)
@@ -4089,7 +4227,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 output_dir=build_dir,
                 payload={
                     "clear_3d_annotations": True,
-                    "surface_name": surface_name,
+                    "surface_names": surface_names,
                     "annotations_path": annotations_path,
                 },
             )
@@ -7611,10 +7749,14 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         if not hasattr(self, "surface_preview_canvas"):
             return
-        surface_name = str(payload.get("surface_name") or "surface")
+        surface_names = payload.get("surface_names")
+        if isinstance(surface_names, list) and surface_names:
+            surface_text = ", ".join(str(name) for name in surface_names)
+        else:
+            surface_text = str(payload.get("surface_name") or "surface")
         annotations_path = payload.get("annotations_path")
         self.surface_preview_canvas.clear_3d_annotations()
-        message = f"Built '{surface_name}'. 3D annotation cleared for the next surface."
+        message = f"Built queued surface(s): {surface_text}. 3D annotation cleared for the next queue."
         if annotations_path:
             message += f" Saved markers: {annotations_path}"
         self.annotate_status.setText(message)

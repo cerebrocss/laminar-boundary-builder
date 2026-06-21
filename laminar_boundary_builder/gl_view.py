@@ -90,6 +90,8 @@ class ShellGLCanvas(QOpenGLWidget):
 
         self.shell_mesh = None
         self.surface_name = "surface"
+        self.surface_names: List[str] = []
+        self.active_surface_index = 0
         self.annotation_mode = "curve"
         self.closed_curves: List[Dict[str, object]] = []
         self.active_curve_vertices: List[int] = []
@@ -155,6 +157,9 @@ class ShellGLCanvas(QOpenGLWidget):
         self.closed_curves = []
         self.active_curve_vertices = []
         self.selected_patches = []
+        self.surface_names = []
+        self.active_surface_index = 0
+        self.surface_name = "surface"
         self.hover_face = None
         self._drag_point_ref = None
         self.annotation_mode = "curve"
@@ -175,7 +180,23 @@ class ShellGLCanvas(QOpenGLWidget):
         self.update()
 
     def set_surface_name(self, text: str) -> None:
-        self.surface_name = str(text or "").strip() or "surface"
+        self._sync_surface_queue()
+        name = str(text or "").strip() or self._default_surface_name(self.active_surface_index)
+        if self.surface_names:
+            self.surface_names[self.active_surface_index] = name
+        self.surface_name = name
+        self._emit_3d_state()
+
+    def set_active_surface_index(self, index: int) -> None:
+        self._sync_surface_queue()
+        if not self.surface_names:
+            self.active_surface_index = 0
+            self.surface_name = "surface"
+            self._emit_3d_state()
+            return
+        self.active_surface_index = max(0, min(int(index), len(self.surface_names) - 1))
+        self.surface_name = self.surface_names[self.active_surface_index]
+        self._emit_3d_state()
 
     def set_curve_mode(self) -> None:
         self.annotation_mode = "curve"
@@ -195,6 +216,9 @@ class ShellGLCanvas(QOpenGLWidget):
         self.closed_curves = []
         self.active_curve_vertices = []
         self.selected_patches = []
+        self.surface_names = []
+        self.active_surface_index = 0
+        self.surface_name = "surface"
         self.hover_face = None
         self._drag_point_ref = None
         self.annotation_mode = "curve"
@@ -203,10 +227,59 @@ class ShellGLCanvas(QOpenGLWidget):
         self.update()
 
     def can_build_3d_surfaces(self) -> bool:
-        return bool(self.shell_mesh is not None and self.closed_curves and self.selected_patches)
+        if self.shell_mesh is None or not self.closed_curves:
+            return False
+        self._sync_surface_queue()
+        seeded = {
+            int(patch.get("surface_index", 0))
+            for patch in self.selected_patches
+            if 0 <= int(patch.get("surface_index", 0)) < len(self.surface_names)
+        }
+        return bool(seeded) and all(index in seeded for index in range(len(self.surface_names)))
 
     def annotation_counts(self) -> tuple[int, int, int]:
         return (len(self.closed_curves), len(self.active_curve_vertices), len(self.selected_patches))
+
+    @staticmethod
+    def _default_surface_name(index: int) -> str:
+        return f"surface_{int(index) + 1}"
+
+    def _sync_surface_queue(self) -> None:
+        while len(self.surface_names) < len(self.closed_curves):
+            if not self.surface_names and self.surface_name.strip() and self.surface_name != "surface":
+                self.surface_names.append(self.surface_name.strip())
+            else:
+                self.surface_names.append(self._default_surface_name(len(self.surface_names)))
+        if len(self.surface_names) > len(self.closed_curves):
+            self.surface_names = self.surface_names[: len(self.closed_curves)]
+        if not self.surface_names:
+            self.active_surface_index = 0
+            self.selected_patches = []
+            return
+        self.selected_patches = [
+            patch
+            for patch in self.selected_patches
+            if 0 <= int(patch.get("surface_index", 0)) < len(self.surface_names)
+        ]
+        self.active_surface_index = max(0, min(int(self.active_surface_index), len(self.surface_names) - 1))
+        self.surface_name = self.surface_names[self.active_surface_index]
+
+    def surface_queue(self) -> List[Dict[str, object]]:
+        self._sync_surface_queue()
+        seed_counts = {index: 0 for index in range(len(self.surface_names))}
+        for patch in self.selected_patches:
+            index = int(patch.get("surface_index", 0))
+            if index in seed_counts:
+                seed_counts[index] += 1
+        return [
+            {
+                "index": index,
+                "name": name,
+                "seed_count": seed_counts.get(index, 0),
+                "active": index == self.active_surface_index,
+            }
+            for index, name in enumerate(self.surface_names)
+        ]
 
     def undo_3d_action(self) -> bool:
         if self.active_curve_vertices:
@@ -222,6 +295,7 @@ class ShellGLCanvas(QOpenGLWidget):
             return True
         if self.closed_curves:
             curve = self.closed_curves.pop()
+            self._sync_surface_queue()
             vertices = [int(value) for value in curve.get("vertices", [])]
             if len(vertices) > 1 and vertices[0] == vertices[-1]:
                 vertices = vertices[:-1]
@@ -235,8 +309,8 @@ class ShellGLCanvas(QOpenGLWidget):
     def annotation_payload(self, mask_path: Optional[Path] = None) -> Dict[str, object]:
         if self.shell_mesh is None:
             raise ValueError("No 3D shell is loaded")
+        self._sync_surface_queue()
         vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
-        surface_label = self.surface_name or "surface"
         curves = []
         for index, curve in enumerate(self.closed_curves, start=1):
             vertex_ids = [int(value) for value in curve.get("vertices", [])]
@@ -253,9 +327,15 @@ class ShellGLCanvas(QOpenGLWidget):
             )
         patches = []
         for patch in self.selected_patches:
+            surface_index = int(patch.get("surface_index", 0))
+            if 0 <= surface_index < len(self.surface_names):
+                surface_label = self.surface_names[surface_index]
+            else:
+                surface_label = str(patch.get("patch_label") or "surface")
             patches.append(
                 {
                     "patch_label": surface_label,
+                    "surface_index": surface_index,
                     "source": "manual_3d",
                     "face_id": int(patch.get("face_id", -1)),
                     "seed_point": np.asarray(patch.get("seed_point"), dtype=float).round(4).tolist(),
@@ -1237,9 +1317,12 @@ class ShellGLCanvas(QOpenGLWidget):
                 "vertices": list(vertices),
             }
         )
+        self._sync_surface_queue()
+        self.active_surface_index = len(self.closed_curves) - 1
+        self.surface_name = self.surface_names[self.active_surface_index]
         self.active_curve_vertices = []
         self.annotation_mode = "patch"
-        self.message = "Closed curve saved. Hover and click the surface patch to keep."
+        self.message = f"Closed curve saved for '{self.surface_name}'. Click its seed patch."
 
     def _add_selected_patch(self, face_id: int) -> None:
         if self.shell_mesh is None or len(self._faces) == 0:
@@ -1250,11 +1333,16 @@ class ShellGLCanvas(QOpenGLWidget):
         face = np.asarray([value for value in self._faces[int(face_id)] if int(value) >= 0], dtype=np.int64)
         if len(face) == 0:
             return
+        self._sync_surface_queue()
+        if not self.surface_names:
+            self.message = "Close a curve before selecting a surface seed"
+            return
         seed_point = np.asarray(self.shell_mesh.vertices, dtype=float)[face].mean(axis=0)
-        label = self.surface_name or "surface"
+        label = self.surface_names[self.active_surface_index]
         self.selected_patches.append(
             {
                 "patch_label": label,
+                "surface_index": int(self.active_surface_index),
                 "face_id": int(face_id),
                 "seed_point": seed_point,
             }
