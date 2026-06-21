@@ -37,6 +37,36 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 
+ProgressCallback = Callable[[int, str, str], None]
+
+
+def _emit_progress(
+    progress_callback: Optional[ProgressCallback],
+    value: float,
+    stage: str,
+    detail: str = "",
+) -> None:
+    if progress_callback is None:
+        return
+    clamped = max(0, min(100, int(round(float(value)))))
+    progress_callback(clamped, str(stage), str(detail or ""))
+
+
+def _progress_range(
+    progress_callback: Optional[ProgressCallback],
+    start: float,
+    stop: float,
+) -> Optional[ProgressCallback]:
+    if progress_callback is None:
+        return None
+
+    def emit(value: int, stage: str, detail: str = "") -> None:
+        scaled = float(start) + (float(stop) - float(start)) * (float(value) / 100.0)
+        _emit_progress(progress_callback, scaled, stage, detail)
+
+    return emit
+
+
 BOUNDARY_BACKGROUND = 0
 BOUNDARY_REGION = 1
 BOUNDARY_OUTER = 2
@@ -3294,6 +3324,31 @@ def build_marching_cubes_shell_mesh(
     )
 
 
+def _crop_mask_to_foreground(mask: np.ndarray, padding: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+    mask = _as_bool_mask(mask)
+    points = np.argwhere(mask)
+    if len(points) == 0:
+        return mask, np.zeros(3, dtype=float)
+    start = np.maximum(points.min(axis=0) - int(padding), 0)
+    stop = np.minimum(points.max(axis=0) + int(padding) + 1, np.asarray(mask.shape, dtype=int))
+    slices = tuple(slice(int(left), int(right)) for left, right in zip(start, stop))
+    return mask[slices], start.astype(float)
+
+
+def _offset_shell_mesh(mesh: ShellMesh, offset: np.ndarray) -> ShellMesh:
+    offset = np.asarray(offset, dtype=float).reshape(3)
+    if not np.any(offset):
+        return mesh
+    mesh.vertices = np.asarray(mesh.vertices, dtype=float) + offset.reshape(1, 3)
+    if mesh.face_sources:
+        int_offset = np.rint(offset).astype(int)
+        for source in mesh.face_sources:
+            for axis_index, key in enumerate(("voxel_x", "voxel_y", "voxel_z")):
+                if key in source:
+                    source[key] = int(source[key]) + int(int_offset[axis_index])
+    return mesh
+
+
 def build_shell_mesh(
     mask: np.ndarray,
     spacing: Optional[np.ndarray] = None,
@@ -3301,10 +3356,17 @@ def build_shell_mesh(
     max_surface_quads: int = 1_500_000,
 ) -> ShellMesh:
     backend = normalize_shell_backend(shell_backend)
+    mask, offset = _crop_mask_to_foreground(mask)
     if backend == SHELL_BACKEND_VOXEL:
-        return build_voxel_shell_mesh(mask, spacing=spacing, max_surface_quads=max_surface_quads)
+        return _offset_shell_mesh(
+            build_voxel_shell_mesh(mask, spacing=spacing, max_surface_quads=max_surface_quads),
+            offset,
+        )
     if backend == SHELL_BACKEND_MARCHING_CUBES:
-        return build_marching_cubes_shell_mesh(mask, spacing=spacing, max_surface_quads=max_surface_quads)
+        return _offset_shell_mesh(
+            build_marching_cubes_shell_mesh(mask, spacing=spacing, max_surface_quads=max_surface_quads),
+            offset,
+        )
     raise ValueError(f"Unknown shell_backend: {shell_backend}")
 
 
@@ -3902,15 +3964,27 @@ def _mesh_edge_pairs(faces: np.ndarray) -> Iterable[Tuple[int, int]]:
         yield _edge_key(int(c), int(a))
 
 
+def _unique_mesh_edges_array(faces: np.ndarray) -> np.ndarray:
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    edges.sort(axis=1)
+    return np.unique(edges, axis=0)
+
+
 def _build_shell_edge_graph(shell: ShellMesh) -> Tuple[Dict[int, List[Tuple[int, float]]], set[Tuple[int, int]]]:
     vertices_scaled = _shell_vertices_scaled(shell)
     adjacency: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
-    edges = set(_mesh_edge_pairs(shell.faces))
-    for left, right in edges:
+    edge_array = _unique_mesh_edges_array(shell.faces)
+    edge_set: set[Tuple[int, int]] = set()
+    for left_value, right_value in edge_array:
+        left, right = int(left_value), int(right_value)
+        edge_set.add((left, right))
         weight = float(np.linalg.norm(vertices_scaled[left] - vertices_scaled[right]))
         adjacency[left].append((right, weight))
         adjacency[right].append((left, weight))
-    return adjacency, edges
+    return adjacency, edge_set
 
 
 def _shortest_shell_path(
@@ -4148,9 +4222,12 @@ def _shell_triangle_area(vertices: np.ndarray) -> float:
 
 
 def _mesh_area(vertices: np.ndarray, faces: np.ndarray) -> float:
+    faces = np.asarray(faces, dtype=np.int64)
     if len(faces) == 0:
         return 0.0
-    return float(sum(_shell_triangle_area(vertices[np.asarray(face, dtype=np.int64)]) for face in faces))
+    triangles = np.asarray(vertices, dtype=float)[faces]
+    cross = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    return float(np.linalg.norm(cross, axis=1).sum() * 0.5)
 
 
 def _boundary_edges_for_faces(faces: np.ndarray) -> List[Tuple[int, int]]:
@@ -4219,8 +4296,10 @@ def _shell_summary_row(
 ) -> Dict:
     boundary_edges = sum(1 for face_ids in edge_to_faces.values() if len(face_ids) == 1)
     nonmanifold_edges = sum(1 for face_ids in edge_to_faces.values() if len(face_ids) > 2)
+    mask = _as_bool_mask(mask)
+    cropped_mask, _offset = _crop_mask_to_foreground(mask, padding=0)
     structure = ndimage.generate_binary_structure(3, 3)
-    _components, component_count = ndimage.label(_as_bool_mask(mask), structure=structure)
+    _components, component_count = ndimage.label(cropped_mask, structure=structure)
     return {
         "backend": shell.backend,
         "coordinate_space": shell.coordinate_space,
@@ -4230,7 +4309,7 @@ def _shell_summary_row(
         "num_boundary_edges": int(boundary_edges),
         "num_nonmanifold_edges": int(nonmanifold_edges),
         "mask_shape": "x".join(str(int(value)) for value in mask.shape),
-        "foreground_voxel_count": int(np.count_nonzero(mask)),
+        "foreground_voxel_count": int(np.count_nonzero(cropped_mask)),
         "mask_component_count": int(component_count),
         "spacing_x": float(shell.spacing[0]),
         "spacing_y": float(shell.spacing[1]),
@@ -4281,13 +4360,60 @@ def _cut_edge_label_lookup(
     edge_curve_ids: Dict[Tuple[int, int], set[str]] = defaultdict(set)
     for curve in curves:
         labels = _cut_curve_boundary_labels(curve)
-        if not labels:
-            continue
         for edge in curve.cut_edges:
             key = _edge_key(edge[0], edge[1])
-            edge_labels[key].update(labels)
+            if labels:
+                edge_labels[key].update(labels)
             edge_curve_ids[key].add(str(curve.curve_id))
     return edge_labels, edge_curve_ids
+
+
+def _cut_edge_rows(curves: Sequence[SurfaceCutCurve]) -> List[Dict]:
+    edge_curve_ids: Dict[Tuple[int, int], set[str]] = defaultdict(set)
+    for curve in curves:
+        for edge in curve.cut_edges:
+            edge_curve_ids[_edge_key(edge[0], edge[1])].add(str(curve.curve_id))
+
+    rows: List[Dict] = []
+    for curve in curves:
+        for left, right in curve.cut_edges:
+            edge = _edge_key(left, right)
+            curve_ids = sorted(edge_curve_ids.get(edge, {str(curve.curve_id)}))
+            rows.append(
+                {
+                    "curve_id": curve.curve_id,
+                    "edge_start": int(edge[0]),
+                    "edge_end": int(edge[1]),
+                    "curve_ids": ";".join(curve_ids),
+                    "shared_by_curve_count": int(len(curve_ids)),
+                }
+            )
+    return rows
+
+
+def _shared_cut_edge_rows(
+    shell: ShellMesh,
+    edge_curve_ids: Dict[Tuple[int, int], set[str]],
+) -> List[Dict]:
+    rows: List[Dict] = []
+    vertices = np.asarray(shell.vertices, dtype=float)
+    for edge, curve_ids in sorted(edge_curve_ids.items()):
+        if len(curve_ids) < 2:
+            continue
+        left, right = int(edge[0]), int(edge[1])
+        center = (vertices[left] + vertices[right]) * 0.5
+        rows.append(
+            {
+                "edge_start": left,
+                "edge_end": right,
+                "curve_ids": ";".join(sorted(curve_ids)),
+                "shared_by_curve_count": int(len(curve_ids)),
+                "center_x": float(center[0]),
+                "center_y": float(center[1]),
+                "center_z": float(center[2]),
+            }
+        )
+    return rows
 
 
 def _component_cut_touch_info(
@@ -4364,6 +4490,7 @@ def _shell_cut_warning_rows(
     component_rows: Optional[Sequence[Dict]] = None,
     shell_summary: Optional[Dict] = None,
     overlap_count: int = 0,
+    shared_cut_edge_count: int = 0,
     minimum_component_count: int = 3,
     warn_unclaimed_components: bool = True,
 ) -> List[Dict]:
@@ -4451,6 +4578,16 @@ def _shell_cut_warning_rows(
                 "object_id": "outer;inner",
                 "message": f"outer and inner flood fills overlap on {overlap_count} faces",
                 "suggested_action": "check cut curves and component assignment",
+            }
+        )
+    if shared_cut_edge_count > 0:
+        rows.append(
+            {
+                "warning_type": "shared_cut_edges",
+                "severity": "info",
+                "object_id": "cut_curves",
+                "message": f"{shared_cut_edge_count} cut edge(s) are shared by more than one closed curve",
+                "suggested_action": "this is allowed; inspect shared_cut_edges.csv if the selected patch is not the intended region",
             }
         )
     return rows
@@ -4814,8 +4951,23 @@ def _write_shell_cut_qc_tables(qc: Dict[str, List[Dict]], output_dir: str | Path
     _write_csv_rows(
         output_dir / "cut_edges.csv",
         qc.get("cut_edges", []),
-        fieldnames=["curve_id", "edge_start", "edge_end"],
+        fieldnames=["curve_id", "edge_start", "edge_end", "curve_ids", "shared_by_curve_count"],
     )
+    shared_cut_edge_rows = qc.get("shared_cut_edges", [])
+    if shared_cut_edge_rows:
+        _write_csv_rows(
+            output_dir / "shared_cut_edges.csv",
+            shared_cut_edge_rows,
+            fieldnames=[
+                "edge_start",
+                "edge_end",
+                "curve_ids",
+                "shared_by_curve_count",
+                "center_x",
+                "center_y",
+                "center_z",
+            ],
+        )
     _write_csv_rows(
         output_dir / "shell_cut_warnings.csv",
         qc.get("warnings", []),
@@ -4898,6 +5050,7 @@ def named_shell_cut_surface_patches(
     output_qc_dir: Optional[str | Path] = None,
     max_surface_quads: int = 1_500_000,
     input_warnings: Optional[Sequence[Dict]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Tuple[Dict[str, SurfaceMesh], Dict[str, List[Dict]]]:
     """Cut named patches from the complete shell using user-selected seed faces."""
 
@@ -4907,6 +5060,18 @@ def named_shell_cut_surface_patches(
     if not patch_seeds:
         raise ValueError("3D shell patch build needs at least one selected surface patch")
 
+    _emit_progress(
+        progress_callback,
+        5,
+        "Reading shell annotations",
+        f"{len(cut_curves)} curve(s), {len(patch_seeds)} patch seed(s)",
+    )
+    _emit_progress(
+        progress_callback,
+        18,
+        "Building shell mesh",
+        f"Backend: {normalize_shell_backend(shell_backend)}",
+    )
     shell = build_shell_mesh(
         mask,
         spacing=spacing,
@@ -4916,11 +5081,15 @@ def named_shell_cut_surface_patches(
     if len(shell.faces) == 0:
         raise ValueError("3D shell patch build could not build a shell from an empty mask")
 
+    _emit_progress(
+        progress_callback,
+        40,
+        "Tracing cut curves on shell",
+        f"{len(cut_curves)} closed curve(s)",
+    )
     edge_graph, edge_set = _build_shell_edge_graph(shell)
     traced_curves: List[SurfaceCutCurve] = []
     blocked_edges: set[Tuple[int, int]] = set()
-    edge_owner_by_curve: Dict[Tuple[int, int], str] = {}
-    overlapping_cut_edges: set[Tuple[int, int]] = set()
     for curve in cut_curves:
         traced = trace_cut_curve_on_shell(
             snap_cut_curve_to_shell(curve, shell),
@@ -4929,18 +5098,14 @@ def named_shell_cut_surface_patches(
             edge_set,
         )
         traced_curves.append(traced)
-        for edge in traced.cut_edges:
-            owner_curve_id = edge_owner_by_curve.get(edge)
-            if owner_curve_id is not None and owner_curve_id != traced.curve_id:
-                overlapping_cut_edges.add(edge)
-            edge_owner_by_curve.setdefault(edge, traced.curve_id)
-            blocked_edges.add(edge)
-    if overlapping_cut_edges:
-        raise ValueError(
-            f"closed cut curves overlap on {len(overlapping_cut_edges)} shell edge(s); "
-            "closed curves may share picked points, but they cannot reuse the same shell edge"
-        )
+        blocked_edges.update(traced.cut_edges)
 
+    _emit_progress(
+        progress_callback,
+        58,
+        "Finding selected surface patches",
+        f"{len(patch_seeds)} seed point(s)",
+    )
     adjacency, shared_edges, edge_to_faces = _build_face_adjacency(shell.faces)
     vertex_faces = _vertex_to_faces(shell.faces, len(shell.vertices))
     snapped_seeds = [snap_seed_to_shell_face(seed, shell, vertex_faces) for seed in patch_seeds]
@@ -4971,6 +5136,7 @@ def named_shell_cut_surface_patches(
         )
         meshes[label] = _extract_shell_submesh(label, shell, np.unique(face_indices))
 
+    _emit_progress(progress_callback, 72, "Preparing shell-cut QC", f"{len(meshes)} selected surface(s)")
     patch_rows = [
         _patch_summary_row(label, shell, np.concatenate([
             np.asarray(components[component_id], dtype=np.int64)
@@ -4980,21 +5146,14 @@ def named_shell_cut_surface_patches(
     ]
     shell_summary = _shell_summary_row(shell, mask, edge_to_faces)
     _edge_labels, edge_curve_ids = _cut_edge_label_lookup(traced_curves)
+    shared_cut_edge_rows = _shared_cut_edge_rows(shell, edge_curve_ids)
     component_rows = _named_patch_component_rows(
         components,
         shell,
         edge_curve_ids,
         labels_by_component,
     )
-    cut_edge_rows = [
-        {
-            "curve_id": curve.curve_id,
-            "edge_start": int(left),
-            "edge_end": int(right),
-        }
-        for curve in traced_curves
-        for left, right in curve.cut_edges
-    ]
+    cut_edge_rows = _cut_edge_rows(traced_curves)
     warning_rows.extend(
         _shell_cut_warning_rows(
             traced_curves,
@@ -5002,6 +5161,7 @@ def named_shell_cut_surface_patches(
             patch_rows,
             component_rows=component_rows,
             shell_summary=shell_summary,
+            shared_cut_edge_count=len(shared_cut_edge_rows),
             minimum_component_count=2,
             warn_unclaimed_components=False,
         )
@@ -5024,11 +5184,13 @@ def named_shell_cut_surface_patches(
         "patch_summary": patch_rows,
         "cut_components": component_rows,
         "cut_edges": cut_edge_rows,
+        "shared_cut_edges": shared_cut_edge_rows,
         "warnings": warning_rows,
     }
 
     if output_qc_dir is not None:
         output_qc_path = Path(output_qc_dir)
+        _emit_progress(progress_callback, 86, "Writing shell-cut QC", str(output_qc_path))
         _write_shell_cut_qc_tables(qc, output_qc_path)
         _write_shell_cut_debug_geometry(
             output_qc_path,
@@ -5044,6 +5206,7 @@ def named_shell_cut_surface_patches(
     ]
     if error_messages:
         raise ValueError("3D shell patch build failed: " + "; ".join(error_messages))
+    _emit_progress(progress_callback, 100, "Shell patches ready", f"{len(meshes)} selected surface(s)")
     return meshes, qc
 
 
@@ -5057,10 +5220,18 @@ def shell_cut_surface_patches(
     output_qc_dir: Optional[str | Path] = None,
     max_surface_quads: int = 1_500_000,
     input_warnings: Optional[Sequence[Dict]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Tuple[Dict[str, SurfaceMesh], Dict[str, List[Dict]]]:
     """Cut outer/inner/lateral patches from the complete mask shell."""
 
     mask = _as_bool_mask(mask)
+    _emit_progress(progress_callback, 5, "Reading shell-cut boundaries", "Preparing cut curves and seed points")
+    _emit_progress(
+        progress_callback,
+        18,
+        "Building shell mesh",
+        f"Backend: {normalize_shell_backend(shell_backend)}",
+    )
     shell = build_shell_mesh(
         mask,
         spacing=spacing,
@@ -5076,6 +5247,7 @@ def shell_cut_surface_patches(
 
     seeds = list(patch_seeds or [])
 
+    _emit_progress(progress_callback, 40, "Tracing cut curves on shell", f"{len(curves)} cut curve(s)")
     edge_graph, edge_set = _build_shell_edge_graph(shell)
     traced_curves: List[SurfaceCutCurve] = []
     blocked_edges: set[Tuple[int, int]] = set()
@@ -5089,6 +5261,7 @@ def shell_cut_surface_patches(
         traced_curves.append(traced)
         blocked_edges.update(traced.cut_edges)
 
+    _emit_progress(progress_callback, 58, "Finding shell components", "Flood filling patches between cut curves")
     adjacency, shared_edges, edge_to_faces = _build_face_adjacency(shell.faces)
     vertex_faces = _vertex_to_faces(shell.faces, len(shell.vertices))
     snapped_seeds = [snap_seed_to_shell_face(seed, shell, vertex_faces) for seed in seeds]
@@ -5112,21 +5285,15 @@ def shell_cut_surface_patches(
         "lateral": _extract_shell_submesh("lateral", shell, lateral_faces),
     }
 
+    _emit_progress(progress_callback, 72, "Preparing shell-cut QC", f"{len(components)} shell component(s)")
     patch_rows = [
         _patch_summary_row("outer", shell, outer_faces),
         _patch_summary_row("inner", shell, inner_faces),
         _patch_summary_row("lateral", shell, lateral_faces),
     ]
     shell_summary = _shell_summary_row(shell, mask, edge_to_faces)
-    cut_edge_rows = [
-        {
-            "curve_id": curve.curve_id,
-            "edge_start": int(left),
-            "edge_end": int(right),
-        }
-        for curve in traced_curves
-        for left, right in curve.cut_edges
-    ]
+    shared_cut_edge_rows = _shared_cut_edge_rows(shell, edge_curve_ids)
+    cut_edge_rows = _cut_edge_rows(traced_curves)
     warning_rows = list(input_warnings or [])
     warning_rows.extend(
         _shell_cut_warning_rows(
@@ -5136,6 +5303,7 @@ def shell_cut_surface_patches(
             component_rows=component_rows,
             shell_summary=shell_summary,
             overlap_count=int(len(overlap)),
+            shared_cut_edge_count=len(shared_cut_edge_rows),
         )
     )
     qc = {
@@ -5145,11 +5313,13 @@ def shell_cut_surface_patches(
         "patch_summary": patch_rows,
         "cut_components": component_rows,
         "cut_edges": cut_edge_rows,
+        "shared_cut_edges": shared_cut_edge_rows,
         "warnings": warning_rows,
     }
 
     if output_qc_dir is not None:
         output_qc_path = Path(output_qc_dir)
+        _emit_progress(progress_callback, 86, "Writing shell-cut QC", str(output_qc_path))
         _write_shell_cut_qc_tables(qc, output_qc_path)
         _write_shell_cut_debug_geometry(
             output_qc_path,
@@ -5165,6 +5335,7 @@ def shell_cut_surface_patches(
     ]
     if error_messages:
         raise ValueError("Shell-cut failed: " + "; ".join(error_messages))
+    _emit_progress(progress_callback, 100, "Shell-cut surfaces ready", "Outer, inner, and lateral patches are isolated")
     return meshes, qc
 
 
@@ -7470,11 +7641,18 @@ def _write_surfaces(
     spacing: Optional[np.ndarray] = None,
     shell_backend: str = "voxel",
     cut_curve_json: Optional[str | Path] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, SurfaceMesh]:
     surface_dir = output_dir / "surfaces"
     surface_dir.mkdir(parents=True, exist_ok=True)
     surface_method = normalize_surface_build_method(surface_method)
     shell_backend = normalize_shell_backend(shell_backend)
+    _emit_progress(
+        progress_callback,
+        0,
+        "Building surface mesh",
+        f"Method: {surface_method.replace('_', ' ')}",
+    )
 
     if surface_method == SURFACE_BUILD_FAST_LOFT:
         meshes = _loft_surface_patches(boundaries, resample_points=resample_points)
@@ -7510,6 +7688,7 @@ def _write_surfaces(
             shell_backend=shell_backend,
             output_qc_dir=output_dir / "qc",
             input_warnings=input_warnings,
+            progress_callback=_progress_range(progress_callback, 5, 75),
         )
     else:
         meshes = _mask_constrained_surface_patches_with_fallback(
@@ -7520,6 +7699,7 @@ def _write_surfaces(
             slice_axis=slice_axis,
         )
 
+    _emit_progress(progress_callback, 78, "Writing surface files", f"{len(meshes)} surface file set(s)")
     for name, mesh in meshes.items():
         if name == "lateral":
             write_ply(surface_dir / "target_lateral_boundary.ply", mesh)
@@ -7527,6 +7707,7 @@ def _write_surfaces(
         else:
             write_ply(surface_dir / f"target_{name}_surface.ply", mesh)
             write_obj(surface_dir / f"target_{name}_surface.obj", mesh)
+    _emit_progress(progress_callback, 100, "Surface files written", str(surface_dir))
     return meshes
 
 
@@ -7626,17 +7807,21 @@ def run_3d_shell_patch_pipeline(
     output_dir: str | Path,
     shell_backend: str = SHELL_BACKEND_MARCHING_CUBES,
     max_surface_quads: int = 1_500_000,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Path]:
     """Build user-named shell patches from direct 3D closed-curve annotations."""
 
     output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
     qc_dir = output_dir / "qc"
     qc_dir.mkdir(parents=True, exist_ok=True)
 
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
     mask_volume = load_volume(mask_path)
     mask = _as_bool_mask(mask_volume.data)
     spacing = _voxel_spacing_from_volume(mask_volume)
+    _emit_progress(progress_callback, 18, "Reading 3D cut curves", str(cut_curve_json))
     curves, patch_seeds, input_warnings = read_shell_cut_json_with_qc(
         cut_curve_json,
         contours=None,
@@ -7650,7 +7835,9 @@ def run_3d_shell_patch_pipeline(
         output_qc_dir=qc_dir,
         max_surface_quads=max_surface_quads,
         input_warnings=input_warnings,
+        progress_callback=_progress_range(progress_callback, 25, 82),
     )
+    _emit_progress(progress_callback, 86, "Writing selected surface files", str(output_dir / "surfaces"))
     surface_outputs = _write_named_surface_outputs(meshes, output_dir)
     config = {
         "mask_path": str(mask_path),
@@ -7661,6 +7848,7 @@ def run_3d_shell_patch_pipeline(
         "surface_names": list(meshes.keys()),
         "surface_outputs": {key: str(value) for key, value in surface_outputs.items()},
     }
+    _emit_progress(progress_callback, 96, "Writing project config", str(output_dir / "project_config.json"))
     with (output_dir / "project_config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
 
@@ -7671,6 +7859,7 @@ def run_3d_shell_patch_pipeline(
         "project_config": output_dir / "project_config.json",
     }
     outputs.update(surface_outputs)
+    _emit_progress(progress_callback, 100, "3D surface build finished", str(output_dir))
     return outputs
 
 
@@ -7693,10 +7882,12 @@ def run_laminar_boundary_pipeline(
     boundary_dilation: int = 1,
     qc_every: int = 10,
     volume_format: str = "nrrd",
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Path]:
     """Run the full MVP pipeline from mask and manual landmarks."""
 
     output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
     surface_method = normalize_surface_build_method(surface_method)
     shell_backend = normalize_shell_backend(shell_backend)
@@ -7709,9 +7900,11 @@ def run_laminar_boundary_pipeline(
     surface_registry_path = qc_dir / "surface_method_registry.csv"
     write_surface_method_registry(surface_registry_path)
 
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
     mask_volume = load_volume(mask_path)
     mask = _as_bool_mask(mask_volume.data)
     spacing = _voxel_spacing_from_volume(mask_volume)
+    _emit_progress(progress_callback, 15, "Extracting slice contours", f"Axis: {slice_axis}")
     contours = extract_slice_contours(
         mask,
         slice_axis=slice_axis,
@@ -7720,16 +7913,20 @@ def run_laminar_boundary_pipeline(
     )
     if not contours:
         raise ValueError("No usable contours were extracted from the mask")
+    _emit_progress(progress_callback, 24, "Writing contour tables", f"{len(contours)} contour(s)")
     save_contours_json(contours, output_dir / "contours.json")
     write_contour_index_table(contours, output_dir / "contour_index.csv")
     write_contour_points_table(contours, output_dir / "contour_points.csv")
 
+    _emit_progress(progress_callback, 32, "Reading manual annotations", str(manual_csv))
     manual_rows = read_manual_landmarks(manual_csv)
+    _emit_progress(progress_callback, 40, "Propagating boundary curves", f"{len(manual_rows)} manual row(s)")
     manual_boundaries = build_manual_boundaries(contours, manual_rows, resample_points)
     validate_endpoint_annotations(contours, manual_boundaries)
     boundaries = propagate_boundaries(contours, manual_boundaries, resample_points=resample_points)
     save_boundaries_json(boundaries, output_dir / "boundary_annotations.json")
     write_boundary_summary(boundaries, tables_dir / "boundary_summary.csv")
+    _emit_progress(progress_callback, 48, "Preparing annotated target mask", f"{len(boundaries)} boundary slice(s)")
     target_mask = _mask_for_annotated_components(mask, boundaries)
     effective_cut_curve_json = _resolve_shell_cut_json_path(
         output_dir,
@@ -7748,6 +7945,7 @@ def run_laminar_boundary_pipeline(
         spacing=spacing,
         shell_backend=shell_backend,
         cut_curve_json=effective_cut_curve_json,
+        progress_callback=_progress_range(progress_callback, 52, 76),
     )
     surface_outputs = {
         "outer_surface": output_dir / "surfaces" / "target_outer_surface.ply",
@@ -7756,6 +7954,7 @@ def run_laminar_boundary_pipeline(
     }
 
     if _surface_only_build_requested(depth_method):
+        _emit_progress(progress_callback, 84, "Writing QC tables", str(qc_dir))
         write_qc_tables(boundaries, qc_dir)
         config = {
             "mask_path": str(mask_path),
@@ -7802,8 +8001,10 @@ def run_laminar_boundary_pipeline(
                 else "annotation_derived",
                 "spacing": [float(value) for value in spacing],
             }
+        _emit_progress(progress_callback, 96, "Writing project config", str(output_dir / "project_config.json"))
         with (output_dir / "project_config.json").open("w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)
+        _emit_progress(progress_callback, 100, "Surface build finished", str(output_dir))
         return {
             "output_dir": output_dir,
             "contours": output_dir / "contours.json",
@@ -7816,13 +8017,16 @@ def run_laminar_boundary_pipeline(
             "surface_method_registry": surface_registry_path,
         }
 
+    _emit_progress(progress_callback, 78, "Building boundary label volume", f"Dilation: {boundary_dilation}")
     labels = make_boundary_label_volume(target_mask, boundaries, dilation_iterations=boundary_dilation)
+    _emit_progress(progress_callback, 82, "Computing laminar depth", f"Method: {depth_method}")
     depth = compute_laminar_depth(
         target_mask,
         labels,
         method=depth_method,
         max_laplace_voxels=max_laplace_voxels,
     )
+    _emit_progress(progress_callback, 88, "Computing layer normals", "Sampling depth gradient")
     normals = compute_layer_normals(depth, target_mask)
 
     volume_format = volume_format.lower().lstrip(".")
@@ -7832,6 +8036,7 @@ def run_laminar_boundary_pipeline(
     def volume_path(name: str) -> Path:
         return volumes_dir / f"{name}.{volume_format}"
 
+    _emit_progress(progress_callback, 91, "Writing volume outputs", str(volumes_dir))
     save_volume(volume_path("target_mask"), target_mask.astype(np.uint8), reference=mask_volume)
     save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
     save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
@@ -7840,6 +8045,7 @@ def run_laminar_boundary_pipeline(
     save_volume(volume_path("layer_normal_z"), normals[..., 2], reference=mask_volume)
 
     if cell_csv is not None:
+        _emit_progress(progress_callback, 93, "Writing cell depth table", str(cell_csv))
         write_cell_depth_table(
             cell_csv,
             tables_dir / "cell_laminar_depth.csv",
@@ -7849,6 +8055,7 @@ def run_laminar_boundary_pipeline(
         )
 
     if swc_paths:
+        _emit_progress(progress_callback, 94, "Summarizing dendrite depth", f"{len(swc_paths)} SWC file(s)")
         summarize_dendrite_depth(
             swc_paths,
             depth,
@@ -7856,6 +8063,7 @@ def run_laminar_boundary_pipeline(
             tables_dir / "dendrite_laminar_depth.csv",
         )
 
+    _emit_progress(progress_callback, 95, "Writing QC tables", str(qc_dir))
     template = load_volume(template_path).data if template_path else None
     write_qc_tables(boundaries, qc_dir)
     write_qc_slice_overlays(
@@ -7911,9 +8119,11 @@ def run_laminar_boundary_pipeline(
             else "annotation_derived",
             "spacing": [float(value) for value in spacing],
         }
+    _emit_progress(progress_callback, 98, "Writing project config", str(output_dir / "project_config.json"))
     with (output_dir / "project_config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
 
+    _emit_progress(progress_callback, 100, "Build finished", str(output_dir))
     return {
         "output_dir": output_dir,
         "contours": output_dir / "contours.json",
@@ -7942,10 +8152,12 @@ def run_laminar_depth_pipeline(
     boundary_dilation: int = 1,
     qc_every: int = 10,
     volume_format: str = "nrrd",
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Path]:
     """Compute laminar depth from a saved boundary_annotations.json file."""
 
     output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
     volumes_dir = output_dir / "volumes"
     tables_dir = output_dir / "tables"
     qc_dir = output_dir / "qc"
@@ -7953,19 +8165,24 @@ def run_laminar_depth_pipeline(
     tables_dir.mkdir(parents=True, exist_ok=True)
     qc_dir.mkdir(parents=True, exist_ok=True)
 
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
     mask_volume = load_volume(mask_path)
     mask = _as_bool_mask(mask_volume.data)
+    _emit_progress(progress_callback, 18, "Reading boundary JSON", str(boundaries_json))
     boundaries = read_boundaries_json(boundaries_json)
     if not boundaries:
         raise ValueError("No boundaries found in boundary_annotations.json")
 
+    _emit_progress(progress_callback, 30, "Building boundary label volume", f"Dilation: {boundary_dilation}")
     labels = make_boundary_label_volume(mask, boundaries, dilation_iterations=boundary_dilation)
+    _emit_progress(progress_callback, 42, "Computing laminar depth", f"Method: {depth_method}")
     depth = compute_laminar_depth(
         mask,
         labels,
         method=depth_method,
         max_laplace_voxels=max_laplace_voxels,
     )
+    _emit_progress(progress_callback, 68, "Computing layer normals", "Sampling depth gradient")
     normals = compute_layer_normals(depth, mask)
 
     volume_format = volume_format.lower().lstrip(".")
@@ -7975,6 +8192,7 @@ def run_laminar_depth_pipeline(
     def volume_path(name: str) -> Path:
         return volumes_dir / f"{name}.{volume_format}"
 
+    _emit_progress(progress_callback, 76, "Writing volume outputs", str(volumes_dir))
     save_volume(volume_path("target_mask"), mask.astype(np.uint8), reference=mask_volume)
     save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
     save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
@@ -7983,6 +8201,7 @@ def run_laminar_depth_pipeline(
     save_volume(volume_path("layer_normal_z"), normals[..., 2], reference=mask_volume)
 
     if cell_csv is not None:
+        _emit_progress(progress_callback, 84, "Writing cell depth table", str(cell_csv))
         write_cell_depth_table(
             cell_csv,
             tables_dir / "cell_laminar_depth.csv",
@@ -7992,6 +8211,7 @@ def run_laminar_depth_pipeline(
         )
 
     if swc_paths:
+        _emit_progress(progress_callback, 88, "Summarizing dendrite depth", f"{len(swc_paths)} SWC file(s)")
         summarize_dendrite_depth(
             swc_paths,
             depth,
@@ -7999,6 +8219,7 @@ def run_laminar_depth_pipeline(
             tables_dir / "dendrite_laminar_depth.csv",
         )
 
+    _emit_progress(progress_callback, 92, "Writing QC tables", str(qc_dir))
     template = load_volume(template_path).data if template_path else None
     write_qc_tables(boundaries, qc_dir)
     write_qc_slice_overlays(
@@ -8028,9 +8249,11 @@ def run_laminar_depth_pipeline(
             "lateral": BOUNDARY_LATERAL,
         },
     }
+    _emit_progress(progress_callback, 98, "Writing depth config", str(output_dir / "depth_config.json"))
     with (output_dir / "depth_config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
 
+    _emit_progress(progress_callback, 100, "Depth volume finished", str(output_dir))
     return {
         "output_dir": output_dir,
         "laminar_depth": volume_path("laminar_depth"),

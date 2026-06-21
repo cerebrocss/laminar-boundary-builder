@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import heapq
 import math
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from OpenGL.GL import (
@@ -15,21 +16,27 @@ from OpenGL.GL import (
     GL_CULL_FACE,
     GL_DEPTH_BUFFER_BIT,
     GL_DEPTH_TEST,
+    GL_FALSE,
     GL_FLOAT,
     GL_LEQUAL,
     GL_LINES,
     GL_ONE_MINUS_SRC_ALPHA,
+    GL_POINT_SMOOTH,
+    GL_POINTS,
     GL_SRC_ALPHA,
     GL_TRIANGLES,
+    GL_TRUE,
     glBlendFunc,
     glClear,
     glClearColor,
     glCullFace,
     glDepthFunc,
+    glDepthMask,
     glDisable,
     glDrawArrays,
     glEnable,
     glLineWidth,
+    glPointSize,
     glViewport,
 )
 from PyQt5.QtCore import QPointF, Qt, pyqtSignal
@@ -57,14 +64,24 @@ class ShellGLCanvas(QOpenGLWidget):
 
     MAX_DISPLAY_FACES = 180000
     MAX_HOVER_FACES = 30000
-    MAX_EDGE_SEGMENTS = 32000
+    MAX_EDGE_SEGMENTS = 90000
+    MAX_CURVE_PATH_VISITED = 120000
     CLICK_MOVE_TOLERANCE_SQ = 81.0
+    ANNOTATION_LINE_COLOR = "#ff3b30"
+    ANNOTATION_POINT_COLOR = "#ffe033"
+    ANNOTATION_DEPTH_BIAS = 0.0025
+    DRAG_INSIDE_CURVE_MARGIN_PX = 12.0
+    MODEL_BASE_SCALE = 0.84
+    PROJECTION_NEAR = -10.0
+    PROJECTION_FAR = 10.0
 
     def __init__(self, parent=None):
         super().__init__(parent)
         fmt = QSurfaceFormat()
         fmt.setDepthBufferSize(24)
-        fmt.setSamples(4)
+        # Keep the framebuffer simple; annotations are now regular 3D draws that
+        # use the same depth test as the shell.
+        fmt.setSamples(0)
         self.setFormat(fmt)
         self.setMinimumSize(420, 420)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -89,6 +106,8 @@ class ShellGLCanvas(QOpenGLWidget):
         self._press_pos: Optional[QPointF] = None
         self._drag_mode = "rotate"
         self._drag_moved = False
+        self._drag_point_ref: Optional[Tuple[str, int, int]] = None
+        self._last_drag_reject_reason = ""
         self._last_hover_at = 0.0
 
         self._gl_ready = False
@@ -96,6 +115,8 @@ class ShellGLCanvas(QOpenGLWidget):
         self._line_program: Optional[QOpenGLShaderProgram] = None
         self._vbo: Optional[QOpenGLBuffer] = None
         self._edge_vbo: Optional[QOpenGLBuffer] = None
+        self._annotation_line_vbo: Optional[QOpenGLBuffer] = None
+        self._annotation_point_vbo: Optional[QOpenGLBuffer] = None
         self._mesh_dirty = False
         self._vertex_count = 0
         self._edge_vertex_count = 0
@@ -112,8 +133,14 @@ class ShellGLCanvas(QOpenGLWidget):
         self._display_triangles = np.empty((0, 3), dtype=np.int64)
         self._display_centers = np.empty((0, 3), dtype=np.float32)
         self._display_center_face_ids = np.empty((0,), dtype=np.int64)
+        self._curve_edge_graph: Dict[int, List[Tuple[int, float]]] = {}
+        self._curve_edge_set: set[Tuple[int, int]] = set()
+        self._curve_graph_vertices = np.empty((0, 3), dtype=np.float32)
+        self._curve_path_cache: Dict[Tuple[int, ...], List[int]] = {}
         self._screen_cache_key = None
         self._screen_cache = None
+        self._viewport_width = 1
+        self._viewport_height = 1
 
     def set_reference_contours(self, _contours, _slice_axis: int = 0) -> None:
         return
@@ -129,6 +156,7 @@ class ShellGLCanvas(QOpenGLWidget):
         self.active_curve_vertices = []
         self.selected_patches = []
         self.hover_face = None
+        self._drag_point_ref = None
         self.annotation_mode = "curve"
         self.rotation_yaw = -0.55
         self.rotation_pitch = 0.38
@@ -168,6 +196,7 @@ class ShellGLCanvas(QOpenGLWidget):
         self.active_curve_vertices = []
         self.selected_patches = []
         self.hover_face = None
+        self._drag_point_ref = None
         self.annotation_mode = "curve"
         self.message = "3D: click the shaded shell to draw a cut curve"
         self._emit_3d_state()
@@ -256,6 +285,10 @@ class ShellGLCanvas(QOpenGLWidget):
         self._display_triangles = np.empty((0, 3), dtype=np.int64)
         self._display_centers = np.empty((0, 3), dtype=np.float32)
         self._display_center_face_ids = np.empty((0,), dtype=np.int64)
+        self._curve_edge_graph = {}
+        self._curve_edge_set = set()
+        self._curve_graph_vertices = np.empty((0, 3), dtype=np.float32)
+        self._curve_path_cache = {}
         self._mesh_dirty = True
 
     def _prepare_mesh_arrays(self, shell_mesh) -> None:
@@ -304,6 +337,12 @@ class ShellGLCanvas(QOpenGLWidget):
         self._display_centers = self._normalized_vertices[triangles].mean(axis=1).astype(np.float32)
         self._display_center_face_ids = np.asarray(triangle_face_ids, dtype=np.int64)
         self._display_vertex_normals = vertex_normals
+        spacing = np.asarray(getattr(shell_mesh, "spacing", (1.0, 1.0, 1.0)), dtype=np.float32)
+        if spacing.shape != (3,):
+            spacing = np.ones(3, dtype=np.float32)
+        self._curve_graph_vertices = (self._vertices * spacing.reshape(1, 3)).astype(np.float32)
+        self._curve_edge_graph, self._curve_edge_set = self._build_curve_edge_graph(faces)
+        self._curve_path_cache = {}
         self._screen_cache_key = None
         self._screen_cache = None
         self._mesh_dirty = True
@@ -370,6 +409,36 @@ class ShellGLCanvas(QOpenGLWidget):
         return (edge_vertices + edge_normals * 0.0015).astype(np.float32)
 
     @staticmethod
+    def _edge_key(left: int, right: int) -> Tuple[int, int]:
+        left = int(left)
+        right = int(right)
+        return (left, right) if left < right else (right, left)
+
+    def _build_curve_edge_graph(self, faces: np.ndarray) -> tuple[Dict[int, List[Tuple[int, float]]], set[Tuple[int, int]]]:
+        graph: Dict[int, List[Tuple[int, float]]] = {}
+        edge_set: set[Tuple[int, int]] = set()
+        vertices = self._curve_graph_vertices
+        if len(vertices) == 0:
+            return graph, edge_set
+        for face in np.asarray(faces, dtype=np.int64):
+            face_vertices = [int(value) for value in face if int(value) >= 0]
+            if len(face_vertices) < 2:
+                continue
+            for left, right in zip(face_vertices, face_vertices[1:] + face_vertices[:1]):
+                if left == right:
+                    continue
+                key = self._edge_key(left, right)
+                if key in edge_set:
+                    continue
+                edge_set.add(key)
+                weight = float(np.linalg.norm(vertices[left] - vertices[right]))
+                if not math.isfinite(weight) or weight <= 0:
+                    weight = 1.0
+                graph.setdefault(left, []).append((right, weight))
+                graph.setdefault(right, []).append((left, weight))
+        return graph, edge_set
+
+    @staticmethod
     def _face_ids_to_colors(face_ids: np.ndarray) -> np.ndarray:
         codes = np.asarray(face_ids, dtype=np.uint32) + np.uint32(1)
         red = (codes & np.uint32(255)).astype(np.float32) / 255.0
@@ -390,6 +459,10 @@ class ShellGLCanvas(QOpenGLWidget):
             self._vbo.create()
             self._edge_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
             self._edge_vbo.create()
+            self._annotation_line_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+            self._annotation_line_vbo.create()
+            self._annotation_point_vbo = QOpenGLBuffer(QOpenGLBuffer.VertexBuffer)
+            self._annotation_point_vbo.create()
             self._gl_ready = True
             self._upload_mesh()
         except Exception as exc:
@@ -397,16 +470,31 @@ class ShellGLCanvas(QOpenGLWidget):
             self.message = f"OpenGL view failed to initialize: {exc}"
 
     def resizeGL(self, width: int, height: int) -> None:
-        glViewport(0, 0, max(1, width), max(1, height))
+        self._viewport_width = max(1, int(width))
+        self._viewport_height = max(1, int(height))
+        glViewport(0, 0, self._viewport_width, self._viewport_height)
         self._screen_cache_key = None
         self._screen_cache = None
 
     def paintGL(self) -> None:
+        try:
+            self._paint_gl()
+        except Exception as exc:
+            self.message = f"3D render failed: {exc}"
+            glClearColor(0.045, 0.075, 0.07, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            try:
+                self._draw_overlay()
+            except Exception:
+                pass
+
+    def _paint_gl(self) -> None:
         glClearColor(0.045, 0.075, 0.07, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         if self._gl_ready and self._vertex_count and self._surface_program is not None:
             self._draw_surface()
             self._draw_edges()
+            self._draw_annotations()
         self._draw_overlay()
 
     def _create_surface_program(self) -> QOpenGLShaderProgram:
@@ -414,19 +502,15 @@ class ShellGLCanvas(QOpenGLWidget):
         vertex_shader = """
             attribute vec3 position;
             attribute vec3 normal;
-            attribute vec3 pick_color;
             uniform mat4 mvp;
             varying vec3 v_normal;
-            varying float v_soft_depth;
             void main() {
                 gl_Position = mvp * vec4(position, 1.0);
                 v_normal = normalize(normal);
-                v_soft_depth = gl_Position.z;
             }
         """
         fragment_shader = """
             varying vec3 v_normal;
-            varying float v_soft_depth;
             uniform vec3 base_color;
             uniform vec3 light_dir;
             void main() {
@@ -452,8 +536,11 @@ class ShellGLCanvas(QOpenGLWidget):
         vertex_shader = """
             attribute vec3 position;
             uniform mat4 mvp;
+            uniform float depth_bias;
             void main() {
-                gl_Position = mvp * vec4(position, 1.0);
+                vec4 clip = mvp * vec4(position, 1.0);
+                clip.z -= depth_bias * clip.w;
+                gl_Position = clip;
             }
         """
         fragment_shader = """
@@ -520,33 +607,170 @@ class ShellGLCanvas(QOpenGLWidget):
         if self._mesh_dirty:
             self._upload_mesh()
         glEnable(GL_DEPTH_TEST)
-        glLineWidth(1.0)
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(GL_FALSE)
+        glLineWidth(1.25)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        try:
+            program = self._line_program
+            program.bind()
+            program.setUniformValue("mvp", self._mvp_matrix())
+            program.setUniformValue("depth_bias", 0.0)
+            program.setUniformValue("line_color", QVector4D(0.015, 0.075, 0.065, 0.58))
+            self._edge_vbo.bind()
+            program.enableAttributeArray("position")
+            program.setAttributeBuffer("position", GL_FLOAT, 0, 3, 3 * 4)
+            glDrawArrays(GL_LINES, 0, int(self._edge_vertex_count))
+            self._edge_vbo.release()
+            program.disableAttributeArray("position")
+            program.release()
+        finally:
+            glDepthMask(GL_TRUE)
+            glDisable(GL_BLEND)
+
+    def _draw_annotations(self) -> None:
+        if (
+            self._line_program is None
+            or self._annotation_line_vbo is None
+            or self._annotation_point_vbo is None
+            or len(self._normalized_vertices) == 0
+        ):
+            return
+        line_vertices = self._annotation_line_vertices()
+        marker_vertices, active_tip = self._annotation_marker_vertices()
+        if line_vertices.size == 0 and marker_vertices.size == 0:
+            return
+
+        glEnable(GL_DEPTH_TEST)
+        glDepthFunc(GL_LEQUAL)
+        glDepthMask(GL_FALSE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_POINT_SMOOTH)
+        mvp = self._mvp_matrix()
+        scale = self._framebuffer_scale()
+        try:
+            if line_vertices.size:
+                self._draw_annotation_line_pass(line_vertices, mvp, QVector4D(0.01, 0.03, 0.025, 0.95), 5.2 * scale)
+                self._draw_annotation_line_pass(line_vertices, mvp, QVector4D(1.0, 0.23, 0.19, 1.0), 3.0 * scale)
+            if marker_vertices.size:
+                self._draw_annotation_point_pass(marker_vertices, mvp, QVector4D(0.01, 0.03, 0.025, 0.95), 17.0 * scale)
+                self._draw_annotation_point_pass(marker_vertices, mvp, QVector4D(1.0, 1.0, 1.0, 1.0), 12.5 * scale)
+                self._draw_annotation_point_pass(marker_vertices, mvp, QVector4D(1.0, 0.88, 0.20, 1.0), 9.5 * scale)
+            if active_tip.size:
+                self._draw_annotation_point_pass(active_tip, mvp, QVector4D(1.0, 0.42, 0.24, 1.0), 4.8 * scale)
+        finally:
+            glDepthMask(GL_TRUE)
+            glDisable(GL_BLEND)
+            glDisable(GL_POINT_SMOOTH)
+
+    def _draw_annotation_line_pass(
+        self,
+        vertices: np.ndarray,
+        mvp: QMatrix4x4,
+        color: QVector4D,
+        width: float,
+    ) -> None:
+        if self._annotation_line_vbo is None or self._line_program is None:
+            return
+        data = np.ascontiguousarray(vertices, dtype=np.float32)
+        glLineWidth(max(1.0, float(width)))
         program = self._line_program
         program.bind()
-        program.setUniformValue("mvp", self._mvp_matrix())
-        program.setUniformValue("line_color", QVector4D(0.03, 0.10, 0.09, 0.26))
-        self._edge_vbo.bind()
+        program.setUniformValue("mvp", mvp)
+        program.setUniformValue("depth_bias", float(self.ANNOTATION_DEPTH_BIAS))
+        program.setUniformValue("line_color", color)
+        self._annotation_line_vbo.bind()
+        self._annotation_line_vbo.allocate(data.tobytes(), int(data.nbytes))
         program.enableAttributeArray("position")
         program.setAttributeBuffer("position", GL_FLOAT, 0, 3, 3 * 4)
-        glDrawArrays(GL_LINES, 0, int(self._edge_vertex_count))
-        self._edge_vbo.release()
+        glDrawArrays(GL_LINES, 0, int(len(data)))
+        self._annotation_line_vbo.release()
         program.disableAttributeArray("position")
         program.release()
-        glDisable(GL_BLEND)
+
+    def _draw_annotation_point_pass(
+        self,
+        vertices: np.ndarray,
+        mvp: QMatrix4x4,
+        color: QVector4D,
+        point_size: float,
+    ) -> None:
+        if self._annotation_point_vbo is None or self._line_program is None:
+            return
+        data = np.ascontiguousarray(vertices, dtype=np.float32)
+        glPointSize(max(1.0, float(point_size)))
+        program = self._line_program
+        program.bind()
+        program.setUniformValue("mvp", mvp)
+        program.setUniformValue("depth_bias", float(self.ANNOTATION_DEPTH_BIAS))
+        program.setUniformValue("line_color", color)
+        self._annotation_point_vbo.bind()
+        self._annotation_point_vbo.allocate(data.tobytes(), int(data.nbytes))
+        program.enableAttributeArray("position")
+        program.setAttributeBuffer("position", GL_FLOAT, 0, 3, 3 * 4)
+        glDrawArrays(GL_POINTS, 0, int(len(data)))
+        self._annotation_point_vbo.release()
+        program.disableAttributeArray("position")
+        program.release()
+
+    def _annotation_line_vertices(self) -> np.ndarray:
+        paths: List[List[int]] = []
+        for curve in self.closed_curves:
+            paths.append(self._curve_vertex_path([int(value) for value in curve.get("vertices", [])], closed=True))
+        if self.active_curve_vertices:
+            paths.append(self._curve_vertex_path(list(self.active_curve_vertices), closed=False))
+        line_ids: List[int] = []
+        for path in paths:
+            for left, right in zip(path[:-1], path[1:]):
+                if left == right:
+                    continue
+                line_ids.extend((int(left), int(right)))
+        if not line_ids:
+            return np.empty((0, 3), dtype=np.float32)
+        return self._normalized_vertices[np.asarray(line_ids, dtype=np.int64)].astype(np.float32)
+
+    def _annotation_marker_vertices(self) -> Tuple[np.ndarray, np.ndarray]:
+        marker_ids: List[int] = []
+        for curve in self.closed_curves:
+            marker_ids.extend(self._marker_vertex_ids([int(value) for value in curve.get("vertices", [])]))
+        if self.active_curve_vertices:
+            marker_ids.extend(self._marker_vertex_ids(list(self.active_curve_vertices)))
+        markers = (
+            self._normalized_vertices[np.asarray(marker_ids, dtype=np.int64)].astype(np.float32)
+            if marker_ids
+            else np.empty((0, 3), dtype=np.float32)
+        )
+        active_tip = np.empty((0, 3), dtype=np.float32)
+        if self.active_curve_vertices:
+            tip_id = int(self.active_curve_vertices[-1])
+            if 0 <= tip_id < len(self._normalized_vertices):
+                active_tip = self._normalized_vertices[np.asarray([tip_id], dtype=np.int64)].astype(np.float32)
+        return markers, active_tip
+
+    def _framebuffer_scale(self) -> float:
+        width_scale = self._viewport_width / float(max(1, self.width()))
+        height_scale = self._viewport_height / float(max(1, self.height()))
+        return max(1.0, min(max(width_scale, height_scale), 3.0))
+
+    def _marker_vertex_ids(self, vertex_ids: List[int]) -> List[int]:
+        marker_ids = [int(value) for value in vertex_ids if 0 <= int(value) < len(self._normalized_vertices)]
+        if len(marker_ids) > 1 and marker_ids[0] == marker_ids[-1]:
+            marker_ids = marker_ids[:-1]
+        return marker_ids
 
     def _mvp_matrix(self) -> QMatrix4x4:
         width = max(1, self.width())
         height = max(1, self.height())
         aspect = width / height
         projection = QMatrix4x4()
-        projection.ortho(-aspect, aspect, -1.0, 1.0, -10.0, 10.0)
+        projection.ortho(-aspect, aspect, -1.0, 1.0, self.PROJECTION_NEAR, self.PROJECTION_FAR)
         model = QMatrix4x4()
         pan_world_x = float(self.pan_x) * aspect / (width * 0.5)
         pan_world_y = -float(self.pan_y) / (height * 0.5)
         model.translate(pan_world_x, pan_world_y, 0.0)
-        model.scale(0.84 * float(self.preview_zoom))
+        model.scale(self.MODEL_BASE_SCALE * float(self.preview_zoom))
         model.rotate(math.degrees(float(self.rotation_pitch)), 1.0, 0.0, 0.0)
         model.rotate(math.degrees(float(self.rotation_yaw)), 0.0, 1.0, 0.0)
         return projection * model
@@ -569,66 +793,98 @@ class ShellGLCanvas(QOpenGLWidget):
             self._screen_cache = (
                 np.empty((0, 2), dtype=np.float32),
                 np.empty((0,), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
             )
             return self._screen_cache
-        rotated = self._rotated_points(self._normalized_vertices)
-        scale = min(max(1, self.width()), max(1, self.height())) * 0.42 * self.preview_zoom
-        screen = np.column_stack(
-            (
-                self.width() * 0.5 + self.pan_x + rotated[:, 0] * scale,
-                self.height() * 0.5 + self.pan_y - rotated[:, 1] * scale,
-            )
-        ).astype(np.float32)
+        screen, front_depth, window_depth = self._project_points(self._normalized_vertices)
         self._screen_cache_key = key
-        self._screen_cache = (screen, rotated[:, 2].astype(np.float32))
+        self._screen_cache = (screen, front_depth, window_depth)
         return self._screen_cache
 
-    def _rotated_points(self, points: np.ndarray) -> np.ndarray:
+    def _project_points(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         coords = np.asarray(points, dtype=np.float32)
-        yaw_cos = math.cos(self.rotation_yaw)
-        yaw_sin = math.sin(self.rotation_yaw)
-        pitch_cos = math.cos(self.rotation_pitch)
-        pitch_sin = math.sin(self.rotation_pitch)
-        x = coords[:, 0]
-        y = coords[:, 1]
-        z = coords[:, 2]
-        xz = x * yaw_cos + z * yaw_sin
-        zz = -x * yaw_sin + z * yaw_cos
-        yz = y * pitch_cos - zz * pitch_sin
-        depth = y * pitch_sin + zz * pitch_cos
-        return np.column_stack((xz, yz, depth)).astype(np.float32)
+        if coords.ndim != 2 or coords.shape[1] != 3 or len(coords) == 0:
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+                np.empty((0,), dtype=np.float32),
+            )
+        matrix = np.asarray(self._mvp_matrix().copyDataTo(), dtype=np.float32).reshape(4, 4)
+        homogeneous = np.column_stack((coords, np.ones(len(coords), dtype=np.float32)))
+        clip = homogeneous @ matrix.T
+        w = clip[:, 3]
+        safe_w = np.where(np.abs(w) > 1e-8, w, 1.0)
+        ndc = clip[:, :3] / safe_w.reshape(-1, 1)
+        width = float(max(1, self.width()))
+        height = float(max(1, self.height()))
+        screen = np.column_stack(
+            (
+                (ndc[:, 0] * 0.5 + 0.5) * width,
+                (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height,
+            )
+        ).astype(np.float32)
+        window_depth = np.clip(ndc[:, 2] * 0.5 + 0.5, 0.0, 1.0).astype(np.float32)
+        front_depth = (-window_depth).astype(np.float32)
+        return screen, front_depth, window_depth
 
     def _nearest_active_vertex_index(self, pos, max_distance: float = 15.0) -> Optional[int]:
         if not self.active_curve_vertices:
             return None
-        screen, _depth = self._screen_cache_data()
+        screen, _front_depth, _window_depth = self._screen_cache_data()
         ids = np.asarray(self.active_curve_vertices, dtype=np.int64)
         click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
         distances = np.linalg.norm(screen[ids] - click.reshape(1, 2), axis=1)
         index = int(np.argmin(distances))
         return index if float(distances[index]) <= max_distance else None
 
+    def _nearest_annotation_point_ref(self, pos, max_distance: float = 14.0) -> Optional[Tuple[str, int, int]]:
+        screen, front_depth, _window_depth = self._screen_cache_data()
+        if len(screen) == 0:
+            return None
+        click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
+        best_ref: Optional[Tuple[str, int, int]] = None
+        best_distance = float(max_distance)
+        best_depth = -math.inf
+
+        def consider(kind: str, curve_index: int, point_index: int, vertex_id: int) -> None:
+            nonlocal best_ref, best_distance, best_depth
+            if vertex_id < 0 or vertex_id >= len(screen):
+                return
+            distance = float(np.linalg.norm(screen[vertex_id] - click))
+            vertex_depth = float(front_depth[vertex_id])
+            if distance > best_distance:
+                return
+            if distance < best_distance or vertex_depth > best_depth:
+                best_distance = distance
+                best_depth = vertex_depth
+                best_ref = (kind, int(curve_index), int(point_index))
+
+        for point_index, vertex_id in enumerate(self.active_curve_vertices):
+            consider("active", -1, point_index, int(vertex_id))
+
+        for curve_index, curve in enumerate(self.closed_curves):
+            vertices = [int(value) for value in curve.get("vertices", [])]
+            if len(vertices) > 1 and vertices[0] == vertices[-1]:
+                vertices = vertices[:-1]
+            for point_index, vertex_id in enumerate(vertices):
+                consider("closed", curve_index, point_index, int(vertex_id))
+
+        return best_ref
+
     def _nearest_display_face_center_id(self, pos, max_distance: float = 36.0) -> Optional[int]:
         if len(self._display_centers) == 0:
             return None
-        rotated = self._rotated_points(self._display_centers)
-        scale = min(max(1, self.width()), max(1, self.height())) * 0.42 * self.preview_zoom
-        centers = np.column_stack(
-            (
-                self.width() * 0.5 + self.pan_x + rotated[:, 0] * scale,
-                self.height() * 0.5 + self.pan_y - rotated[:, 1] * scale,
-            )
-        ).astype(np.float32)
+        centers, front_depth, _window_depth = self._project_points(self._display_centers)
         if len(centers) > self.MAX_HOVER_FACES:
             step = int(math.ceil(len(centers) / self.MAX_HOVER_FACES))
             sample_ids = np.arange(0, len(centers), step, dtype=np.int64)
             centers_to_search = centers[sample_ids]
             face_ids_to_search = self._display_center_face_ids[sample_ids]
-            depth_to_search = rotated[sample_ids, 2]
+            depth_to_search = front_depth[sample_ids]
         else:
             centers_to_search = centers
             face_ids_to_search = self._display_center_face_ids
-            depth_to_search = rotated[:, 2]
+            depth_to_search = front_depth
         click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
         distances = np.linalg.norm(centers_to_search - click.reshape(1, 2), axis=1)
         near = np.flatnonzero(distances <= max_distance)
@@ -645,7 +901,7 @@ class ShellGLCanvas(QOpenGLWidget):
     ) -> Optional[int]:
         if len(self._display_triangles) == 0:
             return None
-        screen, depth = self._screen_cache_data()
+        screen, front_depth, _window_depth = self._screen_cache_data()
         triangles = self._display_triangles
         face_ids = self._display_face_ids
         if max_triangles is not None and len(triangles) > max_triangles:
@@ -698,20 +954,233 @@ class ShellGLCanvas(QOpenGLWidget):
 
         hit_ids = candidate_ids[inside]
         hit_triangles = triangles[hit_ids]
-        hit_depth = depth[hit_triangles].mean(axis=1)
+        hit_depth = front_depth[hit_triangles].mean(axis=1)
         best = int(hit_ids[int(np.argmax(hit_depth))])
         return int(face_ids[best])
 
     def _nearest_face_vertex_id(self, face_id: int, pos) -> Optional[int]:
         if len(self._faces) == 0 or face_id < 0 or face_id >= len(self._faces):
             return None
-        screen, _depth = self._screen_cache_data()
+        screen, _front_depth, _window_depth = self._screen_cache_data()
         face_vertices = np.asarray([value for value in self._faces[int(face_id)] if int(value) >= 0], dtype=np.int64)
         if len(face_vertices) == 0:
             return None
         click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
         distances = np.linalg.norm(screen[face_vertices] - click.reshape(1, 2), axis=1)
         return int(face_vertices[int(np.argmin(distances))])
+
+    def _closed_curve_screen_path(self, vertex_ids: List[int]) -> np.ndarray:
+        path_ids = self._curve_vertex_path(vertex_ids, closed=True)
+        if len(path_ids) < 3:
+            return np.empty((0, 2), dtype=np.float32)
+        screen, _front_depth, _window_depth = self._screen_cache_data()
+        valid_ids = [int(value) for value in path_ids if 0 <= int(value) < len(screen)]
+        if len(valid_ids) < 3:
+            return np.empty((0, 2), dtype=np.float32)
+        return np.asarray(screen[valid_ids], dtype=np.float32)
+
+    @staticmethod
+    def _point_segment_distance_2d(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+        segment = np.asarray(end, dtype=float) - np.asarray(start, dtype=float)
+        length_sq = float(np.dot(segment, segment))
+        if length_sq <= 1e-9:
+            return float(np.linalg.norm(np.asarray(point, dtype=float) - np.asarray(start, dtype=float)))
+        t = float(np.dot(np.asarray(point, dtype=float) - np.asarray(start, dtype=float), segment) / length_sq)
+        t = max(0.0, min(1.0, t))
+        closest = np.asarray(start, dtype=float) + segment * t
+        return float(np.linalg.norm(np.asarray(point, dtype=float) - closest))
+
+    @classmethod
+    def _point_polyline_distance_2d(cls, point: np.ndarray, polyline: np.ndarray, closed: bool = True) -> float:
+        points = np.asarray(polyline, dtype=float).reshape(-1, 2)
+        if len(points) < 2:
+            return math.inf
+        pairs = list(zip(points[:-1], points[1:]))
+        if closed and not np.allclose(points[0], points[-1]):
+            pairs.append((points[-1], points[0]))
+        if not pairs:
+            return math.inf
+        return min(cls._point_segment_distance_2d(point, start, end) for start, end in pairs)
+
+    @staticmethod
+    def _point_in_polygon_2d(point: np.ndarray, polygon: np.ndarray) -> bool:
+        points = np.asarray(polygon, dtype=float).reshape(-1, 2)
+        if len(points) >= 2 and np.allclose(points[0], points[-1]):
+            points = points[:-1]
+        if len(points) < 3:
+            return False
+        x, y = float(point[0]), float(point[1])
+        inside = False
+        previous = points[-1]
+        for current in points:
+            x0, y0 = float(previous[0]), float(previous[1])
+            x1, y1 = float(current[0]), float(current[1])
+            crosses = (y0 > y) != (y1 > y)
+            if crosses:
+                denom = y1 - y0
+                if abs(denom) <= 1e-9:
+                    previous = current
+                    continue
+                edge_x = (x1 - x0) * (y - y0) / denom + x0
+                if x < edge_x:
+                    inside = not inside
+            previous = current
+        return inside
+
+    @staticmethod
+    def _orientation_2d(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+    @classmethod
+    def _segments_intersect_2d(cls, a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> bool:
+        if max(a[0], b[0]) + 1e-6 < min(c[0], d[0]) or max(c[0], d[0]) + 1e-6 < min(a[0], b[0]):
+            return False
+        if max(a[1], b[1]) + 1e-6 < min(c[1], d[1]) or max(c[1], d[1]) + 1e-6 < min(a[1], b[1]):
+            return False
+        o1 = cls._orientation_2d(a, b, c)
+        o2 = cls._orientation_2d(a, b, d)
+        o3 = cls._orientation_2d(c, d, a)
+        o4 = cls._orientation_2d(c, d, b)
+        return (o1 * o2 < -1e-6) and (o3 * o4 < -1e-6)
+
+    @classmethod
+    def _closed_polyline_self_intersects_2d(cls, points: np.ndarray) -> bool:
+        polygon = np.asarray(points, dtype=float).reshape(-1, 2)
+        if len(polygon) >= 2 and np.allclose(polygon[0], polygon[-1]):
+            polygon = polygon[:-1]
+        if len(polygon) < 4:
+            return False
+        segments = [(polygon[index], polygon[(index + 1) % len(polygon)]) for index in range(len(polygon))]
+        for left_index, (a, b) in enumerate(segments):
+            for right_index in range(left_index + 1, len(segments)):
+                if right_index == left_index:
+                    continue
+                if abs(right_index - left_index) == 1:
+                    continue
+                if left_index == 0 and right_index == len(segments) - 1:
+                    continue
+                c, d = segments[right_index]
+                if cls._segments_intersect_2d(a, b, c, d):
+                    return True
+        return False
+
+    def _closed_curve_vertices_after_drag(
+        self,
+        point_ref: Tuple[str, int, int],
+        vertex_id: int,
+    ) -> Optional[List[int]]:
+        kind, curve_index, point_index = point_ref
+        if kind != "closed" or curve_index < 0 or curve_index >= len(self.closed_curves):
+            return None
+        vertices = [int(value) for value in self.closed_curves[curve_index].get("vertices", [])]
+        if len(vertices) < 2:
+            return None
+        closes_to_first = vertices[0] == vertices[-1]
+        editable_count = len(vertices) - 1 if closes_to_first else len(vertices)
+        if point_index < 0 or point_index >= editable_count:
+            return None
+        vertices[point_index] = int(vertex_id)
+        if closes_to_first and point_index == 0:
+            vertices[-1] = int(vertex_id)
+        elif not closes_to_first and vertices[0] != vertices[-1]:
+            vertices.append(vertices[0])
+        return vertices
+
+    def _drag_target_is_inside_closed_curve(
+        self,
+        point_ref: Tuple[str, int, int],
+        vertex_id: int,
+    ) -> bool:
+        screen, _front_depth, _window_depth = self._screen_cache_data()
+        if vertex_id < 0 or vertex_id >= len(screen):
+            return False
+        target = np.asarray(screen[int(vertex_id)], dtype=np.float32)
+        for curve in self.closed_curves:
+            vertices = [int(value) for value in curve.get("vertices", [])]
+            if len(set(vertices[:-1] if len(vertices) > 1 and vertices[0] == vertices[-1] else vertices)) < 3:
+                continue
+            curve_path = self._closed_curve_screen_path(vertices)
+            if len(curve_path) < 3:
+                continue
+            boundary_distance = self._point_polyline_distance_2d(target, curve_path, closed=True)
+            if boundary_distance <= self.DRAG_INSIDE_CURVE_MARGIN_PX:
+                continue
+            if self._point_in_polygon_2d(target, curve_path):
+                return True
+        return False
+
+    def _drag_target_keeps_curve_shape(
+        self,
+        point_ref: Tuple[str, int, int],
+        vertex_id: int,
+    ) -> bool:
+        replacement = self._closed_curve_vertices_after_drag(point_ref, vertex_id)
+        if replacement is None:
+            return True
+        if len(set(replacement[:-1])) < 3:
+            self._last_drag_reject_reason = "A closed curve needs at least three different points"
+            return False
+        replacement_path = self._closed_curve_screen_path(replacement)
+        if self._closed_polyline_self_intersects_2d(replacement_path):
+            self._last_drag_reject_reason = "Drag rejected: it would make the closed curve cross itself"
+            return False
+        return True
+
+    def _drag_target_is_allowed(self, point_ref: Tuple[str, int, int], vertex_id: int) -> bool:
+        self._last_drag_reject_reason = ""
+        if self._drag_target_is_inside_closed_curve(point_ref, vertex_id):
+            self._last_drag_reject_reason = "Drag rejected: keep control points on the closed curve boundary"
+            return False
+        return self._drag_target_keeps_curve_shape(point_ref, vertex_id)
+
+    def _move_dragged_point(self, pos) -> bool:
+        if self._drag_point_ref is None:
+            return False
+        face_id = self._pick_display_face_id(pos, max_distance=52.0)
+        vertex_id = self._nearest_face_vertex_id(face_id, pos) if face_id is not None else None
+        if vertex_id is None:
+            return False
+        if not self._drag_target_is_allowed(self._drag_point_ref, int(vertex_id)):
+            if self._last_drag_reject_reason:
+                self.message = self._last_drag_reject_reason
+                self.update()
+            return False
+        if not self._set_annotation_point_vertex(self._drag_point_ref, int(vertex_id)):
+            return False
+        self._curve_path_cache = {}
+        self.message = "Moved point to the nearest shell vertex"
+        self._emit_3d_state()
+        self.update()
+        return True
+
+    def _set_annotation_point_vertex(self, point_ref: Tuple[str, int, int], vertex_id: int) -> bool:
+        kind, curve_index, point_index = point_ref
+        vertex_id = int(vertex_id)
+        if kind == "active":
+            if point_index < 0 or point_index >= len(self.active_curve_vertices):
+                return False
+            if int(self.active_curve_vertices[point_index]) == vertex_id:
+                return False
+            self.active_curve_vertices[point_index] = vertex_id
+            return True
+
+        if kind != "closed" or curve_index < 0 or curve_index >= len(self.closed_curves):
+            return False
+        curve = self.closed_curves[curve_index]
+        vertices = [int(value) for value in curve.get("vertices", [])]
+        if len(vertices) < 2:
+            return False
+        closes_to_first = vertices[0] == vertices[-1]
+        editable_count = len(vertices) - 1 if closes_to_first else len(vertices)
+        if point_index < 0 or point_index >= editable_count:
+            return False
+        if vertices[point_index] == vertex_id and (point_index != 0 or not closes_to_first or vertices[-1] == vertex_id):
+            return False
+        vertices[point_index] = vertex_id
+        if closes_to_first and point_index == 0:
+            vertices[-1] = vertex_id
+        curve["vertices"] = vertices
+        return True
 
     def _close_active_curve(self, vertex_index: int) -> None:
         vertices = self.active_curve_vertices[int(vertex_index) :] + [self.active_curve_vertices[int(vertex_index)]]
@@ -779,17 +1248,12 @@ class ShellGLCanvas(QOpenGLWidget):
     def _draw_overlay(self) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        screen, _depth = self._screen_cache_data()
         selected_faces = {int(patch["face_id"]) for patch in self.selected_patches}
         for face_id in selected_faces:
             self._draw_face_overlay(painter, face_id, QColor(245, 200, 76, 95), QColor("#f5c84c"), 1.5)
         if self.hover_face is not None:
             self._draw_face_overlay(painter, int(self.hover_face), QColor(88, 204, 156, 95), QColor("#ffffff"), 1.6)
 
-        for index, curve in enumerate(self.closed_curves):
-            color = QColor("#f06a5a") if index % 2 == 0 else QColor("#63a0ff")
-            self._draw_curve(painter, [int(value) for value in curve.get("vertices", [])], screen, color, True)
-        self._draw_curve(painter, [int(value) for value in self.active_curve_vertices], screen, QColor("#f0e95a"), False)
         curve_count, point_count, patch_count = self.annotation_counts()
         mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
         self._draw_message(
@@ -801,7 +1265,7 @@ class ShellGLCanvas(QOpenGLWidget):
     def _draw_face_overlay(self, painter: QPainter, face_id: int, fill: QColor, outline: QColor, width: float) -> None:
         if len(self._faces) == 0 or face_id < 0 or face_id >= len(self._faces):
             return
-        screen, _depth = self._screen_cache_data()
+        screen, _front_depth, _window_depth = self._screen_cache_data()
         face_vertices = [int(value) for value in self._faces[int(face_id)] if int(value) >= 0]
         if len(face_vertices) < 3:
             return
@@ -810,39 +1274,77 @@ class ShellGLCanvas(QOpenGLWidget):
         painter.setBrush(fill)
         painter.drawPolygon(polygon)
 
-    def _draw_curve(self, painter: QPainter, vertex_ids: List[int], screen: np.ndarray, color: QColor, closed: bool) -> None:
-        if not vertex_ids or len(screen) == 0:
-            return
-        points = [QPointF(float(screen[int(value), 0]), float(screen[int(value), 1])) for value in vertex_ids]
-        line_width = 4.6 if closed else 4.0
-        shadow = QPen(QColor(1, 8, 7, 210), line_width + 4.0)
-        shadow.setStyle(Qt.SolidLine if closed else Qt.DashLine)
-        painter.setPen(shadow)
-        for left, right in zip(points[:-1], points[1:]):
-            painter.drawLine(left, right)
+    def _curve_vertex_path(self, vertex_ids: List[int], closed: bool) -> List[int]:
+        if not vertex_ids:
+            return []
+        cleaned: List[int] = []
+        for vertex_id in vertex_ids:
+            value = int(vertex_id)
+            if value < 0 or value >= len(self._normalized_vertices):
+                continue
+            if not cleaned or cleaned[-1] != value:
+                cleaned.append(value)
+        if len(cleaned) < 2:
+            return cleaned
+        if closed and cleaned[0] != cleaned[-1]:
+            cleaned.append(cleaned[0])
 
-        pen = QPen(color, line_width)
-        pen.setStyle(Qt.SolidLine if closed else Qt.DashLine)
-        painter.setPen(pen)
-        for left, right in zip(points[:-1], points[1:]):
-            painter.drawLine(left, right)
-        self._draw_curve_points(painter, points, color, active=not closed)
+        key = tuple(cleaned)
+        cached = self._curve_path_cache.get(key)
+        if cached is not None:
+            return list(cached)
 
-    def _draw_curve_points(self, painter: QPainter, points: List[QPointF], color: QColor, active: bool) -> None:
-        radius = 9.0 if active else 7.5
-        for index, point in enumerate(points):
-            painter.setPen(QPen(QColor(1, 8, 7, 230), 2.5))
-            painter.setBrush(QColor(1, 8, 7, 180))
-            painter.drawEllipse(point, radius + 4.5, radius + 4.5)
+        path: List[int] = []
+        for left, right in zip(cleaned[:-1], cleaned[1:]):
+            segment = self._curve_segment_path(left, right)
+            if path and segment and path[-1] == segment[0]:
+                path.extend(segment[1:])
+            else:
+                path.extend(segment)
+        self._curve_path_cache[key] = list(path)
+        return path
 
-            painter.setPen(QPen(QColor("#ffffff"), 3.0))
-            painter.setBrush(color)
-            painter.drawEllipse(point, radius, radius)
+    def _curve_segment_path(self, start: int, goal: int) -> List[int]:
+        start = int(start)
+        goal = int(goal)
+        if start == goal:
+            return [start]
+        if self._edge_key(start, goal) in self._curve_edge_set:
+            return [start, goal]
+        if len(self._curve_graph_vertices) == 0 or not self._curve_edge_graph:
+            return [start, goal]
 
-            if active and index == len(points) - 1:
-                painter.setPen(QPen(QColor("#ffffff"), 2.0))
-                painter.setBrush(QColor("#ff6a3d"))
-                painter.drawEllipse(point, radius * 0.48, radius * 0.48)
+        vertices = self._curve_graph_vertices
+
+        def heuristic(vertex_id: int) -> float:
+            return float(np.linalg.norm(vertices[int(vertex_id)] - vertices[goal]))
+
+        heap: List[Tuple[float, float, int]] = [(heuristic(start), 0.0, start)]
+        best_cost: Dict[int, float] = {start: 0.0}
+        parent: Dict[int, int] = {}
+        visited: set[int] = set()
+
+        while heap and len(visited) < self.MAX_CURVE_PATH_VISITED:
+            _estimate, cost, vertex_id = heapq.heappop(heap)
+            if vertex_id in visited:
+                continue
+            if vertex_id == goal:
+                path = [goal]
+                while path[-1] != start:
+                    path.append(parent[path[-1]])
+                path.reverse()
+                return path
+            visited.add(vertex_id)
+            for neighbor, weight in self._curve_edge_graph.get(vertex_id, []):
+                if neighbor in visited:
+                    continue
+                next_cost = cost + float(weight)
+                if next_cost >= best_cost.get(neighbor, math.inf):
+                    continue
+                best_cost[neighbor] = next_cost
+                parent[neighbor] = vertex_id
+                heapq.heappush(heap, (next_cost + heuristic(neighbor), next_cost, neighbor))
+        return [start, goal]
 
     def _draw_message(self, painter: QPainter, text: str) -> None:
         metrics = painter.fontMetrics()
@@ -868,10 +1370,17 @@ class ShellGLCanvas(QOpenGLWidget):
         self._drag_pos = QPointF(event.pos())
         self._press_pos = QPointF(event.pos())
         self._drag_moved = False
+        self._drag_point_ref = None
+        self._last_drag_reject_reason = ""
         if event.button() == Qt.RightButton or event.modifiers() & Qt.ShiftModifier:
             self._drag_mode = "pan"
         else:
-            self._drag_mode = "pick"
+            point_ref = self._nearest_annotation_point_ref(event.pos())
+            if point_ref is not None:
+                self._drag_mode = "drag_point"
+                self._drag_point_ref = point_ref
+            else:
+                self._drag_mode = "pick"
         self.setCursor(Qt.ClosedHandCursor)
         event.accept()
 
@@ -899,6 +1408,11 @@ class ShellGLCanvas(QOpenGLWidget):
                 self._drag_moved = True
                 if self._drag_mode == "pick":
                     self._drag_mode = "rotate"
+        if self._drag_mode == "drag_point":
+            if self._drag_moved:
+                self._move_dragged_point(event.pos())
+            event.accept()
+            return
         if self._drag_mode == "pan":
             self.pan_x += dx
             self.pan_y += dy
@@ -920,10 +1434,22 @@ class ShellGLCanvas(QOpenGLWidget):
             total_dx = event.pos().x() - self._press_pos.x()
             total_dy = event.pos().y() - self._press_pos.y()
             moved_distance_sq = total_dx * total_dx + total_dy * total_dy
-        if event.button() == Qt.LeftButton and moved_distance_sq <= self.CLICK_MOVE_TOLERANCE_SQ:
+        if self._drag_mode == "drag_point":
+            if moved_distance_sq > self.CLICK_MOVE_TOLERANCE_SQ:
+                self._move_dragged_point(event.pos())
+            elif (
+                self._drag_point_ref is not None
+                and self._drag_point_ref[0] == "active"
+                and len(self.active_curve_vertices) >= 3
+            ):
+                self._close_active_curve(self._drag_point_ref[2])
+                self._emit_3d_state()
+                self.update()
+        elif event.button() == Qt.LeftButton and moved_distance_sq <= self.CLICK_MOVE_TOLERANCE_SQ:
             self._handle_shell_click(event.pos())
         self._drag_pos = None
         self._press_pos = None
+        self._drag_point_ref = None
         self.unsetCursor()
         event.accept()
 

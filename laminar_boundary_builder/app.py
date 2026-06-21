@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QProgressDialog,
     QScrollArea,
     QShortcut,
@@ -185,6 +186,47 @@ QLabel#buildResultText[state="failed"] {
     background: #fff6f3;
     border-color: #e2b8af;
     color: #7c342b;
+}
+QFrame#buildProgressCard {
+    background: #f7fbfa;
+    border: 1px solid #ccdcd8;
+    border-radius: 7px;
+    padding: 8px 10px;
+}
+QFrame#buildProgressCard[state="running"] {
+    background: #eef7f4;
+    border-color: #adcfc6;
+}
+QFrame#buildProgressCard[state="ready"] {
+    background: #edf8f1;
+    border-color: #a7cdb7;
+}
+QFrame#buildProgressCard[state="failed"] {
+    background: #fff6f3;
+    border-color: #e2b8af;
+}
+QLabel#buildProgressStage {
+    color: #213d38;
+    font-weight: 750;
+}
+QLabel#buildProgressPercent {
+    color: #2f6e62;
+    font-weight: 800;
+}
+QLabel#buildProgressDetail {
+    color: #54706b;
+    font-size: 12px;
+}
+QProgressBar#buildProgressBar {
+    background: #dbe8e5;
+    border: 0;
+    border-radius: 4px;
+    min-height: 8px;
+    max-height: 8px;
+}
+QProgressBar#buildProgressBar::chunk {
+    background: #2f6e62;
+    border-radius: 4px;
 }
 QWidget#parameterHelpRow {
     background: transparent;
@@ -871,22 +913,103 @@ class StreamBuffer(io.StringIO):
 
 class Worker(QObject):
     log = pyqtSignal(str)
+    progress = pyqtSignal(object)
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, fn: Callable[[], TaskResult]):
+    def __init__(self, fn: Callable, accepts_progress: bool = False, task_label: str = ""):
         super().__init__()
         self.fn = fn
+        self.accepts_progress = bool(accepts_progress)
+        self.task_label = str(task_label)
+
+    def _emit_progress(self, value: int, stage: str, detail: str = "") -> None:
+        self.progress.emit(
+            {
+                "label": self.task_label,
+                "value": int(value),
+                "stage": str(stage),
+                "detail": str(detail or ""),
+            }
+        )
 
     def run(self) -> None:
         stdout = StreamBuffer(self.log.emit)
         stderr = StreamBuffer(self.log.emit)
         try:
             with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                result = self.fn()
+                if self.accepts_progress:
+                    result = self.fn(self._emit_progress)
+                else:
+                    result = self.fn()
             self.finished.emit(result)
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+class BuildProgressPanel(QFrame):
+    def __init__(self, idle_detail: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.idle_detail = idle_detail
+        self.setObjectName("buildProgressCard")
+
+        self.stage_label = QLabel("Idle")
+        self.stage_label.setObjectName("buildProgressStage")
+        self.stage_label.setWordWrap(True)
+        self.percent_label = QLabel("0%")
+        self.percent_label.setObjectName("buildProgressPercent")
+        self.percent_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("buildProgressBar")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setTextVisible(False)
+        self.detail_label = QLabel(idle_detail)
+        self.detail_label.setObjectName("buildProgressDetail")
+        self.detail_label.setWordWrap(True)
+
+        header = QWidget()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+        header_layout.addWidget(self.stage_label, 1)
+        header_layout.addWidget(self.percent_label)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(header)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.detail_label)
+        self.reset()
+
+    def _set_state(self, state: str) -> None:
+        self.setProperty("state", state)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def reset(self) -> None:
+        self._set_state("idle")
+        self.stage_label.setText("No build running")
+        self.percent_label.setText("0%")
+        self.progress_bar.setValue(0)
+        self.detail_label.setText(self.idle_detail)
+
+    def start(self, stage: str, detail: str) -> None:
+        self.update_progress(0, stage, detail, state="running")
+
+    def update_progress(self, value: int, stage: str, detail: str = "", state: str = "running") -> None:
+        value = max(0, min(100, int(value)))
+        self._set_state(state)
+        self.stage_label.setText(stage or "Working")
+        self.percent_label.setText(f"{value}%")
+        self.progress_bar.setValue(value)
+        self.detail_label.setText(detail or "Working...")
+
+    def finish(self, stage: str, detail: str) -> None:
+        self.update_progress(100, stage, detail, state="ready")
+
+    def fail(self, detail: str) -> None:
+        self.update_progress(self.progress_bar.value(), "Build failed", detail, state="failed")
 
 
 class PathRow(QWidget):
@@ -2570,6 +2693,7 @@ class LaminarBoundaryWindow(QMainWindow):
         super().__init__()
         self.thread: Optional[QThread] = None
         self.worker: Optional[Worker] = None
+        self.current_task_label: Optional[str] = None
         self.annotation_preview_thread: Optional[QThread] = None
         self.annotation_preview_worker: Optional[Worker] = None
         self.annotation_preview_request_id = 0
@@ -3349,7 +3473,10 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_custom_atlas.toggled.connect(self._update_annotation_readiness)
 
     def _create_annotation_action_buttons(self) -> QWidget:
-        self.load_button = self._make_button("Load Source And Start Picking", "primary")
+        self.load_button = self._make_button("Load / Reload Source And Start Picking", "primary")
+        self.load_button.setToolTip(
+            "Load the selected brain region or mask. You can change region/hemisphere and click again to rebuild the 3D shell."
+        )
         self.load_button.clicked.connect(self.load_annotation_data)
         self.load_previous_csv_button = self._make_button("Load Previous Shell Cut JSON", "secondary")
         self.load_previous_csv_button.setToolTip("Load saved shell-cut annotations into the annotation workspace.")
@@ -3460,6 +3587,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_progress = QLabel("Load a mask to see slice count.")
         self.annotate_progress.setObjectName("progressText")
         self.annotate_progress.setWordWrap(True)
+        self.annotate_build_progress = BuildProgressPanel("Surface build progress appears here after you click Build.")
         self.annotation_review_slice = CleanComboBox()
         self.annotation_review_slice.addItem("No accepted slices yet", None)
         self.annotation_review_slice.activated.connect(self.jump_to_annotation_review_slice)
@@ -3534,6 +3662,7 @@ class LaminarBoundaryWindow(QMainWindow):
         picking_form.addRow("Surface name", self.annotate_surface_name)
         picking_form.addRow("State", self.next_point_label)
         picking_form.addRow("Actions", action_row)
+        picking_form.addRow("Build", self.annotate_build_progress)
         picking_form.addRow("Progress", self.annotate_progress)
         picking_form.addRow("Status", self.annotate_status)
         controls_layout.addWidget(picking_box)
@@ -3790,7 +3919,7 @@ class LaminarBoundaryWindow(QMainWindow):
         is_3d = hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None
         self.annotation_settings_expanded = True if is_3d else False
         self.annotate_settings_button.setVisible(not is_3d)
-        self._set_annotation_parameter_widgets_enabled(False)
+        self._set_annotation_parameter_widgets_enabled(is_3d)
         self._apply_annotation_settings_panel_state()
         self._set_next_annotation_mode()
         if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
@@ -3810,7 +3939,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self._apply_annotation_settings_panel_state()
         self._set_next_annotation_mode()
         self.annotate_status.setText(
-            "Point picking paused. Edit settings, then Load Source And Start Picking again."
+            "Point picking paused. Edit settings, then Load / Reload Source And Start Picking again."
         )
 
     def toggle_annotation_settings_panel(self) -> None:
@@ -3933,19 +4062,20 @@ class LaminarBoundaryWindow(QMainWindow):
             self._show_exception_dialog("Save 3D annotation failed", exc)
             return
 
-        def task() -> TaskResult:
+        def task(progress: Callable[[int, str, str], None]) -> TaskResult:
             core = _core()
             outputs = core.run_3d_shell_patch_pipeline(
                 mask_path=self.annotation_mask_path,
                 cut_curve_json=annotations_path,
                 output_dir=build_dir,
                 shell_backend=shell_backend,
+                progress_callback=progress,
             )
             lines = ["3D surface build finished."]
             lines.extend(f"{key}: {value}" for key, value in outputs.items())
             return TaskResult("Build finished", "\n".join(lines), output_dir=build_dir)
 
-        self.start_task("build", task)
+        self.start_task("build", task, accepts_progress=True)
 
     def _update_custom_atlas_visibility(self, checked: bool) -> None:
         if hasattr(self, "annotate_atlas_row"):
@@ -3971,6 +4101,8 @@ class LaminarBoundaryWindow(QMainWindow):
             self.load_previous_csv_button,
         ):
             widget.setEnabled(enabled)
+        if enabled:
+            self._update_annotation_readiness()
 
     def _apply_review_mode_ui(self, active: bool) -> None:
         for name in ("review_ok_button", "save_review_button", "rebuild_review_button"):
@@ -5431,6 +5563,17 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def load_annotation_data(self) -> None:
         try:
+            if self._reload_would_clear_3d_annotations():
+                reply = QMessageBox.question(
+                    self,
+                    "Reload source?",
+                    "Reloading the source will clear the current 3D curves and selected patches.\n\n"
+                    "Continue?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
             if self._can_reuse_temporary_annotation_mask():
                 self.append_log("\n--- Reusing current extracted mask ---\n")
                 self.start_annotation_mask_load(Path(self.annotation_mask_path), temporary=True)
@@ -5450,6 +5593,14 @@ class LaminarBoundaryWindow(QMainWindow):
             self.start_annotation_mask_load(mask_path)
         except Exception as exc:
             self._show_exception_dialog("Load failed", exc)
+
+    def _reload_would_clear_3d_annotations(self) -> bool:
+        if not self.annotation_picking_active:
+            return False
+        if not hasattr(self, "surface_preview_canvas") or self.surface_preview_canvas.shell_mesh is None:
+            return False
+        curve_count, point_count, patch_count = self.surface_preview_canvas.annotation_counts()
+        return bool(curve_count or point_count or patch_count)
 
     def _annotation_image_for_slice(self, slice_index: int):
         core = _core()
@@ -6993,6 +7144,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.build_result_label.setObjectName("buildResultText")
         self.build_result_label.setWordWrap(True)
         self._set_label_state(self.build_result_label, "idle")
+        self.build_progress = BuildProgressPanel("Build progress appears here while surfaces or depth volumes are running.")
 
         self.open_build_output_button = self._make_button("Open Output Folder", "secondary")
         self.open_build_output_button.clicked.connect(self.open_build_output_folder)
@@ -7009,6 +7161,7 @@ class LaminarBoundaryWindow(QMainWindow):
         button_layout.addWidget(self.review_qc_button)
         button_layout.addStretch(1)
 
+        result_form.addRow("Progress", self.build_progress)
         result_form.addRow("Summary", self.build_result_label)
         result_form.addRow("", result_buttons)
         self._update_build_readiness()
@@ -7332,11 +7485,54 @@ class LaminarBoundaryWindow(QMainWindow):
         except OSError:
             pass
 
-    def start_task(self, label: str, fn: Callable[[], TaskResult]) -> None:
+    def _build_progress_panels(self, label: str) -> List[BuildProgressPanel]:
+        panels: List[BuildProgressPanel] = []
+        if label in ("build", "depth") and hasattr(self, "build_progress"):
+            panels.append(self.build_progress)
+        if label == "build" and hasattr(self, "annotate_build_progress"):
+            panels.append(self.annotate_build_progress)
+        return panels
+
+    def _begin_task_progress(self, label: str) -> None:
+        title = "Extracting surfaces" if label == "build" else "Computing laminar depth"
+        detail = "Starting build task..."
+        for panel in self._build_progress_panels(label):
+            panel.start(title, detail)
+
+    def _update_task_progress(self, event: object) -> None:
+        if not isinstance(event, dict):
+            return
+        label = str(event.get("label") or self.current_task_label or "")
+        try:
+            value = int(event.get("value", 0))
+        except (TypeError, ValueError):
+            value = 0
+        stage = str(event.get("stage") or "Working")
+        detail = str(event.get("detail") or "")
+        for panel in self._build_progress_panels(label):
+            panel.update_progress(value, stage, detail)
+
+    def _finish_task_progress(self, label: Optional[str], result: TaskResult) -> None:
+        if label not in ("build", "depth"):
+            return
+        title = "Surface build finished" if label == "build" else "Depth volume finished"
+        detail = str(result.output_dir) if result.output_dir else "Task finished."
+        for panel in self._build_progress_panels(label):
+            panel.finish(title, detail)
+
+    def _fail_task_progress(self, label: Optional[str], trace: str) -> None:
+        if label not in ("build", "depth"):
+            return
+        detail = self._error_summary(trace)
+        for panel in self._build_progress_panels(label):
+            panel.fail(detail)
+
+    def start_task(self, label: str, fn: Callable, accepts_progress: bool = False) -> None:
         if self.thread is not None:
             QMessageBox.warning(self, "Task running", "Please wait for the current task to finish.")
             return
 
+        self.current_task_label = label
         self.append_log(f"\n--- {label} started ---\n")
         self._set_status(f"Running: {label}", "running")
         if hasattr(self, "build_result_label") and label in ("build", "depth"):
@@ -7345,11 +7541,13 @@ class LaminarBoundaryWindow(QMainWindow):
             self._set_label_state(self.build_result_label, "running")
             self.open_build_output_button.setEnabled(False)
             self.review_qc_button.setEnabled(False)
+            self._begin_task_progress(label)
         self.thread = QThread()
-        self.worker = Worker(fn)
+        self.worker = Worker(fn, accepts_progress=accepts_progress, task_label=label)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log.connect(self.append_log)
+        self.worker.progress.connect(self._update_task_progress)
         self.worker.finished.connect(self.task_finished)
         self.worker.failed.connect(self.task_failed)
         self.worker.finished.connect(self.thread.quit)
@@ -7361,10 +7559,12 @@ class LaminarBoundaryWindow(QMainWindow):
     def clear_thread(self) -> None:
         self.thread = None
         self.worker = None
+        self.current_task_label = None
 
     def force_stop_current_task(self) -> None:
         if self.thread is None:
             return
+        label = self.current_task_label
         self.append_log("\n--- task force-stopped by user ---\n")
         self.thread.requestInterruption()
         self.thread.terminate()
@@ -7373,11 +7573,15 @@ class LaminarBoundaryWindow(QMainWindow):
             os._exit(0)
         self.thread = None
         self.worker = None
+        self._fail_task_progress(label, "Task stopped by user.")
+        self.current_task_label = None
         self._set_status("Ready", "ready")
 
     def task_finished(self, result: TaskResult) -> None:
+        label = self.current_task_label
         self._set_status("Ready", "ready")
         self.append_log(f"\n{result.message}\n")
+        self._finish_task_progress(label, result)
         self._update_build_result_from_task(result)
         self._show_task_result(result)
 
@@ -7436,9 +7640,11 @@ class LaminarBoundaryWindow(QMainWindow):
         self._show_error_dialog(title, trace)
 
     def task_failed(self, trace: str) -> None:
+        label = self.current_task_label
         running_status = self.status_label.text().lower()
         self._set_status("Failed", "failed")
         self.append_log("\n" + trace)
+        self._fail_task_progress(label, trace)
         if hasattr(self, "build_result_label") and ("build" in running_status or "depth" in running_status):
             self.build_result_label.setText("Run failed.\n" + self._error_summary(trace))
             self._set_label_state(self.build_result_label, "failed")
@@ -7477,7 +7683,7 @@ class LaminarBoundaryWindow(QMainWindow):
         if not self._validate_build_inputs():
             return
 
-        def task() -> TaskResult:
+        def task(progress: Callable[[int, str, str], None]) -> TaskResult:
             output_dir = self._require_path("Output folder", self.build_output.text())
             swc_glob = self.build_swc_glob.text().strip()
             swc_paths = sorted(glob.glob(swc_glob)) if swc_glob else []
@@ -7500,6 +7706,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 boundary_dilation=int(self.boundary_dilation.value()),
                 qc_every=int(self.qc_every.value()),
                 volume_format=self.volume_format.currentText(),
+                progress_callback=progress,
             )
             qc_summary = self._surface_qc_summary(output_dir)
             title = "Build needs QC review" if qc_summary.startswith("QC review needed") else "Build finished"
@@ -7508,7 +7715,7 @@ class LaminarBoundaryWindow(QMainWindow):
             lines.extend(("", qc_summary))
             return TaskResult(title, "\n".join(lines), output_dir=output_dir)
 
-        self.start_task("build", task)
+        self.start_task("build", task, accepts_progress=True)
 
     def _build_boundaries_path(self) -> Path:
         text = self.build_boundaries.text().strip()
@@ -7587,7 +7794,7 @@ class LaminarBoundaryWindow(QMainWindow):
         if not self._validate_build_inputs(needs_boundaries=True):
             return
 
-        def task() -> TaskResult:
+        def task(progress: Callable[[int, str, str], None]) -> TaskResult:
             output_dir = self._require_path("Output folder", self.build_output.text())
             swc_glob = self.build_swc_glob.text().strip()
             swc_paths = sorted(glob.glob(swc_glob)) if swc_glob else []
@@ -7608,6 +7815,7 @@ class LaminarBoundaryWindow(QMainWindow):
                 boundary_dilation=int(self.boundary_dilation.value()),
                 qc_every=int(self.qc_every.value()),
                 volume_format=self.volume_format.currentText(),
+                progress_callback=progress,
             )
             lines = ["Depth volume finished."]
             lines.extend(f"{key}: {value}" for key, value in outputs.items())
@@ -7617,7 +7825,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self.build_result_label.setText("Computing laminar depth volume...")
             self.open_build_output_button.setEnabled(False)
             self.review_qc_button.setEnabled(False)
-        self.start_task("depth", task)
+        self.start_task("depth", task, accepts_progress=True)
 
     def run_demo(self) -> None:
         def task() -> TaskResult:
