@@ -1397,7 +1397,7 @@ class ShellGLCanvas(QOpenGLWidget):
         mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
         self._draw_message(
             painter,
-            f"{mode_text}: {curve_count} curve(s), {point_count} active point(s), {patch_count} selected patch(es)",
+            f"{mode_text}: {curve_count} curves · {point_count} points · {patch_count} seeds",
         )
         painter.end()
 

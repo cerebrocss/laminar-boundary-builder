@@ -217,6 +217,34 @@ QLabel#buildProgressDetail {
     color: #54706b;
     font-size: 12px;
 }
+QFrame#surfaceQueuePanel {
+    background: transparent;
+    border: 0;
+}
+QPushButton#surfaceQueueItem {
+    background: #f7fbfa;
+    border: 1px solid #cddfda;
+    border-radius: 7px;
+    color: #24413c;
+    font-weight: 700;
+    padding: 7px 9px;
+    text-align: left;
+}
+QPushButton#surfaceQueueItem[active="true"] {
+    background: #e5f5ef;
+    border-color: #7fb8a7;
+    color: #123e35;
+}
+QPushButton#surfaceQueueItem[seeded="false"] {
+    border-color: #dfc77b;
+}
+QLabel#surfaceQueueEmpty {
+    background: #f8fbfa;
+    border: 1px dashed #cddfda;
+    border-radius: 7px;
+    color: #60736f;
+    padding: 7px 9px;
+}
 QProgressBar#buildProgressBar {
     background: #dbe8e5;
     border: 0;
@@ -2719,7 +2747,7 @@ class SurfacePreviewCanvas(QWidget):
         mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
         self._draw_message(
             painter,
-            f"{mode_text}: {curve_count} curve(s), {point_count} active point(s), {patch_count} selected patch(es)",
+            f"{mode_text}: {curve_count} curves · {point_count} points · {patch_count} seeds",
         )
 
     def mousePressEvent(self, event) -> None:
@@ -3535,7 +3563,14 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_contour.currentIndexChanged.connect(self.change_annotation_contour)
         self.annotate_surface_queue = CleanComboBox()
         self.annotate_surface_queue.setMinimumHeight(28)
+        self.annotate_surface_queue.hide()
         self.annotate_surface_queue.currentIndexChanged.connect(self.on_3d_surface_queue_changed)
+        self.annotate_surface_queue_panel = QFrame()
+        self.annotate_surface_queue_panel.setObjectName("surfaceQueuePanel")
+        self.annotate_surface_queue_layout = QVBoxLayout(self.annotate_surface_queue_panel)
+        self.annotate_surface_queue_layout.setContentsMargins(0, 0, 0, 0)
+        self.annotate_surface_queue_layout.setSpacing(5)
+        self.surface_queue_buttons: List[QPushButton] = []
         self.annotate_surface_name = QLineEdit()
         self.annotate_surface_name.setPlaceholderText("Selected surface name, for example layer_outer")
         self.annotate_surface_name.setText("surface_1")
@@ -3563,6 +3598,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_template.edit.textChanged.connect(self._update_annotation_readiness)
         self.annotate_output.edit.textChanged.connect(self._update_annotation_readiness)
         self.annotate_custom_atlas.toggled.connect(self._update_annotation_readiness)
+        self.annotate_hemisphere.currentIndexChanged.connect(self._update_annotation_readiness)
+        self.annotate_include_children.toggled.connect(self._update_annotation_readiness)
 
     def _create_annotation_action_buttons(self) -> QWidget:
         self.load_button = self._make_button("Load / Reload Source And Start Picking", "primary")
@@ -3682,12 +3719,18 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_progress.setObjectName("progressText")
         self.annotate_progress.setWordWrap(True)
         self.annotate_build_progress = BuildProgressPanel("Surface build progress appears here after you click Build.")
+        self.annotate_build_progress.hide()
         self.annotation_review_slice = CleanComboBox()
         self.annotation_review_slice.addItem("No accepted slices yet", None)
         self.annotation_review_slice.activated.connect(self.jump_to_annotation_review_slice)
 
     def _add_annotation_source_section(self, controls_layout: QVBoxLayout) -> None:
-        source_box, source_form = self._make_form_section("1. Choose Input Source")
+        source_box, source_form = self._make_form_section(
+            "1. Source",
+            checkable=True,
+            checked=True,
+        )
+        self.annotation_source_box = source_box
         source_form.addRow(
             "",
             self._make_note_label(
@@ -3707,6 +3750,7 @@ class LaminarBoundaryWindow(QMainWindow):
         source_form.addRow("Checklist", self.annotation_readiness)
         source_form.addRow("", self.load_button)
         controls_layout.addWidget(source_box)
+        self._update_annotation_source_title()
 
     def _same_path(self, first: str | Path, second: str | Path) -> bool:
         return Path(first).expanduser().resolve() == Path(second).expanduser().resolve()
@@ -3731,8 +3775,30 @@ class LaminarBoundaryWindow(QMainWindow):
                 pass
         return "existing mask"
 
+    def _update_annotation_source_title(self) -> None:
+        if not hasattr(self, "annotation_source_box"):
+            return
+        source = self.annotate_region.text().strip() or "region"
+        mask_text = self.annotate_mask.text().strip()
+        if mask_text and not self._mask_text_is_current_temporary_mask():
+            source = Path(mask_text).expanduser().name or "mask"
+        hemisphere = self.annotate_hemisphere.currentText().strip() or "all"
+        parts = [source, hemisphere]
+        if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
+            shell_mesh = self.surface_preview_canvas.shell_mesh
+            vertex_count = len(getattr(shell_mesh, "vertices", []))
+            face_count = len(getattr(shell_mesh, "faces", []))
+            if vertex_count and face_count:
+                parts.append(f"{vertex_count:,} pts")
+        self.annotation_source_box.setTitle("1. Source: " + " · ".join(parts))
+
     def _add_annotation_reference_section(self, controls_layout: QVBoxLayout) -> None:
-        save_box, save_form = self._make_form_section("2. Optional Reference And Recovery")
+        save_box, save_form = self._make_form_section(
+            "2. Files & Recovery",
+            checkable=True,
+            checked=False,
+        )
+        self.annotation_reference_box = save_box
         self._add_help_row(save_form, "Template image", self.annotate_template, *ANNOTATE_HELP["template"])
         self._add_help_row(save_form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
         self._add_help_row(save_form, "Previous shell-cut JSON", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
@@ -3753,13 +3819,13 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _add_annotation_picking_section(self, controls_layout: QVBoxLayout, action_row: QWidget) -> None:
         picking_box, picking_form = self._make_form_section("3. 3D Pick And Build")
-        picking_form.addRow("Surface queue", self.annotate_surface_queue)
-        picking_form.addRow("Surface name", self.annotate_surface_name)
-        picking_form.addRow("State", self.next_point_label)
+        self.annotation_picking_box = picking_box
+        picking_form.addRow("Surfaces", self.annotate_surface_queue_panel)
+        picking_form.addRow("Selected name", self.annotate_surface_name)
+        picking_form.addRow("Next", self.next_point_label)
         picking_form.addRow("Actions", action_row)
         picking_form.addRow("Build", self.annotate_build_progress)
-        picking_form.addRow("Progress", self.annotate_progress)
-        picking_form.addRow("Status", self.annotate_status)
+        picking_form.addRow("Shell", self.annotate_progress)
         controls_layout.addWidget(picking_box)
 
     def _make_annotation_preview_area(self) -> QSplitter:
@@ -3823,6 +3889,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self._update_annotation_readiness()
         self._update_annotation_review_slice_choices()
         self._apply_review_mode_ui(False)
+        if hasattr(self, "surface_preview_canvas"):
+            self.on_3d_annotation_changed()
 
     def _resolved_existing_input_path(self, text: str) -> Optional[Path]:
         raw = str(text or "").strip()
@@ -3902,6 +3970,7 @@ class LaminarBoundaryWindow(QMainWindow):
         state = "ready" if has_source and not has_warning else "warning" if has_source else "missing"
         self._set_label_state(self.annotation_readiness, state)
         self.load_button.setEnabled(has_source)
+        self._update_annotation_source_title()
 
     def _update_annotation_review_slice_choices(self) -> None:
         if not hasattr(self, "annotation_review_slice"):
@@ -4015,6 +4084,12 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_settings_expanded = True if is_3d else False
         self.annotate_settings_button.setVisible(not is_3d)
         self._set_annotation_parameter_widgets_enabled(is_3d)
+        if is_3d:
+            self._update_annotation_source_title()
+            if hasattr(self, "annotation_source_box"):
+                self.annotation_source_box.setChecked(False)
+            if hasattr(self, "annotation_reference_box"):
+                self.annotation_reference_box.setChecked(False)
         self._apply_annotation_settings_panel_state()
         self._set_next_annotation_mode()
         if hasattr(self, "surface_preview_canvas") and self.surface_preview_canvas.shell_mesh is not None:
@@ -4074,6 +4149,53 @@ class LaminarBoundaryWindow(QMainWindow):
         if hasattr(self, "build_3d_button"):
             self.build_3d_button.setEnabled(bool(ready))
 
+    def _clear_surface_queue_rows(self) -> None:
+        if not hasattr(self, "annotate_surface_queue_layout"):
+            return
+        while self.annotate_surface_queue_layout.count():
+            item = self.annotate_surface_queue_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.surface_queue_buttons = []
+
+    def _activate_3d_surface_from_queue_row(self, surface_index: int) -> None:
+        if not hasattr(self, "surface_preview_canvas"):
+            return
+        self.surface_preview_canvas.set_active_surface_index(surface_index)
+        self.surface_preview_canvas.setFocus(Qt.OtherFocusReason)
+
+    def _rebuild_surface_queue_rows(self, queue: List[Dict[str, object]], active_index: int) -> None:
+        if not hasattr(self, "annotate_surface_queue_layout"):
+            return
+        self._clear_surface_queue_rows()
+        if not queue:
+            empty = QLabel("Close a curve to add the first surface.")
+            empty.setObjectName("surfaceQueueEmpty")
+            empty.setWordWrap(True)
+            self.annotate_surface_queue_layout.addWidget(empty)
+            return
+
+        for item in queue:
+            index = int(item["index"])
+            name = str(item["name"])
+            seed_count = int(item["seed_count"])
+            active = index == active_index
+            seed_text = "seed selected" if seed_count else "needs seed"
+            marker = "●" if active else "○"
+            button = QPushButton(f"{marker} {index + 1}. {name} · {seed_text}")
+            button.setObjectName("surfaceQueueItem")
+            button.setCheckable(True)
+            button.setChecked(active)
+            button.setProperty("active", "true" if active else "false")
+            button.setProperty("seeded", "true" if seed_count else "false")
+            button.setToolTip("Click to make this the current surface for naming and seed selection.")
+            button.clicked.connect(
+                lambda _checked=False, current_index=index: self._activate_3d_surface_from_queue_row(current_index)
+            )
+            self.annotate_surface_queue_layout.addWidget(button)
+            self.surface_queue_buttons.append(button)
+
     def _sync_3d_surface_queue_controls(self) -> List[Dict[str, object]]:
         if not hasattr(self, "surface_preview_canvas") or not hasattr(self, "annotate_surface_queue"):
             return []
@@ -4095,12 +4217,15 @@ class LaminarBoundaryWindow(QMainWindow):
                 )
             self.annotate_surface_queue.setCurrentIndex(max(0, min(active_index, self.annotate_surface_queue.count() - 1)))
         self.annotate_surface_queue.blockSignals(False)
+        self._rebuild_surface_queue_rows(queue, active_index)
 
         active_name = str(queue[active_index]["name"]) if queue else "surface_1"
         self.annotate_surface_name.blockSignals(True)
         self.annotate_surface_name.setText(active_name)
         self.annotate_surface_name.setEnabled(bool(queue))
         self.annotate_surface_queue.setEnabled(bool(queue))
+        if hasattr(self, "annotate_surface_queue_panel"):
+            self.annotate_surface_queue_panel.setEnabled(bool(queue))
         self.annotate_surface_name.blockSignals(False)
         return queue
 
@@ -4112,16 +4237,16 @@ class LaminarBoundaryWindow(QMainWindow):
         if self.surface_preview_canvas.shell_mesh is None:
             text = "3D shell is not ready."
         elif point_count:
-            text = f"Drawing curve: {point_count} point(s). Click an active point to close. X = undo."
+            text = f"Drawing: {point_count} point(s). Click an active point to close. X = undo."
         elif curve_count and self.surface_preview_canvas.can_build_3d_surfaces():
-            text = f"Ready to build {len(queue)} queued surface(s) from {curve_count} closed curve(s)."
+            text = "Ready: every surface has a seed. Check names, then build."
         elif queue:
             missing = [str(int(item["index"]) + 1) for item in queue if int(item["seed_count"]) == 0]
-            text = f"{curve_count} queued surface(s). Select seed patch for surface {', '.join(missing)}."
+            text = f"Next: select seed patch for surface {', '.join(missing)}."
         elif curve_count:
-            text = f"{curve_count} closed curve(s). Hover and click a surface patch to keep."
+            text = "Next: select a seed patch for the selected surface."
         else:
-            text = "Click shell points to draw a closed curve."
+            text = "Next: draw a closed curve on the shell."
         self.next_point_label.setText(text)
         self.on_3d_build_ready_changed(self.surface_preview_canvas.can_build_3d_surfaces())
         if hasattr(self, "annotate_progress"):
@@ -6469,14 +6594,13 @@ class LaminarBoundaryWindow(QMainWindow):
             if region_total:
                 first_slice = self.annotation_region_slices[0]
                 last_slice = self.annotation_region_slices[-1]
-                range_text = f"{region_total} non-empty slices ({first_slice}-{last_slice})"
+                range_text = f"{region_total} slices ({first_slice}-{last_slice})"
             else:
-                range_text = "0 non-empty slices"
+                range_text = "0 slices"
             self.annotate_progress.setText(
-                f"3D shell: {vertex_count:,} points, {face_count:,} faces ({backend}). "
-                f"Mask: {range_text}. "
-                f"Closed curves: {curve_count}. Active points: {point_count}. Selected patches: {patch_count}."
+                f"{vertex_count:,} pts · {face_count:,} faces · {range_text} · {backend}"
             )
+            self._update_annotation_source_title()
             self.slice_canvas.set_progress_text("")
             return
         target_slices = self._target_annotation_slices()
@@ -7654,6 +7778,7 @@ class LaminarBoundaryWindow(QMainWindow):
         title = "Extracting surfaces" if label == "build" else "Computing laminar depth"
         detail = "Starting build task..."
         for panel in self._build_progress_panels(label):
+            panel.show()
             panel.start(title, detail)
 
     def _update_task_progress(self, event: object) -> None:
