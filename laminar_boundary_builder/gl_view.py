@@ -72,6 +72,7 @@ class ShellGLCanvas(QOpenGLWidget):
     ANNOTATION_LINE_COLOR = "#ff3b30"
     ANNOTATION_POINT_COLOR = "#ffe033"
     ANNOTATION_DEPTH_BIAS = 0.0025
+    PICK_VISIBLE_DEPTH_TOLERANCE = 0.006
     DRAG_INSIDE_CURVE_MARGIN_PX = 12.0
     MODEL_BASE_SCALE = 0.84
     PROJECTION_NEAR = -10.0
@@ -913,12 +914,17 @@ class ShellGLCanvas(QOpenGLWidget):
     def _nearest_active_vertex_index(self, pos, max_distance: float = 15.0) -> Optional[int]:
         if not self.active_curve_vertices:
             return None
-        screen, _front_depth, _window_depth = self._screen_cache_data()
+        screen, front_depth, _window_depth = self._screen_cache_data()
         ids = np.asarray(self.active_curve_vertices, dtype=np.int64)
         click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
         distances = np.linalg.norm(screen[ids] - click.reshape(1, 2), axis=1)
-        index = int(np.argmin(distances))
-        return index if float(distances[index]) <= max_distance else None
+        for index in np.argsort(distances):
+            if float(distances[int(index)]) > max_distance:
+                break
+            vertex_id = int(ids[int(index)])
+            if self._screen_depth_is_visible(screen[vertex_id], float(front_depth[vertex_id])):
+                return int(index)
+        return None
 
     def _nearest_annotation_point_ref(
         self,
@@ -943,7 +949,11 @@ class ShellGLCanvas(QOpenGLWidget):
             vertex_depth = float(front_depth[vertex_id])
             if distance > best_distance:
                 return
-            if distance < best_distance or vertex_depth > best_depth:
+            if not self._screen_depth_is_visible(screen[vertex_id], vertex_depth):
+                return
+            if distance < best_distance - 1e-6 or (
+                abs(distance - best_distance) <= 1e-6 and vertex_depth > best_depth
+            ):
                 best_distance = distance
                 best_depth = vertex_depth
                 best_ref = (kind, int(curve_index), int(point_index))
@@ -959,6 +969,81 @@ class ShellGLCanvas(QOpenGLWidget):
                 consider("closed", curve_index, point_index, int(vertex_id))
 
         return best_ref
+
+    def _front_hit_at_screen_point(
+        self,
+        screen_point: np.ndarray,
+        max_triangles: Optional[int] = None,
+        margin: float = 2.0,
+    ) -> Optional[Tuple[int, float]]:
+        if len(self._display_triangles) == 0:
+            return None
+        screen, front_depth, _window_depth = self._screen_cache_data()
+        triangles = self._display_triangles
+        face_ids = self._display_face_ids
+        if max_triangles is not None and len(triangles) > max_triangles:
+            step = int(math.ceil(len(triangles) / float(max_triangles)))
+            sample_ids = np.arange(0, len(triangles), step, dtype=np.int64)
+            triangles = triangles[sample_ids]
+            face_ids = face_ids[sample_ids]
+
+        click = np.asarray(screen_point, dtype=np.float32).reshape(2)
+        points = screen[triangles]
+        inside_bounds = (
+            (points[:, :, 0].min(axis=1) <= click[0] + margin)
+            & (points[:, :, 0].max(axis=1) >= click[0] - margin)
+            & (points[:, :, 1].min(axis=1) <= click[1] + margin)
+            & (points[:, :, 1].max(axis=1) >= click[1] - margin)
+        )
+        candidates = np.flatnonzero(inside_bounds)
+        if len(candidates) == 0:
+            return None
+
+        p0 = points[candidates, 0, :]
+        p1 = points[candidates, 1, :]
+        p2 = points[candidates, 2, :]
+        den = (
+            (p1[:, 1] - p2[:, 1]) * (p0[:, 0] - p2[:, 0])
+            + (p2[:, 0] - p1[:, 0]) * (p0[:, 1] - p2[:, 1])
+        )
+        valid = np.abs(den) > 1e-6
+        if not np.any(valid):
+            return None
+
+        candidate_ids = candidates[valid]
+        p0 = p0[valid]
+        p1 = p1[valid]
+        p2 = p2[valid]
+        den = den[valid]
+        bary0 = (
+            (p1[:, 1] - p2[:, 1]) * (click[0] - p2[:, 0])
+            + (p2[:, 0] - p1[:, 0]) * (click[1] - p2[:, 1])
+        ) / den
+        bary1 = (
+            (p2[:, 1] - p0[:, 1]) * (click[0] - p2[:, 0])
+            + (p0[:, 0] - p2[:, 0]) * (click[1] - p2[:, 1])
+        ) / den
+        bary2 = 1.0 - bary0 - bary1
+        inside = (bary0 >= -0.02) & (bary1 >= -0.02) & (bary2 >= -0.02)
+        if not np.any(inside):
+            return None
+
+        hit_ids = candidate_ids[inside]
+        hit_triangles = triangles[hit_ids]
+        hit_depth = (
+            bary0[inside] * front_depth[hit_triangles[:, 0]]
+            + bary1[inside] * front_depth[hit_triangles[:, 1]]
+            + bary2[inside] * front_depth[hit_triangles[:, 2]]
+        )
+        best = int(np.argmax(hit_depth))
+        return int(face_ids[int(hit_ids[best])]), float(hit_depth[best])
+
+    def _screen_depth_is_visible(self, screen_point: np.ndarray, front_depth: float) -> bool:
+        hit = self._front_hit_at_screen_point(screen_point)
+        if hit is None:
+            return False
+        _face_id, visible_depth = hit
+        return float(front_depth) >= float(visible_depth) - self.PICK_VISIBLE_DEPTH_TOLERANCE
 
     def _nearest_display_face_center_id(self, pos, max_distance: float = 36.0) -> Optional[int]:
         if len(self._display_centers) == 0:
@@ -979,7 +1064,18 @@ class ShellGLCanvas(QOpenGLWidget):
         near = np.flatnonzero(distances <= max_distance)
         if len(near) == 0:
             return None
-        best = near[np.lexsort((distances[near], -depth_to_search[near]))][0]
+        visible = [
+            int(index)
+            for index in near
+            if self._screen_depth_is_visible(
+                centers_to_search[int(index)],
+                float(depth_to_search[int(index)]),
+            )
+        ]
+        if not visible:
+            return None
+        visible_array = np.asarray(visible, dtype=np.int64)
+        best = visible_array[np.lexsort((distances[visible_array], -depth_to_search[visible_array]))][0]
         return int(face_ids_to_search[int(best)])
 
     def _pick_display_face_id(
@@ -988,64 +1084,12 @@ class ShellGLCanvas(QOpenGLWidget):
         max_distance: float = 36.0,
         max_triangles: Optional[int] = None,
     ) -> Optional[int]:
-        if len(self._display_triangles) == 0:
-            return None
-        screen, front_depth, _window_depth = self._screen_cache_data()
-        triangles = self._display_triangles
-        face_ids = self._display_face_ids
-        if max_triangles is not None and len(triangles) > max_triangles:
-            step = int(math.ceil(len(triangles) / float(max_triangles)))
-            sample_ids = np.arange(0, len(triangles), step, dtype=np.int64)
-            triangles = triangles[sample_ids]
-            face_ids = face_ids[sample_ids]
-
         click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
-        points = screen[triangles]
-        margin = 2.0
-        inside_bounds = (
-            (points[:, :, 0].min(axis=1) <= click[0] + margin)
-            & (points[:, :, 0].max(axis=1) >= click[0] - margin)
-            & (points[:, :, 1].min(axis=1) <= click[1] + margin)
-            & (points[:, :, 1].max(axis=1) >= click[1] - margin)
-        )
-        candidates = np.flatnonzero(inside_bounds)
-        if len(candidates) == 0:
+        hit = self._front_hit_at_screen_point(click, max_triangles=max_triangles)
+        if hit is None:
             return self._nearest_display_face_center_id(pos, max_distance=max_distance)
-
-        p0 = points[candidates, 0, :]
-        p1 = points[candidates, 1, :]
-        p2 = points[candidates, 2, :]
-        den = (
-            (p1[:, 1] - p2[:, 1]) * (p0[:, 0] - p2[:, 0])
-            + (p2[:, 0] - p1[:, 0]) * (p0[:, 1] - p2[:, 1])
-        )
-        valid = np.abs(den) > 1e-6
-        if not np.any(valid):
-            return self._nearest_display_face_center_id(pos, max_distance=max_distance)
-        candidate_ids = candidates[valid]
-        p0 = p0[valid]
-        p1 = p1[valid]
-        p2 = p2[valid]
-        den = den[valid]
-
-        bary0 = (
-            (p1[:, 1] - p2[:, 1]) * (click[0] - p2[:, 0])
-            + (p2[:, 0] - p1[:, 0]) * (click[1] - p2[:, 1])
-        ) / den
-        bary1 = (
-            (p2[:, 1] - p0[:, 1]) * (click[0] - p2[:, 0])
-            + (p0[:, 0] - p2[:, 0]) * (click[1] - p2[:, 1])
-        ) / den
-        bary2 = 1.0 - bary0 - bary1
-        inside = (bary0 >= -0.02) & (bary1 >= -0.02) & (bary2 >= -0.02)
-        if not np.any(inside):
-            return self._nearest_display_face_center_id(pos, max_distance=max_distance)
-
-        hit_ids = candidate_ids[inside]
-        hit_triangles = triangles[hit_ids]
-        hit_depth = front_depth[hit_triangles].mean(axis=1)
-        best = int(hit_ids[int(np.argmax(hit_depth))])
-        return int(face_ids[best])
+        face_id, _depth = hit
+        return int(face_id)
 
     def _nearest_face_vertex_id(self, face_id: int, pos) -> Optional[int]:
         if len(self._faces) == 0 or face_id < 0 or face_id >= len(self._faces):
