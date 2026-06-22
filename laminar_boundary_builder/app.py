@@ -2289,6 +2289,9 @@ class SurfacePreviewCanvas(QWidget):
         self._emit_3d_state()
 
     def set_curve_mode(self) -> None:
+        if len(self.active_curve_vertices) >= 3:
+            self.close_active_curve_to_start()
+            return
         self.annotation_mode = "curve"
         self.message = "3D: click shell points to draw a cut curve"
         self.update()
@@ -2529,7 +2532,7 @@ class SurfacePreviewCanvas(QWidget):
         index = int(np.argmin(distances))
         return int(candidates[index]) if float(distances[index]) <= max_distance else None
 
-    def _nearest_active_vertex_index(self, pos, max_distance: float = 15.0) -> Optional[int]:
+    def _nearest_active_vertex_index(self, pos, max_distance: float = 22.0) -> Optional[int]:
         if not self.active_curve_vertices:
             return None
         np = _numpy()
@@ -2601,6 +2604,18 @@ class SurfacePreviewCanvas(QWidget):
         self.active_curve_vertices = []
         self.annotation_mode = "patch"
         self.message = f"Closed curve saved for '{self.surface_name}'. Click its seed patch."
+
+    def close_active_curve_to_start(self) -> bool:
+        if len(self.active_curve_vertices) < 3:
+            self.annotation_mode = "curve"
+            self.message = "A closed curve needs at least three points"
+            self.update()
+            return False
+        curve_count = len(self.closed_curves)
+        self._close_active_curve(0)
+        self._emit_3d_state()
+        self.update()
+        return len(self.closed_curves) > curve_count
 
     def _add_selected_patch(self, face_id: int) -> None:
         if self.shell_mesh is None:
@@ -4237,7 +4252,8 @@ class LaminarBoundaryWindow(QMainWindow):
         if self.surface_preview_canvas.shell_mesh is None:
             text = "3D shell is not ready."
         elif point_count:
-            text = f"Drawing: {point_count} point(s). Click an active point to close. X = undo."
+            close_hint = "Click an active point or press Close Current Curve to close."
+            text = f"Drawing: {point_count} point(s). {close_hint} X = undo."
         elif curve_count and self.surface_preview_canvas.can_build_3d_surfaces():
             text = "Ready: every surface has a seed. Check names, then build."
         elif queue:
@@ -4248,6 +4264,14 @@ class LaminarBoundaryWindow(QMainWindow):
         else:
             text = "Next: draw a closed curve on the shell."
         self.next_point_label.setText(text)
+        if hasattr(self, "draw_curve_button"):
+            can_close = point_count >= 3
+            self.draw_curve_button.setText("Close Current Curve" if can_close else "Draw New Closed Curve")
+            self.draw_curve_button.setToolTip(
+                "Close the current curve by connecting the last point back to the first point."
+                if can_close
+                else "Start or continue a 3D shell cut curve."
+            )
         self.on_3d_build_ready_changed(self.surface_preview_canvas.can_build_3d_surfaces())
         if hasattr(self, "annotate_progress"):
             self._update_annotation_progress()

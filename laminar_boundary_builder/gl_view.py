@@ -217,6 +217,9 @@ class ShellGLCanvas(QOpenGLWidget):
         self._emit_3d_state()
 
     def set_curve_mode(self) -> None:
+        if len(self.active_curve_vertices) >= 3:
+            self.close_active_curve_to_start()
+            return
         self.annotation_mode = "curve"
         self.message = "3D: click the shaded shell to draw a cut curve"
         self.update()
@@ -930,7 +933,9 @@ class ShellGLCanvas(QOpenGLWidget):
         front_depth = (-window_depth).astype(np.float32)
         return screen, front_depth, window_depth
 
-    def _nearest_active_vertex_index(self, pos, max_distance: float = 15.0) -> Optional[int]:
+    def _nearest_active_vertex_index(self, pos, max_distance: Optional[float] = None) -> Optional[int]:
+        if max_distance is None:
+            max_distance = self.ANNOTATION_POINT_HIT_RADIUS_PX
         if not self.active_curve_vertices:
             return None
         screen, front_depth, _window_depth = self._screen_cache_data()
@@ -1452,6 +1457,18 @@ class ShellGLCanvas(QOpenGLWidget):
         self.active_curve_vertices = []
         self.annotation_mode = "patch"
         self.message = f"Closed curve saved for '{self.surface_name}'. Click its seed patch."
+
+    def close_active_curve_to_start(self) -> bool:
+        if len(self.active_curve_vertices) < 3:
+            self.annotation_mode = "curve"
+            self.message = "A closed curve needs at least three points"
+            self.update()
+            return False
+        curve_count = len(self.closed_curves)
+        self._close_active_curve(0)
+        self._emit_3d_state()
+        self.update()
+        return len(self.closed_curves) > curve_count
 
     def _add_selected_patch(self, face_id: int) -> None:
         if self.shell_mesh is None or len(self._faces) == 0:
