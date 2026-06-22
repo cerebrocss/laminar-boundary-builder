@@ -146,8 +146,20 @@ class ShellGLCanvas(QOpenGLWidget):
         self._screen_cache = None
         self._front_hit_cache: Dict[Tuple[int, int, int, int], Optional[Tuple[int, float]]] = {}
         self._visible_vertex_cache: Dict[int, bool] = {}
+        self._pick_bbox_cache_key = None
+        self._pick_bbox_points = np.empty((0, 3, 2), dtype=np.float32)
+        self._pick_bbox_mins = np.empty((0, 2), dtype=np.float32)
+        self._pick_bbox_maxs = np.empty((0, 2), dtype=np.float32)
         self._viewport_width = 1
         self._viewport_height = 1
+
+    def _clear_pick_caches(self) -> None:
+        self._front_hit_cache = {}
+        self._visible_vertex_cache = {}
+        self._pick_bbox_cache_key = None
+        self._pick_bbox_points = np.empty((0, 3, 2), dtype=np.float32)
+        self._pick_bbox_mins = np.empty((0, 2), dtype=np.float32)
+        self._pick_bbox_maxs = np.empty((0, 2), dtype=np.float32)
 
     def set_reference_contours(self, _contours, _slice_axis: int = 0) -> None:
         return
@@ -175,8 +187,7 @@ class ShellGLCanvas(QOpenGLWidget):
         self.pan_y = 0.0
         self._screen_cache_key = None
         self._screen_cache = None
-        self._front_hit_cache = {}
-        self._visible_vertex_cache = {}
+        self._clear_pick_caches()
         if shell_mesh is None:
             self._clear_mesh_buffers()
             self.message = "3D shell is not available"
@@ -377,8 +388,7 @@ class ShellGLCanvas(QOpenGLWidget):
         self._curve_edge_set = set()
         self._curve_graph_vertices = np.empty((0, 3), dtype=np.float32)
         self._curve_path_cache = {}
-        self._front_hit_cache = {}
-        self._visible_vertex_cache = {}
+        self._clear_pick_caches()
         self._mesh_dirty = True
 
     def _prepare_mesh_arrays(self, shell_mesh) -> None:
@@ -435,8 +445,7 @@ class ShellGLCanvas(QOpenGLWidget):
         self._curve_path_cache = {}
         self._screen_cache_key = None
         self._screen_cache = None
-        self._front_hit_cache = {}
-        self._visible_vertex_cache = {}
+        self._clear_pick_caches()
         self._mesh_dirty = True
         if self._gl_ready:
             self.makeCurrent()
@@ -567,8 +576,7 @@ class ShellGLCanvas(QOpenGLWidget):
         glViewport(0, 0, self._viewport_width, self._viewport_height)
         self._screen_cache_key = None
         self._screen_cache = None
-        self._front_hit_cache = {}
-        self._visible_vertex_cache = {}
+        self._clear_pick_caches()
 
     def paintGL(self) -> None:
         try:
@@ -893,8 +901,7 @@ class ShellGLCanvas(QOpenGLWidget):
         screen, front_depth, window_depth = self._project_points(self._normalized_vertices)
         self._screen_cache_key = key
         self._screen_cache = (screen, front_depth, window_depth)
-        self._front_hit_cache = {}
-        self._visible_vertex_cache = {}
+        self._clear_pick_caches()
         return self._screen_cache
 
     def _project_points(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -994,29 +1001,33 @@ class ShellGLCanvas(QOpenGLWidget):
         if cache_key in self._front_hit_cache:
             return self._front_hit_cache[cache_key]
 
+        candidate_triangle_ids, candidate_points = self._pick_bbox_candidate_data(click, margin=margin)
+        if len(candidate_triangle_ids) == 0:
+            self._front_hit_cache[cache_key] = None
+            return None
+        if max_triangles is not None and len(candidate_triangle_ids) > max_triangles:
+            step = int(math.ceil(len(candidate_triangle_ids) / float(max_triangles)))
+            candidate_triangle_ids = candidate_triangle_ids[::step]
+            candidate_points = candidate_points[::step]
+
         triangles = self._display_triangles
         face_ids = self._display_face_ids
-        if max_triangles is not None and len(triangles) > max_triangles:
-            step = int(math.ceil(len(triangles) / float(max_triangles)))
-            sample_ids = np.arange(0, len(triangles), step, dtype=np.int64)
-            triangles = triangles[sample_ids]
-            face_ids = face_ids[sample_ids]
-
-        points = screen[triangles]
+        points = candidate_points
         inside_bounds = (
             (points[:, :, 0].min(axis=1) <= click[0] + margin)
             & (points[:, :, 0].max(axis=1) >= click[0] - margin)
             & (points[:, :, 1].min(axis=1) <= click[1] + margin)
             & (points[:, :, 1].max(axis=1) >= click[1] - margin)
         )
-        candidates = np.flatnonzero(inside_bounds)
+        candidates = candidate_triangle_ids[np.flatnonzero(inside_bounds)]
         if len(candidates) == 0:
             self._front_hit_cache[cache_key] = None
             return None
 
-        p0 = points[candidates, 0, :]
-        p1 = points[candidates, 1, :]
-        p2 = points[candidates, 2, :]
+        candidate_points = self._pick_bbox_points[candidates]
+        p0 = candidate_points[:, 0, :]
+        p1 = candidate_points[:, 1, :]
+        p2 = candidate_points[:, 2, :]
         den = (
             (p1[:, 1] - p2[:, 1]) * (p0[:, 0] - p2[:, 0])
             + (p2[:, 0] - p1[:, 0]) * (p0[:, 1] - p2[:, 1])
@@ -1056,6 +1067,41 @@ class ShellGLCanvas(QOpenGLWidget):
         result = (int(face_ids[int(hit_ids[best])]), float(hit_depth[best]))
         self._front_hit_cache[cache_key] = result
         return result
+
+    def _pick_bbox_candidate_data(self, click: np.ndarray, margin: float) -> Tuple[np.ndarray, np.ndarray]:
+        self._ensure_pick_bbox_cache(margin=margin)
+        if len(self._pick_bbox_points) == 0:
+            return np.empty((0,), dtype=np.int64), np.empty((0, 3, 2), dtype=np.float32)
+        point = np.asarray(click, dtype=np.float32).reshape(2)
+        inside_bounds = (
+            (self._pick_bbox_mins[:, 0] <= point[0] + float(margin))
+            & (self._pick_bbox_maxs[:, 0] >= point[0] - float(margin))
+            & (self._pick_bbox_mins[:, 1] <= point[1] + float(margin))
+            & (self._pick_bbox_maxs[:, 1] >= point[1] - float(margin))
+        )
+        candidate_ids = np.flatnonzero(inside_bounds)
+        return candidate_ids, self._pick_bbox_points[candidate_ids]
+
+    def _ensure_pick_bbox_cache(self, margin: float = 2.0) -> None:
+        screen, _front_depth, _window_depth = self._screen_cache_data()
+        key = (
+            self._screen_cache_key,
+            len(self._display_triangles),
+            int(round(float(margin) * 10.0)),
+        )
+        if self._pick_bbox_cache_key == key:
+            return
+        self._pick_bbox_cache_key = key
+        self._pick_bbox_points = np.empty((0, 3, 2), dtype=np.float32)
+        self._pick_bbox_mins = np.empty((0, 2), dtype=np.float32)
+        self._pick_bbox_maxs = np.empty((0, 2), dtype=np.float32)
+        if len(self._display_triangles) == 0:
+            return
+
+        points = screen[self._display_triangles]
+        self._pick_bbox_points = points.astype(np.float32, copy=False)
+        self._pick_bbox_mins = (points.min(axis=1) - float(margin)).astype(np.float32)
+        self._pick_bbox_maxs = (points.max(axis=1) + float(margin)).astype(np.float32)
 
     def _screen_depth_is_visible(self, screen_point: np.ndarray, front_depth: float) -> bool:
         hit = self._front_hit_at_screen_point(screen_point)
@@ -1487,11 +1533,12 @@ class ShellGLCanvas(QOpenGLWidget):
     def _draw_face_overlay(self, painter: QPainter, face_id: int, fill: QColor, outline: QColor, width: float) -> None:
         if len(self._faces) == 0 or face_id < 0 or face_id >= len(self._faces):
             return
-        screen, _front_depth, _window_depth = self._screen_cache_data()
         face_vertices = [int(value) for value in self._faces[int(face_id)] if int(value) >= 0]
         if len(face_vertices) < 3:
             return
-        polygon = QPolygonF([QPointF(float(screen[i, 0]), float(screen[i, 1])) for i in face_vertices])
+        points = self._normalized_vertices[np.asarray(face_vertices, dtype=np.int64)]
+        screen, _front_depth, _window_depth = self._project_points(points)
+        polygon = QPolygonF([QPointF(float(point[0]), float(point[1])) for point in screen])
         painter.setPen(QPen(outline, width))
         painter.setBrush(fill)
         painter.drawPolygon(polygon)
