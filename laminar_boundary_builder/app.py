@@ -599,10 +599,10 @@ ANNOTATE_HELP = {
         "Recommended: choose a project-specific folder so the annotation files are easy to find later.",
     ),
     "previous_csv": (
-        "Previous shell-cut JSON",
-        "Purpose: reload a saved shell_cut_annotations.json into the annotation workspace.\n"
-        "Effect: accepted shell-cut slices and points are restored so you can edit only the bad slices.\n"
-        "Recommended: load the same mask first, then load the previous JSON and revise flagged slices.",
+        "Previous annotation JSON",
+        "Purpose: reload saved annotations into the annotation workspace.\n"
+        "Effect: shell_cut_annotations.json restores 2D shell-cut slices; surface_3d_annotations_*.json restores 3D curves, names, and seed patches for direct editing.\n"
+        "Recommended: load the same mask/source first, then load the previous JSON and revise only the bad markers.",
     ),
     "slice_axis": (
         "Slice axis",
@@ -2446,6 +2446,152 @@ class SurfacePreviewCanvas(QWidget):
             "selected_patches": patches,
         }
 
+    @staticmethod
+    def _loaded_curve_vertex_ids(points: object, vertices) -> List[int]:
+        np = _numpy()
+        loaded = np.asarray(points, dtype=float)
+        if loaded.ndim != 2 or loaded.shape[1] != 3:
+            raise ValueError("3D cut curve control_points must be an N x 3 array")
+        snapped: List[int] = []
+        for point in loaded:
+            distances = np.linalg.norm(vertices - point.reshape(1, 3), axis=1)
+            vertex_id = int(np.argmin(distances))
+            if not snapped or snapped[-1] != vertex_id:
+                snapped.append(vertex_id)
+        if len(snapped) >= 2 and snapped[0] != snapped[-1]:
+            snapped.append(snapped[0])
+        return snapped
+
+    def _loaded_seed_face_id(self, seed_point: object, fallback_face_id: int) -> Optional[int]:
+        if self.shell_mesh is None:
+            return None
+        np = _numpy()
+        vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
+        faces = np.asarray(self.shell_mesh.faces, dtype=int)
+        if seed_point is None:
+            return int(fallback_face_id) if 0 <= int(fallback_face_id) < len(faces) else None
+        seed = np.asarray(seed_point, dtype=float).reshape(-1)
+        if seed.shape[0] != 3:
+            return int(fallback_face_id) if 0 <= int(fallback_face_id) < len(faces) else None
+        centers = []
+        face_ids = []
+        for face_id, face in enumerate(faces):
+            valid = [int(value) for value in face if 0 <= int(value) < len(vertices)]
+            if not valid:
+                continue
+            centers.append(vertices[np.asarray(valid, dtype=int)].mean(axis=0))
+            face_ids.append(int(face_id))
+        if not centers:
+            return None
+        center_array = np.vstack(centers)
+        index = int(np.linalg.norm(center_array - seed.reshape(1, 3), axis=1).argmin())
+        return int(face_ids[index])
+
+    def load_annotation_payload(self, payload: Dict[str, object]) -> Dict[str, int]:
+        if self.shell_mesh is None:
+            raise ValueError("Load the target 3D shell before loading saved 3D annotations")
+        if payload.get("schema") != "laminar_boundary_builder.surface_3d_annotations.v1":
+            raise ValueError("Expected surface_3d_annotations JSON from the 3D surface workflow")
+        np = _numpy()
+        vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
+        if len(vertices) == 0:
+            raise ValueError("Current 3D shell has no vertices")
+
+        curve_items = payload.get("cut_curves", payload.get("curves", []))
+        if not isinstance(curve_items, list) or not curve_items:
+            raise ValueError("3D annotation JSON has no cut curves")
+
+        closed_curves: List[Dict[str, object]] = []
+        skipped_curves = 0
+        for index, item in enumerate(curve_items):
+            if not isinstance(item, dict):
+                skipped_curves += 1
+                continue
+            points = item.get("control_points", item.get("points"))
+            if points is None:
+                skipped_curves += 1
+                continue
+            try:
+                vertex_ids = self._loaded_curve_vertex_ids(points, vertices)
+            except Exception:
+                skipped_curves += 1
+                continue
+            if len(vertex_ids) < 4 or len(set(vertex_ids[:-1])) < 3:
+                skipped_curves += 1
+                continue
+            closed_curves.append(
+                {
+                    "curve_id": str(item.get("curve_id") or f"cut_curve_{index + 1}"),
+                    "vertices": vertex_ids,
+                }
+            )
+        if not closed_curves:
+            raise ValueError("No usable 3D cut curves were loaded")
+
+        faces = np.asarray(self.shell_mesh.faces, dtype=int)
+        patch_items = payload.get("selected_patches", payload.get("seeds", payload.get("patch_seeds", [])))
+        patch_items = patch_items if isinstance(patch_items, list) else []
+        surface_names = [self._default_surface_name(index) for index in range(len(closed_curves))]
+        patch_records = []
+        skipped_patches = 0
+        for patch_index, item in enumerate(patch_items):
+            if not isinstance(item, dict):
+                skipped_patches += 1
+                continue
+            try:
+                surface_index = int(item.get("surface_index", patch_index))
+            except Exception:
+                surface_index = patch_index
+            if surface_index < 0 or surface_index >= len(surface_names):
+                skipped_patches += 1
+                continue
+            label = str(item.get("patch_label") or "").strip()
+            if label:
+                surface_names[surface_index] = label
+            try:
+                fallback_face_id = int(item.get("face_id", -1))
+            except Exception:
+                fallback_face_id = -1
+            face_id = self._loaded_seed_face_id(item.get("seed_point"), fallback_face_id)
+            if face_id is None:
+                skipped_patches += 1
+                continue
+            face = np.asarray([value for value in faces[int(face_id)] if int(value) >= 0], dtype=int)
+            if len(face) == 0:
+                skipped_patches += 1
+                continue
+            seed_point = vertices[face].mean(axis=0)
+            patch_records.append((surface_index, int(face_id), seed_point))
+
+        self.closed_curves = closed_curves
+        self.active_curve_vertices = []
+        self.surface_names = surface_names
+        self.active_surface_index = 0
+        self.surface_name = surface_names[0]
+        self.selected_patches = [
+            {
+                "patch_label": surface_names[surface_index],
+                "surface_index": int(surface_index),
+                "face_id": int(face_id),
+                "seed_point": seed_point,
+            }
+            for surface_index, face_id, seed_point in patch_records
+        ]
+        self.hover_face = None
+        self.annotation_mode = "patch"
+        self.message = (
+            f"Loaded {len(self.closed_curves)} 3D curve(s) and "
+            f"{len(self.selected_patches)} seed patch(es). Drag points to refine, or build again."
+        )
+        self._emit_3d_state()
+        self.update()
+        return {
+            "curves": len(self.closed_curves),
+            "patches": len(self.selected_patches),
+            "skipped_curves": skipped_curves,
+            "skipped_patches": skipped_patches,
+        }
+
     def _emit_3d_state(self) -> None:
         self.annotation_changed.emit()
         self.build_ready_changed.emit(self.can_build_3d_surfaces())
@@ -3557,7 +3703,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_template = PathRow("Optional template image volume")
         self.annotate_output = PathRow("Output folder for shell-cut annotations", select_file=False)
         self.annotate_previous_csv = PathRow(
-            "Optional previous shell_cut_annotations.json",
+            "Optional previous 2D shell-cut or 3D annotation JSON",
             file_filter="JSON files (*.json);;All files (*)",
         )
         self.annotate_slice_axis = self._axis_combo()
@@ -3622,8 +3768,8 @@ class LaminarBoundaryWindow(QMainWindow):
             "Load the selected brain region or mask. You can change region/hemisphere and click again to rebuild the 3D shell."
         )
         self.load_button.clicked.connect(self.load_annotation_data)
-        self.load_previous_csv_button = self._make_button("Load Previous Shell Cut JSON", "secondary")
-        self.load_previous_csv_button.setToolTip("Load saved shell-cut annotations into the annotation workspace.")
+        self.load_previous_csv_button = self._make_button("Load Previous Annotation JSON", "secondary")
+        self.load_previous_csv_button.setToolTip("Load saved 2D shell-cut JSON or 3D surface annotation JSON into the annotation workspace.")
         self.load_previous_csv_button.clicked.connect(self.load_previous_annotation_csv)
         self.draw_curve_button = self._make_button("Draw New Closed Curve", "secondary")
         self.draw_curve_button.setToolTip("Start or continue a 3D shell cut curve.")
@@ -3816,7 +3962,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_reference_box = save_box
         self._add_help_row(save_form, "Template image", self.annotate_template, *ANNOTATE_HELP["template"])
         self._add_help_row(save_form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
-        self._add_help_row(save_form, "Previous shell-cut JSON", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
+        self._add_help_row(save_form, "Previous annotation JSON", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
         save_form.addRow("", self.load_previous_csv_button)
         controls_layout.addWidget(save_box)
 
@@ -6910,15 +7056,57 @@ class LaminarBoundaryWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Load mask first",
-                "Load the same target mask before loading previous shell-cut annotations.",
+                "Load the same target mask before loading previous annotations.",
             )
             return
 
         try:
-            json_path = self._require_path("Previous shell-cut JSON", self.annotate_previous_csv.text())
-            self._load_shell_cut_rows_from_json(json_path, show_message=True)
+            json_path = self._require_path("Previous annotation JSON", self.annotate_previous_csv.text())
+            with Path(json_path).open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            schema = data.get("schema") if isinstance(data, dict) else None
+            if schema == "laminar_boundary_builder.surface_3d_annotations.v1":
+                self._load_surface_3d_annotations_from_json(json_path, data, show_message=True)
+            else:
+                self._load_shell_cut_rows_from_json(json_path, show_message=True)
         except Exception as exc:
-            self._show_exception_dialog("Load previous shell-cut JSON failed", exc)
+            self._show_exception_dialog("Load previous annotation JSON failed", exc)
+
+    def _load_surface_3d_annotations_from_json(
+        self,
+        json_path: Path,
+        data: Dict[str, object],
+        show_message: bool = True,
+    ) -> Dict[str, int]:
+        if not hasattr(self, "surface_preview_canvas") or self.surface_preview_canvas.shell_mesh is None:
+            raise ValueError("Load the same source and 3D shell before loading saved 3D annotations.")
+        summary = self.surface_preview_canvas.load_annotation_payload(data)
+        self.annotate_previous_csv.set_text(json_path)
+
+        if not self.annotate_output.text().strip():
+            output_dir = json_path.parent.parent if json_path.parent.name == "build_3d" else json_path.parent
+            self.annotate_output.set_text(output_dir)
+
+        self.enter_annotation_picking_mode()
+        self.on_3d_annotation_changed()
+
+        curves = int(summary.get("curves", 0))
+        patches = int(summary.get("patches", 0))
+        skipped_curves = int(summary.get("skipped_curves", 0))
+        skipped_patches = int(summary.get("skipped_patches", 0))
+        message = f"Loaded {curves} 3D curve(s) and {patches} seed patch(es) from:\n{json_path}"
+        if skipped_curves or skipped_patches:
+            message += f"\n\nSkipped {skipped_curves} curve(s) and {skipped_patches} seed patch(es) that did not match the current shell."
+        source_mask = str(data.get("mask_path") or "").strip()
+        if source_mask and self.annotation_mask_path is not None:
+            current_mask = str(self.annotation_mask_path)
+            if source_mask != current_mask:
+                message += "\n\nNote: this JSON was saved with a different mask path. Use the same mask/source for exact recovery."
+        self.annotate_status.setText(f"Loaded {curves} 3D curve(s). Drag points, adjust names/seeds, then build again.")
+        self.append_log(f"Loaded previous 3D annotation JSON: {json_path}\n")
+        if show_message:
+            QMessageBox.information(self, "3D annotation JSON loaded", message)
+        return summary
 
     def _load_shell_cut_rows_from_json(
         self,
@@ -7905,6 +8093,8 @@ class LaminarBoundaryWindow(QMainWindow):
             surface_text = str(payload.get("surface_name") or "surface")
         annotations_path = payload.get("annotations_path")
         self.surface_preview_canvas.clear_3d_annotations()
+        if annotations_path and hasattr(self, "annotate_previous_csv"):
+            self.annotate_previous_csv.set_text(annotations_path)
         message = f"Built queued surface(s): {surface_text}. 3D annotation cleared for the next queue."
         if annotations_path:
             message += f" Saved markers: {annotations_path}"

@@ -370,6 +370,149 @@ class ShellGLCanvas(QOpenGLWidget):
             "selected_patches": patches,
         }
 
+    @staticmethod
+    def _loaded_curve_vertex_ids(points: object, vertices: np.ndarray) -> List[int]:
+        loaded = np.asarray(points, dtype=float)
+        if loaded.ndim != 2 or loaded.shape[1] != 3:
+            raise ValueError("3D cut curve control_points must be an N x 3 array")
+        snapped: List[int] = []
+        for point in loaded:
+            distances = np.linalg.norm(vertices - point.reshape(1, 3), axis=1)
+            vertex_id = int(np.argmin(distances))
+            if not snapped or snapped[-1] != vertex_id:
+                snapped.append(vertex_id)
+        if len(snapped) >= 2 and snapped[0] != snapped[-1]:
+            snapped.append(snapped[0])
+        return snapped
+
+    def _loaded_seed_face_id(self, seed_point: object, fallback_face_id: int) -> Optional[int]:
+        if self.shell_mesh is None or len(self._faces) == 0:
+            return None
+        vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
+        faces = np.asarray(self._faces, dtype=int)
+        if seed_point is None:
+            return int(fallback_face_id) if 0 <= int(fallback_face_id) < len(faces) else None
+        seed = np.asarray(seed_point, dtype=float).reshape(-1)
+        if seed.shape[0] != 3:
+            return int(fallback_face_id) if 0 <= int(fallback_face_id) < len(faces) else None
+        centers: List[np.ndarray] = []
+        face_ids: List[int] = []
+        for face_id, face in enumerate(faces):
+            valid = [int(value) for value in face if 0 <= int(value) < len(vertices)]
+            if not valid:
+                continue
+            centers.append(vertices[np.asarray(valid, dtype=int)].mean(axis=0))
+            face_ids.append(int(face_id))
+        if not centers:
+            return None
+        center_array = np.vstack(centers)
+        index = int(np.linalg.norm(center_array - seed.reshape(1, 3), axis=1).argmin())
+        return int(face_ids[index])
+
+    def load_annotation_payload(self, payload: Dict[str, object]) -> Dict[str, int]:
+        if self.shell_mesh is None:
+            raise ValueError("Load the target 3D shell before loading saved 3D annotations")
+        if payload.get("schema") != "laminar_boundary_builder.surface_3d_annotations.v1":
+            raise ValueError("Expected surface_3d_annotations JSON from the 3D surface workflow")
+        vertices = np.asarray(self.shell_mesh.vertices, dtype=float)
+        if len(vertices) == 0:
+            raise ValueError("Current 3D shell has no vertices")
+
+        curve_items = payload.get("cut_curves", payload.get("curves", []))
+        if not isinstance(curve_items, list) or not curve_items:
+            raise ValueError("3D annotation JSON has no cut curves")
+
+        closed_curves: List[Dict[str, object]] = []
+        skipped_curves = 0
+        for index, item in enumerate(curve_items):
+            if not isinstance(item, dict):
+                skipped_curves += 1
+                continue
+            points = item.get("control_points", item.get("points"))
+            if points is None:
+                skipped_curves += 1
+                continue
+            try:
+                vertex_ids = self._loaded_curve_vertex_ids(points, vertices)
+            except Exception:
+                skipped_curves += 1
+                continue
+            if len(vertex_ids) < 4 or len(set(vertex_ids[:-1])) < 3:
+                skipped_curves += 1
+                continue
+            closed_curves.append(
+                {
+                    "curve_id": str(item.get("curve_id") or f"cut_curve_{index + 1}"),
+                    "vertices": vertex_ids,
+                }
+            )
+
+        if not closed_curves:
+            raise ValueError("No usable 3D cut curves were loaded")
+
+        patch_items = payload.get("selected_patches", payload.get("seeds", payload.get("patch_seeds", [])))
+        patch_items = patch_items if isinstance(patch_items, list) else []
+        surface_names = [self._default_surface_name(index) for index in range(len(closed_curves))]
+        patch_records: List[Tuple[int, int, np.ndarray]] = []
+        skipped_patches = 0
+        for patch_index, item in enumerate(patch_items):
+            if not isinstance(item, dict):
+                skipped_patches += 1
+                continue
+            try:
+                surface_index = int(item.get("surface_index", patch_index))
+            except Exception:
+                surface_index = patch_index
+            if surface_index < 0 or surface_index >= len(surface_names):
+                skipped_patches += 1
+                continue
+            label = str(item.get("patch_label") or "").strip()
+            if label:
+                surface_names[surface_index] = label
+            try:
+                fallback_face_id = int(item.get("face_id", -1))
+            except Exception:
+                fallback_face_id = -1
+            face_id = self._loaded_seed_face_id(item.get("seed_point"), fallback_face_id)
+            if face_id is None:
+                skipped_patches += 1
+                continue
+            face = np.asarray([value for value in self._faces[int(face_id)] if int(value) >= 0], dtype=int)
+            if len(face) == 0:
+                skipped_patches += 1
+                continue
+            seed_point = vertices[face].mean(axis=0)
+            patch_records.append((surface_index, int(face_id), seed_point))
+
+        self.closed_curves = closed_curves
+        self.active_curve_vertices = []
+        self.surface_names = surface_names
+        self.active_surface_index = 0
+        self.surface_name = surface_names[0]
+        self.selected_patches = [
+            {
+                "patch_label": surface_names[surface_index],
+                "surface_index": int(surface_index),
+                "face_id": int(face_id),
+                "seed_point": seed_point,
+            }
+            for surface_index, face_id, seed_point in patch_records
+        ]
+        self.hover_face = None
+        self.annotation_mode = "patch" if self.closed_curves else "curve"
+        self.message = (
+            f"Loaded {len(self.closed_curves)} 3D curve(s) and "
+            f"{len(self.selected_patches)} seed patch(es). Drag points to refine, or build again."
+        )
+        self._emit_3d_state()
+        self.update()
+        return {
+            "curves": len(self.closed_curves),
+            "patches": len(self.selected_patches),
+            "skipped_curves": skipped_curves,
+            "skipped_patches": skipped_patches,
+        }
+
     def _emit_3d_state(self) -> None:
         self.annotation_changed.emit()
         self.build_ready_changed.emit(self.can_build_3d_surfaces())
