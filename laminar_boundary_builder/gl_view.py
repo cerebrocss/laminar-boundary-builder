@@ -144,6 +144,8 @@ class ShellGLCanvas(QOpenGLWidget):
         self._curve_path_cache: Dict[Tuple[int, ...], List[int]] = {}
         self._screen_cache_key = None
         self._screen_cache = None
+        self._front_hit_cache: Dict[Tuple[int, int, int, int], Optional[Tuple[int, float]]] = {}
+        self._visible_vertex_cache: Dict[int, bool] = {}
         self._viewport_width = 1
         self._viewport_height = 1
 
@@ -173,6 +175,8 @@ class ShellGLCanvas(QOpenGLWidget):
         self.pan_y = 0.0
         self._screen_cache_key = None
         self._screen_cache = None
+        self._front_hit_cache = {}
+        self._visible_vertex_cache = {}
         if shell_mesh is None:
             self._clear_mesh_buffers()
             self.message = "3D shell is not available"
@@ -373,6 +377,8 @@ class ShellGLCanvas(QOpenGLWidget):
         self._curve_edge_set = set()
         self._curve_graph_vertices = np.empty((0, 3), dtype=np.float32)
         self._curve_path_cache = {}
+        self._front_hit_cache = {}
+        self._visible_vertex_cache = {}
         self._mesh_dirty = True
 
     def _prepare_mesh_arrays(self, shell_mesh) -> None:
@@ -429,6 +435,8 @@ class ShellGLCanvas(QOpenGLWidget):
         self._curve_path_cache = {}
         self._screen_cache_key = None
         self._screen_cache = None
+        self._front_hit_cache = {}
+        self._visible_vertex_cache = {}
         self._mesh_dirty = True
         if self._gl_ready:
             self.makeCurrent()
@@ -559,6 +567,8 @@ class ShellGLCanvas(QOpenGLWidget):
         glViewport(0, 0, self._viewport_width, self._viewport_height)
         self._screen_cache_key = None
         self._screen_cache = None
+        self._front_hit_cache = {}
+        self._visible_vertex_cache = {}
 
     def paintGL(self) -> None:
         try:
@@ -883,6 +893,8 @@ class ShellGLCanvas(QOpenGLWidget):
         screen, front_depth, window_depth = self._project_points(self._normalized_vertices)
         self._screen_cache_key = key
         self._screen_cache = (screen, front_depth, window_depth)
+        self._front_hit_cache = {}
+        self._visible_vertex_cache = {}
         return self._screen_cache
 
     def _project_points(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -922,7 +934,7 @@ class ShellGLCanvas(QOpenGLWidget):
             if float(distances[int(index)]) > max_distance:
                 break
             vertex_id = int(ids[int(index)])
-            if self._screen_depth_is_visible(screen[vertex_id], float(front_depth[vertex_id])):
+            if self._vertex_is_visible(vertex_id, screen, front_depth):
                 return int(index)
         return None
 
@@ -937,26 +949,16 @@ class ShellGLCanvas(QOpenGLWidget):
         if len(screen) == 0:
             return None
         click = np.asarray([pos.x(), pos.y()], dtype=np.float32)
-        best_ref: Optional[Tuple[str, int, int]] = None
-        best_distance = float(max_distance)
-        best_depth = -math.inf
+        candidates: List[Tuple[float, float, str, int, int, int]] = []
 
         def consider(kind: str, curve_index: int, point_index: int, vertex_id: int) -> None:
-            nonlocal best_ref, best_distance, best_depth
             if vertex_id < 0 or vertex_id >= len(screen):
                 return
             distance = float(np.linalg.norm(screen[vertex_id] - click))
             vertex_depth = float(front_depth[vertex_id])
-            if distance > best_distance:
+            if distance > float(max_distance):
                 return
-            if not self._screen_depth_is_visible(screen[vertex_id], vertex_depth):
-                return
-            if distance < best_distance - 1e-6 or (
-                abs(distance - best_distance) <= 1e-6 and vertex_depth > best_depth
-            ):
-                best_distance = distance
-                best_depth = vertex_depth
-                best_ref = (kind, int(curve_index), int(point_index))
+            candidates.append((distance, -vertex_depth, kind, int(curve_index), int(point_index), int(vertex_id)))
 
         for point_index, vertex_id in enumerate(self.active_curve_vertices):
             consider("active", -1, point_index, int(vertex_id))
@@ -968,7 +970,10 @@ class ShellGLCanvas(QOpenGLWidget):
             for point_index, vertex_id in enumerate(vertices):
                 consider("closed", curve_index, point_index, int(vertex_id))
 
-        return best_ref
+        for _distance, _negative_depth, kind, curve_index, point_index, vertex_id in sorted(candidates):
+            if self._vertex_is_visible(vertex_id, screen, front_depth):
+                return (kind, int(curve_index), int(point_index))
+        return None
 
     def _front_hit_at_screen_point(
         self,
@@ -979,6 +984,16 @@ class ShellGLCanvas(QOpenGLWidget):
         if len(self._display_triangles) == 0:
             return None
         screen, front_depth, _window_depth = self._screen_cache_data()
+        click = np.asarray(screen_point, dtype=np.float32).reshape(2)
+        cache_key = (
+            int(round(float(click[0]))),
+            int(round(float(click[1]))),
+            int(max_triangles) if max_triangles is not None else -1,
+            int(round(float(margin) * 10.0)),
+        )
+        if cache_key in self._front_hit_cache:
+            return self._front_hit_cache[cache_key]
+
         triangles = self._display_triangles
         face_ids = self._display_face_ids
         if max_triangles is not None and len(triangles) > max_triangles:
@@ -987,7 +1002,6 @@ class ShellGLCanvas(QOpenGLWidget):
             triangles = triangles[sample_ids]
             face_ids = face_ids[sample_ids]
 
-        click = np.asarray(screen_point, dtype=np.float32).reshape(2)
         points = screen[triangles]
         inside_bounds = (
             (points[:, :, 0].min(axis=1) <= click[0] + margin)
@@ -997,6 +1011,7 @@ class ShellGLCanvas(QOpenGLWidget):
         )
         candidates = np.flatnonzero(inside_bounds)
         if len(candidates) == 0:
+            self._front_hit_cache[cache_key] = None
             return None
 
         p0 = points[candidates, 0, :]
@@ -1008,6 +1023,7 @@ class ShellGLCanvas(QOpenGLWidget):
         )
         valid = np.abs(den) > 1e-6
         if not np.any(valid):
+            self._front_hit_cache[cache_key] = None
             return None
 
         candidate_ids = candidates[valid]
@@ -1026,6 +1042,7 @@ class ShellGLCanvas(QOpenGLWidget):
         bary2 = 1.0 - bary0 - bary1
         inside = (bary0 >= -0.02) & (bary1 >= -0.02) & (bary2 >= -0.02)
         if not np.any(inside):
+            self._front_hit_cache[cache_key] = None
             return None
 
         hit_ids = candidate_ids[inside]
@@ -1036,7 +1053,9 @@ class ShellGLCanvas(QOpenGLWidget):
             + bary2[inside] * front_depth[hit_triangles[:, 2]]
         )
         best = int(np.argmax(hit_depth))
-        return int(face_ids[int(hit_ids[best])]), float(hit_depth[best])
+        result = (int(face_ids[int(hit_ids[best])]), float(hit_depth[best]))
+        self._front_hit_cache[cache_key] = result
+        return result
 
     def _screen_depth_is_visible(self, screen_point: np.ndarray, front_depth: float) -> bool:
         hit = self._front_hit_at_screen_point(screen_point)
@@ -1044,6 +1063,18 @@ class ShellGLCanvas(QOpenGLWidget):
             return False
         _face_id, visible_depth = hit
         return float(front_depth) >= float(visible_depth) - self.PICK_VISIBLE_DEPTH_TOLERANCE
+
+    def _vertex_is_visible(self, vertex_id: int, screen: np.ndarray, front_depth: np.ndarray) -> bool:
+        vertex_id = int(vertex_id)
+        cached = self._visible_vertex_cache.get(vertex_id)
+        if cached is not None:
+            return bool(cached)
+        if vertex_id < 0 or vertex_id >= len(screen):
+            self._visible_vertex_cache[vertex_id] = False
+            return False
+        visible = self._screen_depth_is_visible(screen[vertex_id], float(front_depth[vertex_id]))
+        self._visible_vertex_cache[vertex_id] = bool(visible)
+        return bool(visible)
 
     def _nearest_display_face_center_id(self, pos, max_distance: float = 36.0) -> Optional[int]:
         if len(self._display_centers) == 0:
