@@ -67,6 +67,8 @@ class ShellGLCanvas(QOpenGLWidget):
     MAX_EDGE_SEGMENTS = 90000
     MAX_CURVE_PATH_VISITED = 120000
     CLICK_MOVE_TOLERANCE_SQ = 81.0
+    ANNOTATION_POINT_HIT_RADIUS_PX = 22.0
+    ANNOTATION_POINT_PATCH_GUARD_RADIUS_PX = 30.0
     ANNOTATION_LINE_COLOR = "#ff3b30"
     ANNOTATION_POINT_COLOR = "#ffe033"
     ANNOTATION_DEPTH_BIAS = 0.0025
@@ -918,7 +920,13 @@ class ShellGLCanvas(QOpenGLWidget):
         index = int(np.argmin(distances))
         return index if float(distances[index]) <= max_distance else None
 
-    def _nearest_annotation_point_ref(self, pos, max_distance: float = 14.0) -> Optional[Tuple[str, int, int]]:
+    def _nearest_annotation_point_ref(
+        self,
+        pos,
+        max_distance: Optional[float] = None,
+    ) -> Optional[Tuple[str, int, int]]:
+        if max_distance is None:
+            max_distance = self.ANNOTATION_POINT_HIT_RADIUS_PX
         screen, front_depth, _window_depth = self._screen_cache_data()
         if len(screen) == 0:
             return None
@@ -1518,9 +1526,10 @@ class ShellGLCanvas(QOpenGLWidget):
             if point_ref is not None:
                 self._drag_mode = "drag_point"
                 self._drag_point_ref = point_ref
+                self.setCursor(Qt.CrossCursor)
             else:
                 self._drag_mode = "pick"
-        self.setCursor(Qt.ClosedHandCursor)
+                self.setCursor(Qt.ClosedHandCursor)
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
@@ -1528,6 +1537,12 @@ class ShellGLCanvas(QOpenGLWidget):
             return
         if self._drag_pos is None:
             now = time.monotonic()
+            if self._nearest_annotation_point_ref(event.pos()) is not None:
+                self.hover_face = None
+                self.setCursor(Qt.CrossCursor)
+                self.update()
+                return
+            self.unsetCursor()
             if self.annotation_mode == "patch" and now - self._last_hover_at > 0.035:
                 self.hover_face = self._pick_display_face_id(
                     event.pos(),
@@ -1585,7 +1600,18 @@ class ShellGLCanvas(QOpenGLWidget):
                 self._emit_3d_state()
                 self.update()
         elif event.button() == Qt.LeftButton and moved_distance_sq <= self.CLICK_MOVE_TOLERANCE_SQ:
-            self._handle_shell_click(event.pos())
+            if (
+                self.annotation_mode == "patch"
+                and self._nearest_annotation_point_ref(
+                    event.pos(),
+                    max_distance=self.ANNOTATION_POINT_PATCH_GUARD_RADIUS_PX,
+                )
+                is not None
+            ):
+                self.message = "Click and drag the nearby point, or click farther inside the patch to select a seed"
+                self.update()
+            else:
+                self._handle_shell_click(event.pos())
         self._drag_pos = None
         self._press_pos = None
         self._drag_point_ref = None
