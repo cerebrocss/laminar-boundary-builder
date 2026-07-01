@@ -60,17 +60,17 @@ except Exception:
 
 APP_STYLESHEET = """
 QMainWindow, QWidget {
-    background: #edf2f1;
-    color: #263232;
+    background: #f4f0fb;
+    color: #282036;
     font-size: 13px;
 }
 QFrame#header {
-    background: #fbfcfc;
-    border: 1px solid #d7e0dd;
+    background: #fffcff;
+    border: 1px solid #ded2ec;
     border-radius: 8px;
 }
 QLabel#title {
-    color: #172323;
+    color: #20182f;
     font-size: 22px;
     font-weight: 700;
 }
@@ -80,58 +80,58 @@ QLabel#status {
     font-weight: 650;
 }
 QLabel#status[state="ready"] {
-    background: #dff1e9;
-    color: #205247;
+    background: #eee5fb;
+    color: #513476;
 }
 QLabel#status[state="running"] {
-    background: #e7edf9;
-    color: #2c4f84;
+    background: #ebe6ff;
+    color: #4b3d8f;
 }
 QLabel#status[state="failed"] {
-    background: #fae1dc;
+    background: #fde5e3;
     color: #8b2e24;
 }
 QFrame#hint {
-    background: #f4f8f7;
-    border: 1px solid #d4e2de;
+    background: #faf6ff;
+    border: 1px solid #dfd2ef;
     border-radius: 8px;
 }
 QLabel#hintText {
-    color: #35534e;
+    color: #514267;
     font-weight: 650;
 }
 QLabel#sectionNote {
-    color: #5c706c;
+    color: #6b5d78;
     font-size: 12px;
     line-height: 130%;
 }
 QLabel#progressText {
-    background: #eef7f4;
-    border: 1px solid #cddfda;
+    background: #f4effc;
+    border: 1px solid #d8caea;
     border-radius: 7px;
-    color: #2e504a;
+    color: #51406d;
     font-weight: 650;
     padding: 7px 9px;
 }
 QLabel#nextPointText {
-    background: #f7fbfa;
-    border: 1px solid #cddfda;
+    background: #fcf9ff;
+    border: 1px solid #d8caea;
     border-radius: 7px;
-    color: #24413c;
+    color: #3d3155;
     font-weight: 750;
     padding: 7px 9px;
 }
 QLabel#readinessText {
-    background: #f8fbfa;
-    border: 1px solid #ccdcd8;
+    background: #fffbff;
+    border: 1px solid #d8cce8;
     border-radius: 7px;
-    color: #304946;
+    color: #4a3c63;
     padding: 7px 9px;
 }
 QLabel#readinessText[state="ready"] {
-    background: #edf8f1;
-    border-color: #a7cdb7;
-    color: #24563c;
+    background: #f1e9fb;
+    border-color: #b9a2d8;
+    color: #573a7e;
 }
 QLabel#readinessText[state="warning"] {
     background: #fff8e5;
@@ -151,9 +151,9 @@ QLabel#buildReadyText {
     padding: 7px 9px;
 }
 QLabel#buildReadyText[state="ready"] {
-    background: #edf8f1;
-    border-color: #a7cdb7;
-    color: #24563c;
+    background: #f1e9fb;
+    border-color: #b9a2d8;
+    color: #573a7e;
 }
 QLabel#buildReadyText[state="warning"] {
     background: #fff8e5;
@@ -166,21 +166,21 @@ QLabel#buildReadyText[state="missing"] {
     color: #7c342b;
 }
 QLabel#buildResultText {
-    background: #f8fbfa;
-    border: 1px solid #ccdcd8;
+    background: #fffbff;
+    border: 1px solid #d8cce8;
     border-radius: 7px;
-    color: #304946;
+    color: #4a3c63;
     padding: 8px 10px;
 }
 QLabel#buildResultText[state="running"] {
     background: #eef4ff;
-    border-color: #b9cbea;
-    color: #294e82;
+    border-color: #c7b9e8;
+    color: #4b3c82;
 }
 QLabel#buildResultText[state="ready"] {
-    background: #edf8f1;
-    border-color: #a7cdb7;
-    color: #24563c;
+    background: #f1e9fb;
+    border-color: #b9a2d8;
+    color: #573a7e;
 }
 QLabel#buildResultText[state="failed"] {
     background: #fff6f3;
@@ -188,33 +188,33 @@ QLabel#buildResultText[state="failed"] {
     color: #7c342b;
 }
 QFrame#buildProgressCard {
-    background: #f7fbfa;
-    border: 1px solid #ccdcd8;
+    background: #fcf9ff;
+    border: 1px solid #d8cce8;
     border-radius: 7px;
     padding: 8px 10px;
 }
 QFrame#buildProgressCard[state="running"] {
-    background: #eef7f4;
-    border-color: #adcfc6;
+    background: #f4effc;
+    border-color: #bba6db;
 }
 QFrame#buildProgressCard[state="ready"] {
-    background: #edf8f1;
-    border-color: #a7cdb7;
+    background: #f1e9fb;
+    border-color: #b9a2d8;
 }
 QFrame#buildProgressCard[state="failed"] {
     background: #fff6f3;
     border-color: #e2b8af;
 }
 QLabel#buildProgressStage {
-    color: #213d38;
+    color: #3a2f50;
     font-weight: 750;
 }
 QLabel#buildProgressPercent {
-    color: #2f6e62;
+    color: #7552b8;
     font-weight: 800;
 }
 QLabel#buildProgressDetail {
-    color: #54706b;
+    color: #6b5d7d;
     font-size: 12px;
 }
 QFrame#surfaceQueuePanel {
@@ -222,38 +222,38 @@ QFrame#surfaceQueuePanel {
     border: 0;
 }
 QPushButton#surfaceQueueItem {
-    background: #f7fbfa;
-    border: 1px solid #cddfda;
+    background: #fcf9ff;
+    border: 1px solid #d8caea;
     border-radius: 7px;
-    color: #24413c;
+    color: #3d3155;
     font-weight: 700;
     padding: 7px 9px;
     text-align: left;
 }
 QPushButton#surfaceQueueItem[active="true"] {
-    background: #e5f5ef;
-    border-color: #7fb8a7;
-    color: #123e35;
+    background: #f0e8fb;
+    border-color: #a889d2;
+    color: #34234f;
 }
 QPushButton#surfaceQueueItem[seeded="false"] {
     border-color: #dfc77b;
 }
 QLabel#surfaceQueueEmpty {
-    background: #f8fbfa;
-    border: 1px dashed #cddfda;
+    background: #fffbff;
+    border: 1px dashed #d8caea;
     border-radius: 7px;
-    color: #60736f;
+    color: #786a84;
     padding: 7px 9px;
 }
 QProgressBar#buildProgressBar {
-    background: #dbe8e5;
+    background: #e5ddef;
     border: 0;
     border-radius: 4px;
     min-height: 8px;
     max-height: 8px;
 }
 QProgressBar#buildProgressBar::chunk {
-    background: #2f6e62;
+    background: #7552b8;
     border-radius: 4px;
 }
 QWidget#parameterHelpRow {
@@ -261,9 +261,9 @@ QWidget#parameterHelpRow {
 }
 QToolButton#parameterHelpButton {
     background: transparent;
-    border: 1px solid #b7c9c5;
+    border: 1px solid #c9badf;
     border-radius: 9px;
-    color: #5a6f6b;
+    color: #766783;
     font-weight: 800;
     min-width: 18px;
     max-width: 18px;
@@ -273,31 +273,31 @@ QToolButton#parameterHelpButton {
 }
 QToolButton#parameterHelpButton:hover {
     background: #ffffff;
-    border-color: #7f9f98;
-    color: #2f6e62;
+    border-color: #9b82c7;
+    color: #7552b8;
 }
 QFrame#parameterHelpPopup {
     background: transparent;
     border: 0;
 }
 QFrame#parameterHelpCard {
-    background: #fbfcfc;
-    border: 1px solid #aec8c2;
+    background: #fffcff;
+    border: 1px solid #c6b3df;
     border-radius: 8px;
 }
 QLabel#parameterHelpTitle {
-    color: #1f3431;
+    color: #35294a;
     font-weight: 750;
 }
 QLabel#parameterHelpBody {
-    color: #344847;
+    color: #4d405f;
     line-height: 135%;
 }
 QPushButton#settingsPeek {
-    border: 1px solid #b7c9c5;
+    border: 1px solid #c9badf;
     border-radius: 8px;
-    background: #fbfcfc;
-    color: #2f6e62;
+    background: #fffcff;
+    color: #7552b8;
     font-size: 18px;
     font-weight: 800;
     min-width: 24px;
@@ -305,19 +305,19 @@ QPushButton#settingsPeek {
     padding: 8px 0;
 }
 QPushButton#settingsPeek:hover {
-    background: #edf7f4;
-    border-color: #80a79f;
+    background: #f4edfc;
+    border-color: #a78bd0;
 }
 QWidget:disabled, QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
-    color: #7f8f8b;
+    color: #8a7d95;
 }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
-    background: #f2f5f4;
-    border-color: #d3ddda;
+    background: #f6f1fb;
+    border-color: #ded2ea;
 }
 QGroupBox {
-    background: #fbfcfc;
-    border: 1px solid #d7e0dd;
+    background: #fffcff;
+    border: 1px solid #ded2ec;
     border-radius: 8px;
     margin-top: 12px;
     padding: 14px 12px 12px 12px;
@@ -327,10 +327,10 @@ QGroupBox::title {
     subcontrol-origin: margin;
     left: 12px;
     padding: 0 5px;
-    color: #2e4744;
+    color: #4a3b61;
 }
 QLabel {
-    color: #344847;
+    color: #4d405f;
     background: transparent;
 }
 QCheckBox {
@@ -338,14 +338,14 @@ QCheckBox {
 }
 QLineEdit, QComboBox, QSpinBox, QTextEdit {
     background: #ffffff;
-    border: 1px solid #b9cbc7;
+    border: 1px solid #cbbcdf;
     border-radius: 7px;
     padding: 5px 9px;
     min-height: 24px;
-    selection-background-color: #5e8f83;
+    selection-background-color: #8b6dcc;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {
-    border: 1px solid #32786b;
+    border: 1px solid #7350b4;
     background: #ffffff;
 }
 QComboBox {
@@ -366,11 +366,11 @@ QComboBox::down-arrow {
 }
 QComboBox QAbstractItemView {
     background: #ffffff;
-    border: 1px solid #b9cbc7;
+    border: 1px solid #cbbcdf;
     border-radius: 7px;
     padding: 4px;
-    selection-background-color: #dcece8;
-    selection-color: #1e3330;
+    selection-background-color: #efe8fa;
+    selection-color: #332747;
     outline: 0;
 }
 QSpinBox {
@@ -380,37 +380,37 @@ QTextEdit {
     font-family: Menlo, Consolas, monospace;
 }
 QPushButton {
-    border: 1px solid #b9c8c4;
+    border: 1px solid #cbbddc;
     border-radius: 6px;
     padding: 6px 12px;
     min-height: 20px;
-    background: #f6f8f7;
-    color: #263635;
+    background: #fbf8ff;
+    color: #342842;
     font-weight: 600;
 }
 QPushButton:hover {
-    background: #edf4f2;
-    border-color: #8fb0a8;
+    background: #f3eefb;
+    border-color: #a98dcc;
 }
 QPushButton:pressed {
-    background: #dfe9e6;
+    background: #e7def2;
 }
 QPushButton:disabled, QPushButton[role="primary"]:disabled, QPushButton[role="secondary"]:disabled {
-    background: #e5ebe9;
-    border-color: #cbd6d3;
-    color: #879894;
+    background: #ece6f2;
+    border-color: #d8cede;
+    color: #94899e;
 }
 QPushButton[role="primary"] {
-    background: #2f6e62;
-    border-color: #2f6e62;
+    background: #7552b8;
+    border-color: #7552b8;
     color: white;
 }
 QPushButton[role="primary"]:hover {
-    background: #285f55;
+    background: #6442a3;
 }
 QPushButton[role="secondary"] {
-    background: #eef4f2;
-    color: #2f504a;
+    background: #f4effb;
+    color: #4e3d69;
 }
 QPushButton[role="danger"] {
     background: #fbefec;
@@ -420,17 +420,17 @@ QPushButton[role="danger"] {
 QPushButton[role="browse"] {
     padding-left: 0;
     padding-right: 0;
-    background: #eef4f2;
-    color: #1f3532;
+    background: #f4effb;
+    color: #3a2e50;
     font-weight: 800;
 }
 QTabWidget::pane {
     border: 0;
 }
 QTabBar::tab {
-    background: #dde8e5;
-    color: #465b58;
-    border: 1px solid #c9d6d3;
+    background: #e7dff0;
+    color: #655974;
+    border: 1px solid #d6cae4;
     border-bottom: 0;
     border-top-left-radius: 7px;
     border-top-right-radius: 7px;
@@ -439,13 +439,13 @@ QTabBar::tab {
     font-weight: 650;
 }
 QTabBar::tab:selected {
-    background: #fbfcfc;
-    color: #1f3532;
+    background: #fffcff;
+    color: #3a2e50;
 }
 QScrollArea {
-    border: 1px solid #d7e0dd;
+    border: 1px solid #ded2ec;
     border-radius: 8px;
-    background: #fbfcfc;
+    background: #fffcff;
 }
 QScrollArea#sideScroll {
     border: 0;
@@ -456,20 +456,20 @@ QScrollArea#buildScroll {
     background: transparent;
 }
 QScrollBar:vertical {
-    background: #eef5f3;
+    background: #f3eef9;
     width: 9px;
     margin: 0;
     border: 0;
     border-radius: 5px;
 }
 QScrollBar::handle:vertical {
-    background: #b7cbc5;
+    background: #c9b9df;
     border-radius: 5px;
     min-height: 36px;
     margin: 2px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #8fb0a8;
+    background: #a98dcc;
 }
 QScrollBar::add-line:vertical,
 QScrollBar::sub-line:vertical {
@@ -482,20 +482,20 @@ QScrollBar::sub-page:vertical {
     background: transparent;
 }
 QScrollBar:horizontal {
-    background: #eef5f3;
+    background: #f3eef9;
     height: 9px;
     margin: 0;
     border: 0;
     border-radius: 5px;
 }
 QScrollBar::handle:horizontal {
-    background: #b7cbc5;
+    background: #c9b9df;
     border-radius: 5px;
     min-width: 36px;
     margin: 2px;
 }
 QScrollBar::handle:horizontal:hover {
-    background: #8fb0a8;
+    background: #a98dcc;
 }
 QScrollBar::add-line:horizontal,
 QScrollBar::sub-line:horizontal {
@@ -509,12 +509,12 @@ QScrollBar::sub-page:horizontal {
 }
 QSlider::groove:horizontal {
     height: 6px;
-    background: #d4e0dd;
+    background: #ded2ea;
     border-radius: 3px;
 }
 QSlider::handle:horizontal {
-    background: #2f6e62;
-    border: 2px solid #edf7f4;
+    background: #7552b8;
+    border: 2px solid #f4edfc;
     width: 15px;
     margin: -6px 0;
     border-radius: 9px;
@@ -525,17 +525,17 @@ QCheckBox {
 QCheckBox::indicator {
     width: 15px;
     height: 15px;
-    border: 1px solid #b7c9c5;
+    border: 1px solid #c9badf;
     border-radius: 4px;
     background: #ffffff;
 }
 QCheckBox::indicator:hover {
-    border-color: #6f9b92;
-    background: #f2f8f6;
+    border-color: #9b7ec5;
+    background: #f8f4ff;
 }
 QCheckBox::indicator:checked {
-    background: #2f6e62;
-    border-color: #2f6e62;
+    background: #7552b8;
+    border-color: #7552b8;
 }
 """
 
@@ -594,15 +594,15 @@ ANNOTATE_HELP = {
     ),
     "output": (
         "Output folder",
-        "Purpose: choose where shell-cut annotations and build inputs will be saved.\n"
-        "Effect: Save Shell Cut And Review Build writes shell_cut_annotations.json plus a derived build CSV.\n"
+        "Purpose: choose where 3D surface markers and build outputs will be saved.\n"
+        "Effect: Build Queued 3D Surfaces writes the surface OBJ files, project_config.json, and editable marker JSON.\n"
         "Recommended: choose a project-specific folder so the annotation files are easy to find later.",
     ),
     "previous_csv": (
         "Previous annotation JSON",
-        "Purpose: reload saved annotations into the annotation workspace.\n"
-        "Effect: shell_cut_annotations.json restores 2D shell-cut slices; surface_3d_annotations_*.json restores 3D curves, names, and seed patches for direct editing.\n"
-        "Recommended: load the same mask/source first, then load the previous JSON and revise only the bad markers.",
+        "Purpose: reload saved 3D surface markers into the annotation workspace.\n"
+        "Effect: surface_3d_annotations_*.json restores 3D curves, surface names, and seed patches for direct editing.\n"
+        "Recommended: load the same mask/source first, then load the previous 3D JSON and revise only the bad markers.",
     ),
     "slice_axis": (
         "Slice axis",
@@ -635,10 +635,10 @@ ANNOTATE_HELP = {
         "Recommended: use contour 0 when only one contour is present. Switch if the highlighted contour is not your target boundary.",
     ),
     "pick_mode": (
-        "Shell cut points",
-        "Purpose: clicks edit shell-cut boundary points only.\n"
-        "Effect: Shell Cut Boundary stores outer_cut_A/B and inner_cut_A/B in shell_cut_annotations.json.\n"
-        "Recommended: annotate sparse smooth regions and add more slices near sudden shape changes.",
+        "3D surface curve",
+        "Purpose: clicks add or adjust curve points directly on the shell.\n"
+        "Effect: each closed curve creates a queued surface; seed patches decide which shell patch belongs to that surface.\n"
+        "Recommended: draw curves on the real 3D boundary you want to cut, then name and build each queued surface.",
     ),
     "outer_path": (
         "Outer arc path",
@@ -662,16 +662,16 @@ BUILD_HELP = {
         "Recommended: use the mask that was prepared by the Annotate step.",
     ),
     "manual_csv": (
-        "Derived build CSV",
-        "Purpose: an internal CSV derived from shell-cut annotations.\n"
-        "Effect: the current build pipeline uses these derived rows to prepare propagated boundary curves.\n"
-        "Recommended: use the file created by Save Shell Cut And Review Build.",
+        "Retired 2D build CSV",
+        "Purpose: legacy 2D slice input kept only for old project detection.\n"
+        "Effect: current surface builds do not use this file.\n"
+        "Recommended: use 3D annotation JSON and project_config.json instead.",
     ),
     "boundaries_json": (
-        "Boundary JSON",
-        "Purpose: saved propagated outer, inner, and lateral curves from Extract Surfaces.\n"
-        "Effect: Compute Laminar Depth Volume can reuse this file later without repeating annotation.\n"
-        "Recommended: keep the default boundary_annotations.json from the surface build folder.",
+        "Retired 2D boundary JSON",
+        "Purpose: legacy 2D output kept only for old project detection.\n"
+        "Effect: current depth builds read outer/inner OBJ surfaces from project_config.json.\n"
+        "Recommended: build 3D surfaces named outer and inner, then compute depth.",
     ),
     "output": (
         "Output folder",
@@ -730,8 +730,8 @@ BUILD_HELP = {
     "depth_method": (
         "Depth method",
         "Purpose: choose how laminar depth is computed between outer and inner boundaries.\n"
-        "Effect: surfaces only skips slow volume/depth outputs; laplace is smoother but slower; distance is faster.\n"
-        "Recommended: surfaces only for the first automatic build; auto only when depth volume is needed.",
+        "Effect: auto chooses the safer available solver; laplace is smoother but slower; distance is faster.\n"
+        "Recommended: use auto unless you need to force a specific method.",
     ),
     "volume_format": (
         "Volume format",
@@ -924,7 +924,7 @@ class ReviewRepairRequest:
 class PreviousProjectPaths:
     project_dir: Path
     mask_path: Path
-    manual_csv: Path
+    manual_csv: Optional[Path]
     build_output_dir: Path
 
 
@@ -1103,8 +1103,8 @@ class CleanComboBox(QComboBox):
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         focused = self.hasFocus()
         hovered = self.underMouse()
-        border = QColor("#32786b" if focused else "#abc0bc")
-        button_bg = QColor("#e8f2ef" if hovered else "#f1f7f5")
+        border = QColor("#7350b4" if focused else "#c7b8dd")
+        button_bg = QColor("#f0e8fa" if hovered else "#faf6ff")
 
         painter.setBrush(QColor("#ffffff"))
         painter.setPen(QPen(border, 1.0))
@@ -1114,12 +1114,12 @@ class CleanComboBox(QComboBox):
         painter.setPen(Qt.NoPen)
         painter.setBrush(button_bg)
         painter.drawRect(button_rect.adjusted(0, 1, 0, -1))
-        painter.setPen(QPen(QColor("#d2e0dc"), 1.0))
+        painter.setPen(QPen(QColor("#ddd1ec"), 1.0))
         painter.drawLine(button_rect.topLeft(), button_rect.bottomLeft())
 
         text_rect = rect.adjusted(9, 0, -39, 0)
         text = painter.fontMetrics().elidedText(self.currentText(), Qt.ElideRight, int(text_rect.width()))
-        painter.setPen(QColor("#233534" if self.currentText() else "#8a9895"))
+        painter.setPen(QColor("#342842" if self.currentText() else "#94899e"))
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
 
         center = button_rect.center()
@@ -1131,7 +1131,7 @@ class CleanComboBox(QComboBox):
             ]
         )
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#486762"))
+        painter.setBrush(QColor("#715d8d"))
         painter.drawPolygon(arrow)
 
 
@@ -1657,17 +1657,17 @@ class SliceCanvas(QWidget):
         rect_width = min(max(340, metrics.horizontalAdvance(text) + 24), max(120, self.width() - 20))
         label_rect = QRectF(10, self.height() - 42, rect_width, 30)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(18, 24, 23, 210))
+        painter.setBrush(QColor(24, 18, 34, 210))
         painter.drawRoundedRect(label_rect, 8, 8)
-        painter.setPen(QColor("#e8eeee"))
+        painter.setPen(QColor("#f0eafa"))
         painter.drawText(label_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, text)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#121817"))
+        painter.fillRect(self.rect(), QColor("#171225"))
         if self.image is None:
-            painter.setPen(QColor("#d4dddd"))
+            painter.setPen(QColor("#e5def1"))
             painter.drawText(self.rect(), Qt.AlignCenter, "No mask loaded")
             return
 
@@ -1728,9 +1728,9 @@ class SliceCanvas(QWidget):
                 label = "All four points set. Enter = accept + next"
         label_rect = QRectF(10, 10, max(260, len(label) * 8), 30)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(18, 24, 23, 205))
+        painter.setBrush(QColor(24, 18, 34, 205))
         painter.drawRoundedRect(label_rect, 8, 8)
-        painter.setPen(QColor("#e8eeee"))
+        painter.setPen(QColor("#f0eafa"))
         painter.drawText(label_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, label)
 
         if self.picking_enabled and self.show_shortcuts:
@@ -1742,9 +1742,9 @@ class SliceCanvas(QWidget):
             keys_width = min(max(560, metrics.horizontalAdvance(keys) + 24), max(120, self.width() - 20))
             keys_rect = QRectF(10, 46, keys_width, 26)
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(18, 24, 23, 135))
+            painter.setBrush(QColor(24, 18, 34, 135))
             painter.drawRoundedRect(keys_rect, 8, 8)
-            painter.setPen(QColor("#cbd9d6"))
+            painter.setPen(QColor("#d9cfe8"))
             painter.drawText(keys_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, keys)
 
         if self.progress_text:
@@ -1757,9 +1757,9 @@ class SliceCanvas(QWidget):
                 progress_top = 82 if self.picking_enabled and self.show_shortcuts else 46
                 progress_rect = QRectF(10, progress_top, rect_width, rect_height)
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(18, 24, 23, 150))
+                painter.setBrush(QColor(24, 18, 34, 150))
                 painter.drawRoundedRect(progress_rect, 8, 8)
-                painter.setPen(QColor("#e8eeee"))
+                painter.setPen(QColor("#f0eafa"))
                 y = progress_rect.top() + 21
                 for line in lines:
                     painter.drawText(QPointF(progress_rect.left() + 10, y), line)
@@ -2094,8 +2094,8 @@ class SurfacePreviewCanvas(QWidget):
     def _draw_reference_structure(self, painter: QPainter, transform) -> None:
         if not self.reference_contours:
             return
-        outline_color = QColor(150, 178, 170, 95)
-        connector_color = QColor(150, 178, 170, 45)
+        outline_color = QColor(170, 145, 205, 95)
+        connector_color = QColor(170, 145, 205, 45)
         for contour in self.reference_contours:
             self._draw_volume_polyline(
                 painter,
@@ -2132,25 +2132,25 @@ class SurfacePreviewCanvas(QWidget):
         rect_width = min(max(260, metrics.horizontalAdvance(text) + 24), max(120, self.width() - 20))
         label_rect = QRectF(10, top, rect_width, 30)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(18, 24, 23, 215))
+        painter.setBrush(QColor(24, 18, 34, 215))
         painter.drawRoundedRect(label_rect, 8, 8)
-        painter.setPen(QColor("#e8eeee"))
+        painter.setPen(QColor("#f0eafa"))
         painter.drawText(label_rect.adjusted(10, 0, 0, 0), Qt.AlignVCenter, text)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#101817"))
+        painter.fillRect(self.rect(), QColor("#151020"))
 
         boundaries = self._combined_boundaries()
         if not boundaries and not self.reference_contours:
-            painter.setPen(QColor("#d4dddd"))
+            painter.setPen(QColor("#e5def1"))
             painter.drawText(self.rect(), Qt.AlignCenter, self.message)
             return
 
         points = self._all_points(boundaries)
         if len(points) == 0:
-            painter.setPen(QColor("#d4dddd"))
+            painter.setPen(QColor("#e5def1"))
             painter.drawText(self.rect(), Qt.AlignCenter, self.message)
             return
 
@@ -2827,7 +2827,7 @@ class SurfacePreviewCanvas(QWidget):
         painter.setPen(pen)
         for left, right in zip(points[:-1], points[1:]):
             painter.drawLine(left, right)
-        painter.setPen(QPen(QColor("#101817"), 1.0))
+        painter.setPen(QPen(QColor("#151020"), 1.0))
         painter.setBrush(color)
         for point in points:
             painter.drawEllipse(point, 4.5, 4.5)
@@ -2835,17 +2835,17 @@ class SurfacePreviewCanvas(QWidget):
     def paintEvent(self, event) -> None:
         if self.shell_mesh is None:
             painter = QPainter(self)
-            painter.fillRect(self.rect(), QColor("#101817"))
-            painter.setPen(QColor("#d4dddd"))
+            painter.fillRect(self.rect(), QColor("#151020"))
+            painter.setPen(QColor("#e5def1"))
             painter.drawText(self.rect(), Qt.AlignCenter, self.message)
             return
         np = _numpy()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#101817"))
+        painter.fillRect(self.rect(), QColor("#151020"))
         projection = self._3d_projection()
         if projection is None:
-            painter.setPen(QColor("#d4dddd"))
+            painter.setPen(QColor("#e5def1"))
             painter.drawText(self.rect(), Qt.AlignCenter, self.message)
             return
         screen, depth = projection
@@ -2867,15 +2867,15 @@ class SurfacePreviewCanvas(QWidget):
             polygon = QPolygonF([QPointF(float(screen[i, 0]), float(screen[i, 1])) for i in face])
             if face_id == self.hover_face:
                 painter.setPen(QPen(QColor("#ffffff"), 1.2))
-                painter.setBrush(QColor(85, 180, 145, 165))
+                painter.setBrush(QColor(150, 120, 210, 165))
             elif face_id in selected_faces:
                 painter.setPen(QPen(QColor("#f5c84c"), 1.1))
                 painter.setBrush(QColor(245, 200, 76, 145))
             else:
                 normalized_depth = (float(face_depth[face_id]) - depth_min) / depth_span
                 shade = int(92 + normalized_depth * 110)
-                painter.setPen(QPen(QColor(190, 230, 220, 45), 0.5))
-                painter.setBrush(QColor(shade, min(255, shade + 34), min(255, shade + 25), 138))
+                painter.setPen(QPen(QColor(205, 185, 230, 55), 0.5))
+                painter.setBrush(QColor(min(255, shade + 20), min(255, shade + 10), min(255, shade + 42), 138))
             painter.drawPolygon(polygon)
 
         if self._draw_vertex_ids is not None and len(self._draw_vertex_ids):
@@ -2883,7 +2883,7 @@ class SurfacePreviewCanvas(QWidget):
             max_points = 7000
             if len(vertex_ids) > max_points:
                 vertex_ids = vertex_ids[:: int(math.ceil(len(vertex_ids) / max_points))]
-            painter.setPen(QPen(QColor(232, 255, 247, 150), 1.8))
+            painter.setPen(QPen(QColor(236, 225, 255, 150), 1.8))
             for vertex_id in vertex_ids:
                 point = screen[int(vertex_id)]
                 painter.drawPoint(QPointF(float(point[0]), float(point[1])))
@@ -3079,8 +3079,6 @@ class LaminarBoundaryWindow(QMainWindow):
         tools_menu = self.menuBar().addMenu("Tools")
         open_project_action = tools_menu.addAction("Open Previous Project")
         open_project_action.triggered.connect(lambda _checked=False: self.open_previous_project())
-        demo_action = tools_menu.addAction("Run Demo Test")
-        demo_action.triggered.connect(lambda _checked=False: self.show_demo_dialog())
 
         log_menu = self.menuBar().addMenu("Log")
         view_action = log_menu.addAction("View Current Log")
@@ -3091,24 +3089,11 @@ class LaminarBoundaryWindow(QMainWindow):
         clear_action.triggered.connect(lambda _checked=False: self.clear_current_log())
 
     def show_demo_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Demo Test")
-        dialog.resize(900, 360)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
-        layout.addWidget(self._make_demo_tab(), 1)
-
-        close_row = QHBoxLayout()
-        close_row.setContentsMargins(0, 0, 0, 0)
-        close_row.addStretch(1)
-        close_button = self._make_button("Close", "secondary")
-        close_button.clicked.connect(dialog.accept)
-        close_row.addWidget(close_button)
-        layout.addLayout(close_row)
-
-        dialog.exec_()
+        QMessageBox.information(
+            self,
+            "Demo removed",
+            "The old demo used the removed 2D slice pipeline. Current testing should use a real 3D shell build and the saved project_config.json.",
+        )
 
     def _read_current_log(self) -> str:
         try:
@@ -3191,7 +3176,7 @@ class LaminarBoundaryWindow(QMainWindow):
             if not text:
                 continue
             path = Path(text).expanduser()
-            if path.name.lower() == "build" or path.name.lower().startswith("build_review_round"):
+            if path.name.lower() in ("build", "build_3d") or path.name.lower().startswith("build_review_round"):
                 path = path.parent
             if path.exists():
                 return path
@@ -3226,7 +3211,7 @@ class LaminarBoundaryWindow(QMainWindow):
     def _normalize_previous_project_selection(cls, selected_dir: Path) -> tuple[Path, Optional[Path]]:
         selected_dir = Path(selected_dir).expanduser()
         name = selected_dir.name.lower()
-        if name == "build" or name.startswith("build_review_round"):
+        if name in ("build", "build_3d") or name.startswith("build_review_round"):
             return selected_dir.parent, selected_dir
         return selected_dir, None
 
@@ -3286,14 +3271,10 @@ class LaminarBoundaryWindow(QMainWindow):
         if preferred_build_dir is not None and preferred_build_dir.exists():
             return preferred_build_dir
 
-        review_dirs = [
-            path
-            for path in project_dir.glob("build_review_round*")
-            if path.is_dir()
-        ]
-        if review_dirs:
-            return sorted(review_dirs, key=cls._previous_project_round_key)[-1]
-        return project_dir / "build"
+        build_3d = project_dir / "build_3d"
+        if (build_3d / "project_config.json").exists():
+            return build_3d
+        return build_3d
 
     @classmethod
     def _resolve_previous_project_paths(cls, selected_dir: Path) -> PreviousProjectPaths:
@@ -3309,11 +3290,6 @@ class LaminarBoundaryWindow(QMainWindow):
             )
 
         manual_csv = cls._find_previous_project_manual_csv(project_dir)
-        if manual_csv is None:
-            raise ValueError(
-                "Could not find a saved manual landmark CSV.\n\n"
-                "Expected manual_landmarks_interactive.csv or manual_landmarks_review_roundN.csv."
-            )
 
         build_output_dir = cls._find_previous_project_build_dir(project_dir, preferred_build_dir)
         return PreviousProjectPaths(
@@ -3340,29 +3316,27 @@ class LaminarBoundaryWindow(QMainWindow):
     def _restore_previous_project(self, paths: PreviousProjectPaths) -> None:
         self.annotate_output.set_text(paths.project_dir)
         self.annotate_mask.set_text(paths.mask_path)
-        self.annotate_previous_csv.set_text(paths.manual_csv)
+        if paths.manual_csv is not None:
+            self.annotate_previous_csv.set_text(paths.manual_csv)
         self.build_mask.set_text(paths.mask_path)
-        self.build_manual.set_text(paths.manual_csv)
+        self.build_manual.set_text(paths.manual_csv or "")
         self.build_output.set_text(paths.build_output_dir)
-        self.build_boundaries.set_text(paths.build_output_dir / "boundary_annotations.json")
-        self.depth_method.setCurrentText("surfaces only")
+        self.build_boundaries.set_text("")
+        self.depth_method.setCurrentText("auto")
         self._update_annotation_readiness()
         self._update_build_readiness()
         self.append_log(
             "Opened previous project.\n"
             f"project_dir: {paths.project_dir}\n"
             f"mask: {paths.mask_path}\n"
-            f"manual_csv: {paths.manual_csv}\n"
+            f"manual_csv: {paths.manual_csv or 'none'}\n"
             f"build_output: {paths.build_output_dir}\n"
         )
 
-        if paths.build_output_dir.exists():
-            self.review_build_qc_slices()
-            return
-
-        self.pending_previous_csv_load = (paths.mask_path, paths.manual_csv, paths.project_dir)
-        self.tabs.setCurrentIndex(0)
-        if self.annotation_mask_data is not None and self.annotation_mask_path is not None:
+        self.tabs.setCurrentIndex(1 if paths.build_output_dir.exists() else 0)
+        if paths.manual_csv is not None:
+            self.pending_previous_csv_load = (paths.mask_path, paths.manual_csv, paths.project_dir)
+        if paths.manual_csv is not None and self.annotation_mask_data is not None and self.annotation_mask_path is not None:
             try:
                 if self._same_path(self.annotation_mask_path, paths.mask_path):
                     self._finish_pending_previous_csv_after_mask_load(paths.mask_path)
@@ -3678,7 +3652,6 @@ class LaminarBoundaryWindow(QMainWindow):
 
         self._add_annotation_source_section(controls_layout)
         self._add_annotation_reference_section(controls_layout)
-        self._add_annotation_advanced_section(controls_layout)
         self._add_annotation_picking_section(controls_layout, action_row)
         controls_layout.addStretch(1)
         return controls
@@ -3701,9 +3674,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_include_children.setChecked(True)
         self.annotate_mask = PathRow("Optional existing target mask")
         self.annotate_template = PathRow("Optional template image volume")
-        self.annotate_output = PathRow("Output folder for shell-cut annotations", select_file=False)
+        self.annotate_output = PathRow("Output folder for 3D annotations and builds", select_file=False)
         self.annotate_previous_csv = PathRow(
-            "Optional previous 2D shell-cut or 3D annotation JSON",
+            "Optional previous 3D annotation JSON",
             file_filter="JSON files (*.json);;All files (*)",
         )
         self.annotate_slice_axis = self._axis_combo()
@@ -3769,7 +3742,7 @@ class LaminarBoundaryWindow(QMainWindow):
         )
         self.load_button.clicked.connect(self.load_annotation_data)
         self.load_previous_csv_button = self._make_button("Load Previous Annotation JSON", "secondary")
-        self.load_previous_csv_button.setToolTip("Load saved 2D shell-cut JSON or 3D surface annotation JSON into the annotation workspace.")
+        self.load_previous_csv_button.setToolTip("Load saved 3D surface annotation JSON into the annotation workspace.")
         self.load_previous_csv_button.clicked.connect(self.load_previous_annotation_csv)
         self.draw_curve_button = self._make_button("Draw New Closed Curve", "secondary")
         self.draw_curve_button.setToolTip("Start or continue a 3D shell cut curve.")
@@ -3832,8 +3805,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.rebuild_review_button = self._make_button("Rebuild Review Round", "primary")
         self.rebuild_review_button.setToolTip("Save review landmarks and rebuild into a new review output folder.")
         self.rebuild_review_button.clicked.connect(self.rebuild_review_round)
-        self.export_button = self._make_button("Save Shell Cut And Review Build", "secondary")
-        self.export_button.setToolTip("Save accepted shell-cut annotations and switch to the Build settings.")
+        self.export_button = self._make_button("Legacy 2D Export Removed", "secondary")
+        self.export_button.setToolTip("The old 2D slice export has been removed. Use Build Queued 3D Surfaces.")
         self.export_button.clicked.connect(self.export_annotation_csv)
         self.export_button.hide()
         self.export_mask_button = self._make_button("Export Current Mask", "secondary")
@@ -4476,6 +4449,7 @@ class LaminarBoundaryWindow(QMainWindow):
             annotation_output_dir = self._auto_build_output_dir()
             if not self.annotate_output.text().strip():
                 self.annotate_output.set_text(annotation_output_dir)
+            mask_path = self._ensure_persistent_annotation_mask(annotation_output_dir) or self.annotation_mask_path
             surface_queue = self.surface_preview_canvas.surface_queue()
             surface_names = [str(item["name"]) for item in surface_queue]
             build_dir = annotation_output_dir / "build_3d"
@@ -4488,10 +4462,11 @@ class LaminarBoundaryWindow(QMainWindow):
                 annotation_suffix = f"{annotation_suffix}_and_{len(surface_slugs) - 3}_more"
             annotations_path = build_dir / f"surface_3d_annotations_{annotation_suffix or 'surface'}.json"
             self._write_surface_3d_annotations_json(annotations_path)
-            self.build_mask.set_text(self.annotation_mask_path)
+            self.build_mask.set_text(mask_path)
             self.build_output.set_text(build_dir)
+            self.build_boundaries.set_text("")
             self.surface_method.setCurrentText("Shell cut")
-            self.depth_method.setCurrentText("surfaces only")
+            self.depth_method.setCurrentText("auto")
             shell_backend = (
                 getattr(self.surface_preview_canvas.shell_mesh, "backend", None)
                 or self.shell_backend.currentText()
@@ -4508,7 +4483,7 @@ class LaminarBoundaryWindow(QMainWindow):
         def task(progress: Callable[[int, str, str], None]) -> TaskResult:
             core = _core()
             outputs = core.run_3d_shell_patch_pipeline(
-                mask_path=self.annotation_mask_path,
+                mask_path=mask_path,
                 cut_curve_json=annotations_path,
                 output_dir=build_dir,
                 shell_backend=shell_backend,
@@ -5312,48 +5287,15 @@ class LaminarBoundaryWindow(QMainWindow):
         return Path.home() / "Desktop" / "laminar_boundary_builder_output"
 
     def finish_annotation_and_run_build(self) -> None:
-        target_slices = self._target_annotation_slices()
-        missing = [slice_index for slice_index in target_slices if slice_index not in self.shell_cut_rows_by_slice]
-        if missing:
-            self.annotate_slice.setValue(missing[0])
-            self.annotate_status.setText(f"Still missing suggested slice {missing[0]}.")
-            return
-        try:
-            output_dir = self._auto_build_output_dir()
-            if not self.annotate_output.text().strip():
-                self.annotate_output.set_text(output_dir)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            self._sync_derived_annotation_rows_from_shell_cut()
-            csv_path = output_dir / "manual_landmarks_interactive.csv"
-            self._write_annotation_rows_csv(csv_path)
-            shell_cut_path = output_dir / "shell_cut_annotations.json"
-            self._write_shell_cut_annotations_json(shell_cut_path)
-            self._sync_build_from_annotation(csv_path, output_dir)
-            self.annotation_picking_active = False
-            self.annotation_settings_expanded = True
-            self.annotate_settings_button.hide()
-            self._set_annotation_parameter_widgets_enabled(True)
-            self._apply_annotation_settings_panel_state()
-            self.tabs.setCurrentIndex(1)
-            self.append_log(
-                f"Suggested annotation set complete: {len(target_slices)} slices.\n"
-                f"Saved shell-cut annotations: {shell_cut_path}\n"
-                f"Saved derived build CSV: {csv_path}\n"
-                "Build settings are ready for review.\n"
-            )
-            self.append_log(f"Saved shell-cut annotations: {shell_cut_path}\n")
-            reply = QMessageBox.question(
-                self,
-                "Annotation saved",
-                "Suggested annotation set is complete and the Build step is ready.\n\n"
-                "Run surface extraction now?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.Yes:
-                self.run_surface_build()
-        except Exception as exc:
-            self._show_exception_dialog("Auto build failed", exc)
+        self.annotate_status.setText(
+            "The old 2D slice rebuild flow has been removed. Use the 3D shell: close a curve, select its seed patch, then build queued 3D surfaces."
+        )
+        QMessageBox.information(
+            self,
+            "2D slice build removed",
+            "The app now builds surfaces from 3D shell curves and seed patches only.\n\n"
+            "Close a 3D curve, select the surface patch, name the queued surface, then click Build Queued 3D Surfaces.",
+        )
 
     def _go_to_next_annotation_slice(self) -> None:
         current = int(self.annotate_slice.value())
@@ -7068,7 +7010,10 @@ class LaminarBoundaryWindow(QMainWindow):
             if schema == "laminar_boundary_builder.surface_3d_annotations.v1":
                 self._load_surface_3d_annotations_from_json(json_path, data, show_message=True)
             else:
-                self._load_shell_cut_rows_from_json(json_path, show_message=True)
+                raise ValueError(
+                    "This app version no longer loads 2D shell-cut annotations. "
+                    "Load a surface_3d_annotations_*.json file saved by the 3D workflow."
+                )
         except Exception as exc:
             self._show_exception_dialog("Load previous annotation JSON failed", exc)
 
@@ -7204,30 +7149,12 @@ class LaminarBoundaryWindow(QMainWindow):
         return len(loaded_rows), errors
 
     def export_annotation_csv(self) -> None:
-        if not self.shell_cut_rows_by_slice:
-            QMessageBox.warning(self, "No accepted slices", "Accept at least one slice before saving.")
-            return
-        try:
-            output_dir = self._require_path("Output folder", self.annotate_output.text())
-            output_dir.mkdir(parents=True, exist_ok=True)
-            self._sync_derived_annotation_rows_from_shell_cut()
-            csv_path = output_dir / "manual_landmarks_interactive.csv"
-            self._write_annotation_rows_csv(csv_path)
-            shell_cut_path = output_dir / "shell_cut_annotations.json"
-            self._write_shell_cut_annotations_json(shell_cut_path)
-            self._sync_build_from_annotation(csv_path, output_dir)
-            self.tabs.setCurrentIndex(1)
-            QMessageBox.information(
-                self,
-                "Annotations saved",
-                f"Saved shell-cut annotations:\n{shell_cut_path}\n\n"
-                f"Saved derived build CSV:\n{csv_path}\n\n"
-                "Review the Build settings.",
-            )
-            self.append_log(f"Saved shell-cut annotations: {shell_cut_path}\n")
-            self.append_log(f"Saved derived build CSV: {csv_path}\n")
-        except Exception as exc:
-            self._show_exception_dialog("Save failed", exc)
+        QMessageBox.information(
+            self,
+            "2D slice export removed",
+            "The old 2D shell-cut export is no longer part of the app.\n\n"
+            "Use Build Queued 3D Surfaces; it saves the editable 3D marker JSON together with the surface build.",
+        )
 
     def export_current_annotation_mask(self) -> None:
         if self.annotation_mask_data is None or self.annotation_mask_path is None:
@@ -7310,25 +7237,17 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _sync_build_from_annotation(self, csv_path: Path, annotation_output_dir: Path) -> None:
         mask_path = self._ensure_persistent_annotation_mask(annotation_output_dir)
-        self.build_manual.set_text(csv_path)
         self.build_mask.set_text(mask_path or self.annotate_mask.text())
         self.build_template.set_text(self.annotate_template.text())
-        self.build_output.set_text(annotation_output_dir / "build")
-        self.build_boundaries.set_text(annotation_output_dir / "build" / "boundary_annotations.json")
-        self.build_slice_axis.setCurrentText(self.annotate_slice_axis.currentText())
-        self.build_min_area.setValue(self.annotate_min_area.value())
-        self.build_keep_all.setChecked(self.annotate_keep_all.isChecked())
-        if self.shell_cut_rows_by_slice:
-            self.surface_method.setCurrentText("Shell cut")
-        self.depth_method.setCurrentText("surfaces only")
+        self.build_output.set_text(annotation_output_dir / "build_3d")
+        self.depth_method.setCurrentText("auto")
+        self._update_build_readiness()
         self.tabs.setCurrentIndex(1)
 
     def _validate_build_inputs(self, needs_boundaries: bool = False) -> bool:
         missing = []
         if not self.build_mask.text().strip():
             missing.append("Mask")
-        if not self.build_manual.text().strip() and not needs_boundaries:
-            missing.append("Derived build CSV")
         if not self.build_output.text().strip():
             missing.append("Output folder")
         if missing:
@@ -7342,8 +7261,6 @@ class LaminarBoundaryWindow(QMainWindow):
         path_checks = [
             ("Mask", self.build_mask.text()),
         ]
-        if not needs_boundaries:
-            path_checks.append(("Derived build CSV", self.build_manual.text()))
         if self.build_template.text().strip():
             path_checks.append(("Template image", self.build_template.text()))
         if self.build_cell_csv.text().strip():
@@ -7359,12 +7276,13 @@ class LaminarBoundaryWindow(QMainWindow):
                 return False
 
         if needs_boundaries:
-            boundaries_path = self._build_boundaries_path()
-            if not boundaries_path.exists():
+            depth_source, depth_path, depth_detail = self._build_depth_source()
+            if depth_source != "surface_3d":
                 QMessageBox.warning(
                     self,
-                    "Boundary JSON not found",
-                    "Run Extract Surfaces first, or choose an existing boundary_annotations.json.",
+                    "Depth source not found",
+                    "Build 3D surfaces named outer and inner before computing depth.\n\n"
+                    f"{depth_detail}",
                 )
                 return False
         return True
@@ -7374,35 +7292,11 @@ class LaminarBoundaryWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(12)
-
-        settings = QGroupBox("Prepare Annotation Template")
-
-        self.prepare_mask = PathRow("Target mask volume (.nrrd/.npy/.npz)")
-        self.prepare_output = PathRow("Output folder for contour template", select_file=False)
-        self.prepare_slice_axis = self._axis_combo()
-        self.prepare_min_area = self._min_area_spin()
-        self.prepare_manual_every = QSpinBox()
-        self.prepare_manual_every.setRange(1, 500)
-        self.prepare_manual_every.setValue(8)
-        self.prepare_manual_every.setButtonSymbols(QSpinBox.NoButtons)
-        self.prepare_manual_every.setMinimumHeight(28)
-        self.prepare_keep_all = QCheckBox("Keep all contours per slice")
-
-        form = QFormLayout(settings)
-        self._tune_form(form)
-        form.addRow("Mask", self.prepare_mask)
-        form.addRow("Output folder", self.prepare_output)
-        form.addRow("Slice axis", self.prepare_slice_axis)
-        form.addRow("Min contour area", self.prepare_min_area)
-        form.addRow("Manual row interval", self.prepare_manual_every)
-        form.addRow("", self.prepare_keep_all)
-
-        run_button = self._make_button("Prepare Annotation Template", "primary")
-        run_button.clicked.connect(self.run_prepare)
-        run_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-        layout.addWidget(settings)
-        layout.addWidget(run_button)
+        layout.addWidget(
+            self._make_hint(
+                "The old 2D slice template step has been removed. Load a source on Annotate and work directly on the 3D shell."
+            )
+        )
         layout.addStretch(1)
         return tab
 
@@ -7438,17 +7332,17 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _make_build_hint(self) -> QFrame:
         return self._make_hint(
-            "Check Mask, derived build CSV, and Output folder. Extract surfaces first; depth unlocks after Boundary JSON exists."
+            "Build depth from the current 3D outer/inner surface result. Details are tucked away unless you need to inspect files or tune the solver."
         )
 
     def _create_build_input_fields(self) -> None:
         self.build_mask = PathRow("Target mask volume (.nrrd/.npy/.npz)")
         self.build_manual = PathRow(
-            "manual_landmarks_template.csv",
+            "Retired 2D build CSV",
             file_filter="CSV files (*.csv);;All files (*)",
         )
         self.build_boundaries = PathRow(
-            "boundary_annotations.json",
+            "Retired 2D boundary JSON",
             file_filter="JSON files (*.json);;All files (*)",
         )
         self.build_output = PathRow("Output folder for surfaces, volumes, tables, and QC", select_file=False)
@@ -7476,7 +7370,8 @@ class LaminarBoundaryWindow(QMainWindow):
         self.shell_backend.setCurrentText("Voxel")
         self.shell_backend.setMinimumHeight(28)
         self.depth_method = CleanComboBox()
-        self.depth_method.addItems(["surfaces only", "auto", "laplace", "distance"])
+        self.depth_method.addItems(["auto", "laplace", "distance"])
+        self.depth_method.setCurrentText("auto")
         self.depth_method.setMinimumHeight(28)
         self.volume_format = CleanComboBox()
         self.volume_format.addItems(["nrrd", "npy", "nii.gz"])
@@ -7501,27 +7396,52 @@ class LaminarBoundaryWindow(QMainWindow):
         self.build_readiness = QLabel()
         self.build_readiness.setObjectName("buildReadyText")
         self.build_readiness.setWordWrap(True)
+        self.build_source_details = QLabel()
+        self.build_source_details.setObjectName("buildResultText")
+        self.build_source_details.setWordWrap(True)
         self._connect_build_readiness_signals()
 
     def _make_build_required_section(self) -> QGroupBox:
-        required_box, required_form = self._make_form_section("Required Build Inputs")
+        required_box, required_form = self._make_form_section("Depth Build")
         required_form.addRow("Status", self.build_readiness)
         self._add_help_row(required_form, "Mask", self.build_mask, *BUILD_HELP["mask"])
-        self._add_help_row(required_form, "Derived build CSV", self.build_manual, *BUILD_HELP["manual_csv"])
         self._add_help_row(required_form, "Output folder", self.build_output, *BUILD_HELP["output"])
         return required_box
 
     def _connect_build_readiness_signals(self) -> None:
         for path_row in (
             self.build_mask,
-            self.build_manual,
-            self.build_boundaries,
             self.build_output,
             self.build_template,
             self.build_cell_csv,
         ):
             path_row.edit.textChanged.connect(self._update_build_readiness)
         self.build_swc_glob.textChanged.connect(self._update_build_readiness)
+
+    def _build_boundary_json_candidate(self) -> Optional[Path]:
+        return None
+
+    def _build_3d_project_config_candidates(self) -> List[Path]:
+        output_text = self.build_output.text().strip()
+        if not output_text:
+            return []
+        output_dir = Path(output_text).expanduser()
+        return [
+            output_dir / "project_config.json",
+            output_dir / "build_3d" / "project_config.json",
+        ]
+
+    def _build_depth_source(self) -> tuple[str, Optional[Path], str]:
+        for project_config in self._build_3d_project_config_candidates():
+            if not project_config.exists():
+                continue
+            try:
+                _core().resolve_3d_surface_depth_inputs(project_config)
+            except Exception as exc:
+                return "invalid_3d", project_config, str(exc)
+            return "surface_3d", project_config, "3D outer/inner OBJ surfaces"
+
+        return "missing", None, "No 3D project_config.json with outer/inner OBJ surfaces found."
 
     def _update_build_readiness(self, *_args) -> None:
         if not hasattr(self, "build_readiness"):
@@ -7530,18 +7450,12 @@ class LaminarBoundaryWindow(QMainWindow):
         missing = []
         warnings = []
         mask_text = self.build_mask.text().strip()
-        manual_text = self.build_manual.text().strip()
         output_text = self.build_output.text().strip()
 
         if not mask_text:
             missing.append("Mask")
         elif self._resolved_existing_input_path(mask_text) is None:
             missing.append("Mask file")
-
-        if not manual_text:
-            missing.append("Derived build CSV")
-        elif self._resolved_existing_input_path(manual_text) is None:
-            missing.append("Derived build CSV file")
 
         if not output_text:
             missing.append("Output folder")
@@ -7553,36 +7467,47 @@ class LaminarBoundaryWindow(QMainWindow):
             if text and self._resolved_existing_input_path(text) is None:
                 warnings.append(f"{label} file is missing.")
 
-        surface_ready = not missing
-        boundary_text = self.build_boundaries.text().strip()
-        if boundary_text:
-            boundary_path = Path(boundary_text).expanduser()
-        elif output_text:
-            boundary_path = Path(output_text).expanduser() / "boundary_annotations.json"
-        else:
-            boundary_path = None
-        depth_ready = surface_ready and boundary_path is not None and boundary_path.exists()
+        depth_source, depth_path, depth_detail = self._build_depth_source()
+        depth_ready = not missing and depth_source == "surface_3d"
 
         lines = []
-        if not surface_ready:
-            lines.append("Surface build: fill " + ", ".join(missing) + ".")
+        if missing:
+            lines.append("Depth: fill " + ", ".join(missing) + ".")
         elif depth_ready:
-            lines.append("Surface build and depth volume are ready.")
+            lines.append("Depth source: 3D outer/inner surfaces ready.")
+            lines.append("Next: compute laminar depth.")
+        elif depth_source == "invalid_3d":
+            lines.append(f"Depth source: 3D build found but not usable. {depth_detail}")
         else:
-            lines.append("Surface build is ready. Depth unlocks after Boundary JSON exists.")
+            lines.append("Depth source: build 3D surfaces named outer and inner first.")
         lines.extend(warnings)
 
+        detail_lines = []
+        if depth_path is not None:
+            detail_lines.append(f"3D project config: {depth_path}")
+        elif depth_ready:
+            detail_lines.append(f"Depth source: {depth_detail}")
+        else:
+            detail_lines.append(depth_detail)
+        detail_lines.extend(
+            [
+                f"Mask: {mask_text or 'not set'}",
+                f"Output folder: {output_text or 'not set'}",
+                f"Depth method: {self.depth_method.currentText()}",
+                f"Volume format: {self.volume_format.currentText()}",
+            ]
+        )
+
         self.build_readiness.setText("\n".join(lines))
-        state = "ready" if surface_ready and not warnings else "missing" if missing else "warning"
+        if hasattr(self, "build_source_details"):
+            self.build_source_details.setText("\n".join(detail_lines))
+        state = "ready" if depth_ready and not warnings else "missing" if missing else "warning"
         self._set_label_state(self.build_readiness, state)
 
-        if hasattr(self, "surface_button"):
-            self.surface_button.setEnabled(surface_ready)
         if hasattr(self, "depth_button"):
             self.depth_button.setEnabled(depth_ready)
         if hasattr(self, "review_qc_button"):
-            review_ready = surface_ready and bool(output_text) and Path(output_text).expanduser().exists()
-            self.review_qc_button.setEnabled(review_ready)
+            self.review_qc_button.setEnabled(False)
 
     def _make_build_optional_section(self) -> QGroupBox:
         optional_box, optional_form = self._make_form_section(
@@ -7598,34 +7523,24 @@ class LaminarBoundaryWindow(QMainWindow):
 
     def _make_build_advanced_section(self) -> QGroupBox:
         advanced_box, advanced_form = self._make_form_section(
-            "Advanced Build Settings",
+            "Details",
             checkable=True,
             checked=False,
         )
-        self._add_help_row(advanced_form, "Boundary JSON", self.build_boundaries, *BUILD_HELP["boundaries_json"])
-        self._add_help_row(advanced_form, "Slice axis", self.build_slice_axis, *BUILD_HELP["slice_axis"])
-        self._add_help_row(advanced_form, "Min contour area", self.build_min_area, *BUILD_HELP["min_area"])
-        self._add_help_row(advanced_form, "Resample points", self.resample_points, *BUILD_HELP["resample_points"])
-        self._add_help_row(advanced_form, "Surface method", self.surface_method, *BUILD_HELP["surface_method"])
-        self._add_help_row(advanced_form, "Shell backend", self.shell_backend, *BUILD_HELP["shell_backend"])
+        advanced_form.addRow("Detected files", self.build_source_details)
         self._add_help_row(advanced_form, "Depth method", self.depth_method, *BUILD_HELP["depth_method"])
         self._add_help_row(advanced_form, "Volume format", self.volume_format, *BUILD_HELP["volume_format"])
         self._add_help_row(advanced_form, "Max Laplace voxels", self.max_laplace_voxels, *BUILD_HELP["max_laplace_voxels"])
         self._add_help_row(advanced_form, "Boundary dilation", self.boundary_dilation, *BUILD_HELP["boundary_dilation"])
-        self._add_help_row(advanced_form, "QC interval", self.qc_every, *BUILD_HELP["qc_every"])
-        self._add_help_row(advanced_form, "", self.build_keep_all, *BUILD_HELP["keep_all"])
         self._set_collapsible_form_visible(advanced_box, advanced_form, False)
         return advanced_box
 
     def _make_build_button_row(self) -> QHBoxLayout:
-        self.surface_button = self._make_button("Extract Surfaces", "primary")
-        self.surface_button.clicked.connect(self.run_surface_build)
-        self.depth_button = self._make_button("Compute Laminar Depth Volume", "secondary")
+        self.depth_button = self._make_button("Compute Laminar Depth", "primary")
         self.depth_button.clicked.connect(self.run_depth_build)
         button_row = QHBoxLayout()
         button_row.setContentsMargins(0, 0, 0, 0)
         button_row.setSpacing(8)
-        button_row.addWidget(self.surface_button)
         button_row.addWidget(self.depth_button)
         button_row.addStretch(1)
         self._update_build_readiness()
@@ -7642,16 +7557,16 @@ class LaminarBoundaryWindow(QMainWindow):
         self.open_build_output_button = self._make_button("Open Output Folder", "secondary")
         self.open_build_output_button.clicked.connect(self.open_build_output_folder)
         self.open_build_output_button.setEnabled(False)
-        self.review_qc_button = self._make_button("Review And Repair Build", "secondary")
+        self.review_qc_button = self._make_button("Legacy 2D Review Removed", "secondary")
         self.review_qc_button.clicked.connect(self.review_build_qc_slices)
         self.review_qc_button.setEnabled(False)
+        self.review_qc_button.hide()
 
         result_buttons = QWidget()
         button_layout = QHBoxLayout(result_buttons)
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(8)
         button_layout.addWidget(self.open_build_output_button)
-        button_layout.addWidget(self.review_qc_button)
         button_layout.addStretch(1)
 
         result_form.addRow("Progress", self.build_progress)
@@ -7676,108 +7591,19 @@ class LaminarBoundaryWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_dir)))
 
     def review_build_qc_slices(self) -> None:
-        output_text = self.build_output.text().strip()
-        if not output_text:
-            QMessageBox.information(self, "No build output", "Run a build before starting review.")
-            return
-        build_output_dir = Path(output_text).expanduser()
-        if not build_output_dir.exists():
-            QMessageBox.information(
-                self,
-                "Build output missing",
-                f"Folder does not exist yet:\n{build_output_dir}",
-            )
-            return
-
-        mask_path = self._resolved_existing_input_path(self.build_mask.text())
-        manual_csv = self._resolved_existing_input_path(self.build_manual.text())
-        if mask_path is None or manual_csv is None:
-            QMessageBox.warning(
-                self,
-                "Review inputs missing",
-                "Build review needs an existing Mask and derived build CSV.",
-            )
-            return
-
-        queue_slices = self._review_queue_from_build(build_output_dir)
-        if queue_slices:
-            self.append_log(
-                "Review & Repair queue uses QC targets: "
-                + ", ".join(str(value) for value in queue_slices)
-                + "\n"
-            )
-        else:
-            queue_slices = self._manual_slices_from_csv(manual_csv)
-            if queue_slices:
-                self.append_log(
-                    "Review & Repair found no QC targets; reviewing derived build CSV slices: "
-                    + ", ".join(str(value) for value in queue_slices)
-                    + "\n"
-                )
-        if not queue_slices:
-            QMessageBox.information(
-                self,
-                "No review slices",
-                "No QC targets or manual annotation slices were found for this build.",
-            )
-            return
-
-        request = ReviewRepairRequest(
-            mask_path=mask_path,
-            manual_csv=manual_csv,
-            build_output_dir=build_output_dir,
-            queue_slices=queue_slices,
+        QMessageBox.information(
+            self,
+            "2D review removed",
+            "The old slice-by-slice Review & Repair flow has been removed.\n\n"
+            "To revise a built surface, load the saved 3D annotation JSON on the Annotate page, drag the curve points or seed patches, then build the queued 3D surface again.",
         )
-        if self.annotation_mask_data is not None and self.annotation_mask_path is not None:
-            try:
-                if self._same_path(self.annotation_mask_path, mask_path):
-                    self._finish_review_repair_start(request)
-                    return
-            except OSError:
-                pass
-
-        self.pending_review_request = request
-        self.annotate_mask.set_text(mask_path)
-        self.tabs.setCurrentIndex(0)
-        self.start_annotation_mask_load(mask_path)
 
     def _finish_review_repair_start(self, request: ReviewRepairRequest) -> None:
-        annotation_output_dir = self._annotation_output_dir_from_build_dir(request.build_output_dir)
-        loaded_count, errors = self._load_annotation_rows_from_csv(
-            request.manual_csv,
-            output_dir=annotation_output_dir,
-            show_message=False,
-            sync_build=False,
-        )
-        self.review_mode_active = True
-        self.review_source_build_dir = request.build_output_dir
-        self.review_queue_slices = [
-            slice_index for slice_index in request.queue_slices if slice_index in self.annotation_region_slices
-        ] or list(request.queue_slices)
-        self.review_checked_slices = set()
-        self.review_round_csv_path = None
-        self.annotation_target_slices = list(self.review_queue_slices)
-        self.build_mask.set_text(request.mask_path)
-        self.build_manual.set_text(request.manual_csv)
-        self.build_output.set_text(request.build_output_dir)
-        self.build_boundaries.set_text(request.build_output_dir / "boundary_annotations.json")
-        self._apply_review_mode_ui(True)
-        self.tabs.setCurrentIndex(0)
-        if self.review_queue_slices:
-            self.annotate_slice.setValue(self.review_queue_slices[0])
-        if not self.annotation_picking_active:
-            self.enter_annotation_picking_mode()
-        self._update_annotation_progress()
-        skipped_text = f" {len(errors)} rows skipped." if errors else ""
-        self.annotate_status.setText(
-            f"Review & Repair loaded {loaded_count} manual slices.{skipped_text} "
-            f"Queue: {len(self.review_queue_slices)} target slices."
-        )
-        self.append_log(
-            "Review & Repair started.\n"
-            f"source_build: {request.build_output_dir}\n"
-            f"manual_csv: {request.manual_csv}\n"
-            f"queue_slices: {', '.join(str(value) for value in self.review_queue_slices)}\n"
+        self.review_mode_active = False
+        QMessageBox.information(
+            self,
+            "2D review removed",
+            "This project was built with the old 2D slice review flow. Current editing happens by loading the saved 3D annotation JSON and rebuilding the queued 3D surface.",
         )
 
     def _advance_review_queue(self) -> None:
@@ -7810,44 +7636,20 @@ class LaminarBoundaryWindow(QMainWindow):
         self._advance_review_queue()
 
     def save_review_repair_csv(self) -> Optional[Path]:
-        if not self.review_mode_active:
-            QMessageBox.information(self, "Not in review mode", "Start Review And Repair from a build first.")
-            return None
-        if not self.annotation_rows:
-            QMessageBox.warning(self, "No annotations", "No annotation rows are loaded.")
-            return None
-
-        source_build = self.review_source_build_dir or Path(self.build_output.text()).expanduser()
-        annotation_output_dir = self._annotation_output_dir_from_build_dir(source_build)
-        if self.review_round_csv_path is None:
-            csv_path, _build_dir, _round_index = self._next_review_round_paths(annotation_output_dir)
-            self.review_round_csv_path = csv_path
-        self._write_annotation_rows_csv(self.review_round_csv_path)
-        self.annotate_previous_csv.set_text(self.review_round_csv_path)
-        self.build_manual.set_text(self.review_round_csv_path)
-        self.append_log(f"Saved review repair CSV: {self.review_round_csv_path}\n")
-        self.annotate_status.setText(f"Saved review CSV: {self.review_round_csv_path}")
-        return self.review_round_csv_path
+        QMessageBox.information(
+            self,
+            "2D review removed",
+            "Review CSV is part of the old 2D slice workflow. Current revisions are saved as 3D annotation JSON during 3D surface build.",
+        )
+        return None
 
     def rebuild_review_round(self) -> None:
-        csv_path = self.save_review_repair_csv()
-        if csv_path is None:
-            return
-        source_build = self.review_source_build_dir or Path(self.build_output.text()).expanduser()
-        annotation_output_dir = self._annotation_output_dir_from_build_dir(source_build)
-        _csv_path, build_dir, round_index = self._next_review_round_paths(annotation_output_dir)
-        if self.review_round_csv_path is not None:
-            stem = self.review_round_csv_path.stem
-            match = re.search(r"round(\d+)$", stem)
-            if match:
-                round_index = int(match.group(1))
-                build_dir = annotation_output_dir / f"build_review_round{round_index}"
-        self.build_manual.set_text(csv_path)
-        self.build_output.set_text(build_dir)
-        self.build_boundaries.set_text(build_dir / "boundary_annotations.json")
-        self.tabs.setCurrentIndex(1)
-        self.append_log(f"Review round {round_index} rebuild started: {build_dir}\n")
-        self.run_surface_build()
+        QMessageBox.information(
+            self,
+            "2D review removed",
+            "Rebuild Review Round belonged to the old 2D slice workflow.\n\n"
+            "Load the 3D annotation JSON, edit the points or seed patches, then click Build Queued 3D Surfaces.",
+        )
 
     def _finish_pending_review_after_mask_load(self, load_data: AnnotationLoadData) -> None:
         request = self.pending_review_request
@@ -7869,33 +7671,12 @@ class LaminarBoundaryWindow(QMainWindow):
         request = self.pending_previous_csv_load
         if request is None:
             return
-        mask_path, csv_path, output_dir = request
-        try:
-            if not self._same_path(loaded_mask_path, mask_path):
-                return
-        except OSError:
-            return
         self.pending_previous_csv_load = None
-        try:
-            loaded_count, errors = self._load_annotation_rows_from_csv(
-                csv_path,
-                output_dir=output_dir,
-                show_message=False,
-            )
-        except Exception as exc:
-            self._show_exception_dialog("Load previous project annotations failed", exc)
-            return
-
-        skipped_text = f" {len(errors)} rows skipped." if errors else ""
-        self.annotate_status.setText(
-            f"Previous project loaded {loaded_count} manual slices.{skipped_text} "
-            "Run Extract Surfaces when you are ready."
-        )
         QMessageBox.information(
             self,
-            "Previous project loaded",
-            f"Loaded {loaded_count} manual slices from:\n{csv_path}\n\n"
-            "No existing build folder was found, so the Build page is ready for Extract Surfaces.",
+            "2D project annotations ignored",
+            "This previous project contains old 2D slice annotations. They are not loaded in this app version.\n\n"
+            "Load a saved 3D annotation JSON or rebuild the surface with direct 3D marking.",
         )
 
     def _update_build_result_from_task(self, result: TaskResult) -> None:
@@ -7927,7 +7708,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.build_result_label.setText("\n".join(summary_lines))
         self._set_label_state(self.build_result_label, "ready")
         self.open_build_output_button.setEnabled(bool(result.output_dir))
-        self.review_qc_button.setEnabled(any(line.startswith("QC review needed") for line in qc_lines))
+        self.review_qc_button.setEnabled(False)
         self._update_build_readiness()
 
     def _make_demo_tab(self) -> QWidget:
@@ -7935,32 +7716,11 @@ class LaminarBoundaryWindow(QMainWindow):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(0, 8, 0, 0)
         layout.setSpacing(12)
-        layout.addWidget(self._make_hint("Demo is only a setup test with synthetic data."))
-
-        settings = QGroupBox("Demo Test")
-
-        self.demo_output = PathRow("Demo output folder", select_file=False)
-        self.demo_resample_points = QSpinBox()
-        self.demo_resample_points.setRange(8, 1000)
-        self.demo_resample_points.setValue(48)
-        self.demo_resample_points.setButtonSymbols(QSpinBox.NoButtons)
-        self.demo_resample_points.setMinimumHeight(28)
-        self.demo_depth_method = CleanComboBox()
-        self.demo_depth_method.addItems(["auto", "laplace", "distance"])
-        self.demo_depth_method.setMinimumHeight(28)
-
-        form = QFormLayout(settings)
-        self._tune_form(form)
-        self._add_help_row(form, "Output folder", self.demo_output, *DEMO_HELP["output"])
-        self._add_help_row(form, "Resample points", self.demo_resample_points, *DEMO_HELP["resample_points"])
-        self._add_help_row(form, "Depth method", self.demo_depth_method, *DEMO_HELP["depth_method"])
-
-        run_button = self._make_button("Run Demo Test", "primary")
-        run_button.clicked.connect(self.run_demo)
-        run_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-
-        layout.addWidget(settings)
-        layout.addWidget(run_button)
+        layout.addWidget(
+            self._make_hint(
+                "The old synthetic demo used the removed 2D slice pipeline. Use a real 3D shell build to test the current workflow."
+            )
+        )
         layout.addStretch(1)
         return tab
 
@@ -8128,8 +7888,8 @@ class LaminarBoundaryWindow(QMainWindow):
             return "Use a custom atlas file, or choose an existing Mask instead."
         if "input file does not exist" in text or "no such file" in text or "not found" in text:
             return "Choose an existing file and try again."
-        if "boundary_annotations.json" in text or "boundary json" in text:
-            return "Run Extract Surfaces first, or choose the existing boundary_annotations.json file."
+        if "project_config.json" in text or "outer and inner surfaces" in text:
+            return "Build 3D surfaces named outer and inner first, then compute depth from that build folder."
         if "template shape" in text:
             return "The template is only a visual background. Choose a matching template, or leave it empty."
         return "Check the highlighted input and try again."
@@ -8169,76 +7929,26 @@ class LaminarBoundaryWindow(QMainWindow):
         self._show_error_dialog("Run failed", trace)
 
     def run_prepare(self) -> None:
-        def task() -> TaskResult:
-            output_dir = self._require_path("Output folder", self.prepare_output.text())
-            core = _core()
-            contours = core.prepare_laminar_project(
-                mask_path=self._require_path("Mask", self.prepare_mask.text()),
-                output_dir=output_dir,
-                slice_axis=self.prepare_slice_axis.currentText(),
-                min_area=float(self.prepare_min_area.value()),
-                largest_only=not self.prepare_keep_all.isChecked(),
-                manual_every=int(self.prepare_manual_every.value()),
-            )
-            return TaskResult(
-                title="Prepare finished",
-                message=(
-                    f"Prepared {len(contours)} slice contours.\n"
-                    f"Edit: {output_dir / 'manual_landmarks_template.csv'}"
-                ),
-                output_dir=output_dir,
-            )
-
-        self.start_task("prepare", task)
+        QMessageBox.information(
+            self,
+            "2D template removed",
+            "Preparing a 2D slice annotation template has been removed.\n\n"
+            "Use Annotate to load a mask, draw closed curves on the 3D shell, select seed patches, and build queued 3D surfaces.",
+        )
 
     def run_surface_build(self) -> None:
-        self.depth_method.setCurrentText("surfaces only")
-        self.run_build()
+        QMessageBox.information(
+            self,
+            "2D surface extraction removed",
+            "Extract Surfaces belonged to the old 2D slice workflow.\n\n"
+            "Use Build Queued 3D Surfaces on the Annotate page.",
+        )
 
     def run_build(self) -> None:
-        if not self._validate_build_inputs():
-            return
-
-        def task(progress: Callable[[int, str, str], None]) -> TaskResult:
-            output_dir = self._require_path("Output folder", self.build_output.text())
-            swc_glob = self.build_swc_glob.text().strip()
-            swc_paths = sorted(glob.glob(swc_glob)) if swc_glob else []
-            core = _core()
-            outputs = core.run_laminar_boundary_pipeline(
-                mask_path=self._require_path("Mask", self.build_mask.text()),
-                manual_csv=self._require_path("Derived build CSV", self.build_manual.text()),
-                output_dir=output_dir,
-                template_path=self.build_template.text() or None,
-                cell_csv=self.build_cell_csv.text() or None,
-                swc_paths=swc_paths,
-                slice_axis=self.build_slice_axis.currentText(),
-                min_area=float(self.build_min_area.value()),
-                largest_only=not self.build_keep_all.isChecked(),
-                resample_points=int(self.resample_points.value()),
-                surface_method=self.surface_method.currentText(),
-                shell_backend=self.shell_backend.currentText(),
-                depth_method=self.depth_method.currentText(),
-                max_laplace_voxels=int(self.max_laplace_voxels.value()),
-                boundary_dilation=int(self.boundary_dilation.value()),
-                qc_every=int(self.qc_every.value()),
-                volume_format=self.volume_format.currentText(),
-                progress_callback=progress,
-            )
-            qc_summary = self._surface_qc_summary(output_dir)
-            title = "Build needs QC review" if qc_summary.startswith("QC review needed") else "Build finished"
-            lines = [title + "."]
-            lines.extend(f"{key}: {value}" for key, value in outputs.items())
-            lines.extend(("", qc_summary))
-            return TaskResult(title, "\n".join(lines), output_dir=output_dir)
-
-        self.start_task("build", task, accepts_progress=True)
+        self.run_surface_build()
 
     def _build_boundaries_path(self) -> Path:
-        text = self.build_boundaries.text().strip()
-        if text:
-            return Path(text).expanduser()
-        output_dir = self._require_path("Output folder", self.build_output.text())
-        return output_dir / "boundary_annotations.json"
+        raise ValueError("The old 2D boundary_annotations.json depth path has been removed. Use 3D project_config.json instead.")
 
     def _surface_qc_summary(self, output_dir: Path) -> str:
         review_slices = self._read_qc_review_slices(output_dir)
@@ -8316,20 +8026,20 @@ class LaminarBoundaryWindow(QMainWindow):
             swc_paths = sorted(glob.glob(swc_glob)) if swc_glob else []
             core = _core()
             depth_method = self.depth_method.currentText()
-            if depth_method == "surfaces only":
-                depth_method = "auto"
-            outputs = core.run_laminar_depth_pipeline(
-                mask_path=self._require_path("Mask", self.build_mask.text()),
-                boundaries_json=self._build_boundaries_path(),
+            depth_source, depth_path, _detail = self._build_depth_source()
+            if depth_source != "surface_3d" or depth_path is None:
+                raise ValueError("Build 3D outer and inner surfaces before computing depth.")
+            mask_path = self._require_path("Mask", self.build_mask.text())
+            outputs = core.run_3d_surface_depth_pipeline(
+                mask_path=mask_path,
+                project_config=depth_path,
                 output_dir=output_dir,
                 template_path=self.build_template.text() or None,
                 cell_csv=self.build_cell_csv.text() or None,
                 swc_paths=swc_paths,
-                slice_axis=self.build_slice_axis.currentText(),
                 depth_method=depth_method,
                 max_laplace_voxels=int(self.max_laplace_voxels.value()),
                 boundary_dilation=int(self.boundary_dilation.value()),
-                qc_every=int(self.qc_every.value()),
                 volume_format=self.volume_format.currentText(),
                 progress_callback=progress,
             )
@@ -8344,27 +8054,11 @@ class LaminarBoundaryWindow(QMainWindow):
         self.start_task("depth", task, accepts_progress=True)
 
     def run_demo(self) -> None:
-        def task() -> TaskResult:
-            output_dir = self._require_path("Output folder", self.demo_output.text())
-            demo_input_dir = output_dir / "demo_input"
-            core = _core()
-            mask_path, manual_csv = core.write_demo_project(demo_input_dir)
-            build_dir = output_dir / "demo_build"
-            outputs = core.run_laminar_boundary_pipeline(
-                mask_path=mask_path,
-                manual_csv=manual_csv,
-                output_dir=build_dir,
-                slice_axis=0,
-                min_area=20.0,
-                resample_points=int(self.demo_resample_points.value()),
-                depth_method=self.demo_depth_method.currentText(),
-                qc_every=4,
-            )
-            lines = ["Demo finished.", f"demo_mask: {mask_path}", f"demo_manual_csv: {manual_csv}"]
-            lines.extend(f"{key}: {value}" for key, value in outputs.items())
-            return TaskResult("Demo finished", "\n".join(lines), output_dir=build_dir)
-
-        self.start_task("demo", task)
+        QMessageBox.information(
+            self,
+            "2D demo removed",
+            "The synthetic demo used the old 2D slice pipeline and has been removed from the app UI.",
+        )
 
     def closeEvent(self, event) -> None:
         if self.thread is not None:

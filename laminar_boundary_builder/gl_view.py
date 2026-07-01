@@ -695,7 +695,7 @@ class ShellGLCanvas(QOpenGLWidget):
 
     def initializeGL(self) -> None:
         try:
-            glClearColor(0.045, 0.075, 0.07, 1.0)
+            glClearColor(0.055, 0.045, 0.078, 1.0)
             glEnable(GL_DEPTH_TEST)
             glDepthFunc(GL_LEQUAL)
             glEnable(GL_CULL_FACE)
@@ -729,7 +729,7 @@ class ShellGLCanvas(QOpenGLWidget):
             self._paint_gl()
         except Exception as exc:
             self.message = f"3D render failed: {exc}"
-            glClearColor(0.045, 0.075, 0.07, 1.0)
+            glClearColor(0.055, 0.045, 0.078, 1.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             try:
                 self._draw_overlay()
@@ -737,7 +737,7 @@ class ShellGLCanvas(QOpenGLWidget):
                 pass
 
     def _paint_gl(self) -> None:
-        glClearColor(0.045, 0.075, 0.07, 1.0)
+        glClearColor(0.055, 0.045, 0.078, 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         if self._gl_ready and self._vertex_count and self._surface_program is not None:
             self._draw_surface()
@@ -835,7 +835,7 @@ class ShellGLCanvas(QOpenGLWidget):
         program = self._surface_program
         program.bind()
         program.setUniformValue("mvp", self._mvp_matrix())
-        program.setUniformValue("base_color", QVector3D(0.70, 0.88, 0.82))
+        program.setUniformValue("base_color", QVector3D(0.76, 0.70, 0.86))
         program.setUniformValue("light_dir", QVector3D(-0.35, 0.65, 0.72))
         self._vbo.bind()
         stride = 9 * 4
@@ -865,7 +865,7 @@ class ShellGLCanvas(QOpenGLWidget):
             program.bind()
             program.setUniformValue("mvp", self._mvp_matrix())
             program.setUniformValue("depth_bias", 0.0)
-            program.setUniformValue("line_color", QVector4D(0.015, 0.075, 0.065, 0.58))
+            program.setUniformValue("line_color", QVector4D(0.11, 0.075, 0.16, 0.58))
             self._edge_vbo.bind()
             program.enableAttributeArray("position")
             program.setAttributeBuffer("position", GL_FLOAT, 0, 3, 3 * 4)
@@ -1680,7 +1680,7 @@ class ShellGLCanvas(QOpenGLWidget):
         for face_id in selected_faces:
             self._draw_face_overlay(painter, face_id, QColor(245, 200, 76, 95), QColor("#f5c84c"), 1.5)
         if self.hover_face is not None:
-            self._draw_face_overlay(painter, int(self.hover_face), QColor(88, 204, 156, 95), QColor("#ffffff"), 1.6)
+            self._draw_face_overlay(painter, int(self.hover_face), QColor(150, 120, 220, 95), QColor("#ffffff"), 1.6)
 
         curve_count, point_count, patch_count = self.annotation_counts()
         mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
@@ -1781,9 +1781,9 @@ class ShellGLCanvas(QOpenGLWidget):
         rect = painter.boundingRect(10, 12, rect_width, 30, Qt.AlignVCenter, text)
         rect = rect.adjusted(0, 0, 20, 8)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(14, 22, 20, 220))
+        painter.setBrush(QColor(22, 16, 32, 220))
         painter.drawRoundedRect(rect, 8, 8)
-        painter.setPen(QColor("#eef8f4"))
+        painter.setPen(QColor("#f1eafa"))
         painter.drawText(rect.adjusted(10, 0, -6, 0), Qt.AlignVCenter, text)
 
     @staticmethod

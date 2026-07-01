@@ -7,8 +7,8 @@
 ```text
 apps/laminar_boundary_builder/
 ├── laminar_boundary_builder/
-│   ├── core.py      # contour、边界传播、surface、depth、QC 核心算法
-│   ├── cli.py       # prepare/build/demo 命令行入口
+│   ├── core.py      # 3D shell、surface patch、depth、QC 共享算法
+│   ├── cli.py       # depth/selfcheck 命令行入口
 │   ├── app.py       # PyQt 桌面 GUI
 │   ├── __main__.py  # python -m laminar_boundary_builder
 │   └── __init__.py
@@ -29,12 +29,12 @@ python apps/laminar_boundary_builder/launch_gui.py
 
 GUI 主界面有两个正式页面：
 
-- `Annotate`：在切片图上直接点 outer / inner 的起止点，并保存人工标注
-- `Build`：生成 surface、laminar depth、layer normal、表格和 QC
+- `Annotate`：在 3D shell 上画闭合曲线、选择 seed patch、构建 surface OBJ
+- `Build`：从 3D build 输出的 outer/inner OBJ 计算 laminar depth、layer normal、表格和 QC
 
-`Tools > Run Demo Test` 可以用合成数据检查软件能不能正常跑，不是真实分析入口。
+旧的 2D 切片端点重建流程已经移除。不要再用切片 CSV 或 `boundary_annotations.json` 作为 surface build 输入。
 
-## 图上交互标注
+## 3D 图上交互标注
 
 推荐现在用这个流程：
 
@@ -74,65 +74,43 @@ data/local/laminar_boundary_masks/ENT_left_ml_low_10um_mask.nrrd
 ```
 
 5. `Output folder` 选择一个标注输出目录。
-6. 左侧 `Progress` 会显示 mask 里有多少张有效切片，以及当前建议关键切片标注进度。
-7. 进入点选模式后，参数设置会收起到左边；点左侧小箭头可以临时展开查看参数。展开时参数是灰色的，按 `Esc` 才能退出点选模式并重新编辑参数。
-8. 每张切片直接按顺序点四个点：
+6. 左侧 `Shell` 会显示当前 3D shell 的点数、面片数和 mask 有效切片范围。
+7. 在 3D 视图里直接点 shell 表面，点会连成沿三角网格走的曲线。拖动已有点可以局部微调。
+8. 闭合曲线后，这条曲线会进入 surface 队列。选中队列里的 surface，给它命名，例如：
 
 ```text
-outer_start
-outer_end
-inner_start
-inner_end
+outer
+inner
 ```
 
-软件会自动吸附到最近的 contour 点，并在图上标出每个点的名字。
+9. 点 `Select Surface Patch`，在闭合曲线限定的区域里点 seed patch。seed patch 就是告诉软件“我要这条曲线围住的哪一块表面”。
 
-9. 快捷键：
+10. 点 `Build Queued 3D Surfaces`。软件会在输出目录下写入：
 
 ```text
-X      撤销当前切片上最后一个点
-Enter  接受当前切片并进入下一张有效切片
-S      当前整圈 contour 只作为 outer surface；适合 inner 已经结束的封顶切片
-A      当前整圈 contour 只作为 inner surface；适合 outer 已经结束的封顶切片
-Esc    退出点选模式，重新编辑参数
+build_3d/project_config.json
+build_3d/surfaces/*.obj
+build_3d/surface_3d_annotations_*.json
 ```
 
-11. 标完几个关键切片后，点 `Save CSV And Review Build`。
+`surface_3d_annotations_*.json` 是可编辑的 3D 标注线和 seed patch。之后要微调，就重新加载同一个 mask，再加载这个 JSON。
 
-软件会自动生成：
+常用快捷键：
 
 ```text
-manual_landmarks_interactive.csv
+X      撤销上一步 3D 标注
+Enter  当前 surface 队列满足条件时直接 build
+Esc    退出点选模式，重新编辑输入来源
 ```
 
-并自动跳到 `Build` 页，同时把这些内容同步过去：
-
-```text
-Mask
-Manual CSV
-Output folder
-Template image
-Slice axis
-Min contour area
-Keep all contours per slice
-```
-
-CSV 现在只是后台保存格式，不需要手动编辑，也不需要在 `Build` 页重新挑这些参数。
+多个 surface 的命名逻辑：每条闭合曲线会新增一个 surface 队列项。队列里的每一项都有自己的名字和 seed patch。比如先画 outer，命名为 `outer`；再画 inner，命名为 `inner`。
 
 ## 本地直接运行
 
-在仓库根目录运行：
+在仓库根目录可以跑轻量冒烟检查：
 
 ```bash
-python apps/laminar_boundary_builder/run.py demo \
-  --output-dir /tmp/laminar_boundary_demo
-```
-
-也可以跑一个更完整的冒烟检查：
-
-```bash
-python apps/laminar_boundary_builder/run.py selfcheck \
-  --output-dir /tmp/laminar_boundary_selfcheck
+python apps/laminar_boundary_builder/run.py selfcheck
 ```
 
 ## 安装成命令
@@ -147,8 +125,10 @@ python -m pip install -e .
 安装后可以直接运行：
 
 ```bash
-laminar-boundary-builder demo \
-  --output-dir /tmp/laminar_boundary_demo
+laminar-boundary-builder depth \
+  --mask data/local/ENT_mask.nrrd \
+  --project-config results/laminar_boundary/ENT_left/build_3d/project_config.json \
+  --output-dir results/laminar_boundary/ENT_left/depth
 ```
 
 ## 正式数据流程
@@ -156,68 +136,36 @@ laminar-boundary-builder demo \
 推荐走图上交互流程：
 
 ```text
-Annotate 里加载 mask 并点 outer/inner
+Annotate 里加载 mask
         ↓
-Save Manual CSV
+在 3D shell 上画 outer/inner 闭合曲线，并各自选择 seed patch
         ↓
-Build 里选择 mask + Manual CSV
+Build Queued 3D Surfaces
         ↓
-生成 surface、laminar depth 和 QC
-```
-
-命令行仍然保留一个旧的批量入口，可以提取每张切片的 mask 轮廓，并生成可填写的人工标注模板：
-
-```bash
-python apps/laminar_boundary_builder/run.py prepare \
-  --mask data/local/ENT_mask.nrrd \
-  --output-dir results/laminar_boundary/ENT_left_prepare \
-  --slice-axis coronal \
-  --manual-every 8
-```
-
-如果暂时不用图上交互，也可以打开：
-
-```text
-results/laminar_boundary/ENT_left_prepare/manual_landmarks_template.csv
-```
-
-每个关键切片手动填写：
-
-```text
-outer_start / outer_end
-inner_start / inner_end
-```
-
-可以填 `*_index`，也可以填 `*_x/*_y/*_z` 坐标。点号和坐标可从同一目录下的 `contour_points.csv` 查。
-
-第二步，用人工关键切片传播到中间切片，并生成 surface、depth field 和 QC：
-
-```bash
-python apps/laminar_boundary_builder/run.py build \
-  --mask data/local/ENT_mask.nrrd \
-  --manual-csv results/laminar_boundary/ENT_left_prepare/manual_landmarks_template.csv \
-  --template data/local/misc/average_template_10.nrrd \
-  --cell-csv results/ENT_soma_coordinates.csv \
-  --output-dir results/laminar_boundary/ENT_left_build \
-  --slice-axis coronal
+得到 build_3d/project_config.json 和 surface OBJ
+        ↓
+Build 页或 CLI depth 从 project_config.json 计算 laminar depth
 ```
 
 ## 输出
 
-主要输出在 `--output-dir` 下：
+3D surface build 主要输出在 `build_3d/` 下：
 
-- `surfaces/target_outer_surface.ply`
-- `surfaces/target_inner_surface.ply`
-- `surfaces/target_lateral_boundary.ply`
+- `project_config.json`
+- `surfaces/*outer*.obj`
+- `surfaces/*inner*.obj`
+- `surface_3d_annotations_*.json`
+
+Depth build 主要输出在 depth 输出目录下：
+
 - `volumes/laminar_depth.nrrd`
+- `volumes/boundary_labels.nrrd`
 - `volumes/layer_normal_x.nrrd`
 - `volumes/layer_normal_y.nrrd`
 - `volumes/layer_normal_z.nrrd`
-- `tables/boundary_summary.csv`
 - `tables/cell_laminar_depth.csv`
 - `tables/dendrite_laminar_depth.csv`
 - `qc/qc_slice_overlay/`
-- `qc/qc_uncertain_slices.csv`
 
 体积文件默认写成 NRRD。如果要输出 NIfTI，先安装：
 
@@ -248,7 +196,7 @@ apps/laminar_boundary_builder/dist/Laminar Boundary Builder.dmg
 
 双击 `.app` 就会打开窗口。正式发给其他电脑前，后续还可以补 Developer ID 签名和 Apple notarization。
 
-后面如果做切片点选编辑器，建议继续放在这个目录里，并复用 `laminar_boundary_builder/core.py`，不要再把算法散回主仓库。
+后面如果继续做 3D 标注编辑器，建议继续放在这个目录里，并复用 `laminar_boundary_builder/core.py`，不要再把算法散回主仓库。
 
 ## License
 

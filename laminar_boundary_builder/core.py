@@ -6955,6 +6955,244 @@ def make_boundary_label_volume(
     return labels
 
 
+def _read_obj_vertices(path: str | Path) -> Tuple[np.ndarray, int]:
+    path = _resolve_existing_input_path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"OBJ surface file does not exist: {path}")
+
+    vertices: List[Tuple[float, float, float]] = []
+    face_count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("v "):
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                face_count += 1
+
+    if not vertices:
+        raise ValueError(f"OBJ surface has no vertices: {path}")
+    return np.asarray(vertices, dtype=np.float32), face_count
+
+
+def _mask_shell_voxels(mask: np.ndarray) -> np.ndarray:
+    region = _as_bool_mask(mask)
+    if not np.any(region):
+        raise ValueError("Mask is empty; cannot build depth labels from surface meshes")
+    structure = ndimage.generate_binary_structure(3, 1)
+    eroded = ndimage.binary_erosion(region, structure=structure, border_value=0)
+    shell = region & ~eroded
+    coords = np.argwhere(shell)
+    if len(coords) == 0:
+        coords = np.argwhere(region)
+    return coords.astype(np.float32, copy=False)
+
+
+def _mask_bounding_slices(mask: np.ndarray, padding: int = 0) -> Tuple[slice, slice, slice]:
+    region = _as_bool_mask(mask)
+    if not np.any(region):
+        raise ValueError("Mask is empty; cannot crop depth volume")
+
+    slices: List[slice] = []
+    for axis in range(3):
+        other_axes = tuple(idx for idx in range(3) if idx != axis)
+        occupied = np.any(region, axis=other_axes)
+        indices = np.flatnonzero(occupied)
+        start = max(0, int(indices[0]) - int(padding))
+        stop = min(region.shape[axis], int(indices[-1]) + int(padding) + 1)
+        slices.append(slice(start, stop))
+    return slices[0], slices[1], slices[2]
+
+
+def _slice_origin(slices: Sequence[slice]) -> np.ndarray:
+    return np.asarray([int(item.start or 0) for item in slices], dtype=float)
+
+
+def _surface_vertices_to_shell_mask(
+    mask: np.ndarray,
+    vertices: np.ndarray,
+    *,
+    max_snap_distance: float = 3.0,
+    chunk_size: int = 200_000,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    shell_coords = _mask_shell_voxels(mask)
+    tree = cKDTree(shell_coords)
+    vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+
+    chosen_indices: List[np.ndarray] = []
+    accepted_distances: List[np.ndarray] = []
+    nearest_distances: List[np.ndarray] = []
+    for start in range(0, len(vertices), int(chunk_size)):
+        chunk = vertices[start : start + int(chunk_size)]
+        try:
+            distances, indices = tree.query(chunk, k=1, workers=-1)
+        except TypeError:
+            distances, indices = tree.query(chunk, k=1)
+        distances = np.asarray(distances, dtype=np.float32)
+        indices = np.asarray(indices, dtype=np.int64)
+        nearest_distances.append(distances)
+        keep = distances <= float(max_snap_distance)
+        if np.any(keep):
+            chosen_indices.append(indices[keep])
+            accepted_distances.append(distances[keep])
+
+    if not chosen_indices:
+        all_distances = np.concatenate(nearest_distances) if nearest_distances else np.empty(0, dtype=np.float32)
+        nearest = float(np.nanmin(all_distances)) if len(all_distances) else math.nan
+        raise ValueError(
+            "Surface mesh could not be snapped to the mask shell. "
+            f"Nearest vertex distance was {nearest:.3f} voxel(s). "
+            "Use the same mask that produced the 3D surface build."
+        )
+
+    selected = np.unique(np.concatenate(chosen_indices))
+    selected_coords = shell_coords[selected].astype(np.int64, copy=False)
+    surface_mask = np.zeros(mask.shape, dtype=bool)
+    surface_mask[selected_coords[:, 0], selected_coords[:, 1], selected_coords[:, 2]] = True
+    accepted = np.concatenate(accepted_distances)
+    stats = {
+        "input_vertices": float(len(vertices)),
+        "labeled_voxels": float(np.count_nonzero(surface_mask)),
+        "mean_snap_distance": float(np.mean(accepted)) if len(accepted) else math.nan,
+        "max_snap_distance": float(np.max(accepted)) if len(accepted) else math.nan,
+    }
+    return surface_mask, stats
+
+
+def make_boundary_label_volume_from_surface_meshes(
+    mask: np.ndarray,
+    outer_surface_path: str | Path,
+    inner_surface_path: str | Path,
+    dilation_iterations: int = 1,
+    max_snap_distance: float = 3.0,
+    coordinate_origin: Optional[Sequence[float]] = None,
+) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    """Paint outer/inner OBJ surfaces back onto the mask shell as depth labels."""
+
+    labels = np.zeros(mask.shape, dtype=np.uint8)
+    region = _as_bool_mask(mask)
+    labels[region] = BOUNDARY_REGION
+    origin = (
+        np.asarray(coordinate_origin, dtype=np.float32).reshape(1, 3)
+        if coordinate_origin is not None
+        else None
+    )
+
+    summaries: List[Dict[str, object]] = []
+    surface_masks: Dict[int, np.ndarray] = {}
+    for label, role, path in (
+        (BOUNDARY_OUTER, "outer", outer_surface_path),
+        (BOUNDARY_INNER, "inner", inner_surface_path),
+    ):
+        vertices, face_count = _read_obj_vertices(path)
+        if origin is not None:
+            vertices = vertices - origin
+        surface_mask, stats = _surface_vertices_to_shell_mask(
+            region,
+            vertices,
+            max_snap_distance=max_snap_distance,
+        )
+        surface_masks[label] = surface_mask
+        summaries.append(
+            {
+                "surface": role,
+                "path": str(_resolve_existing_input_path(path)),
+                "vertices": int(stats["input_vertices"]),
+                "faces": int(face_count),
+                "labeled_voxels": int(stats["labeled_voxels"]),
+                "mean_snap_distance": float(stats["mean_snap_distance"]),
+                "max_snap_distance": float(stats["max_snap_distance"]),
+            }
+        )
+
+    if dilation_iterations > 0:
+        structure = ndimage.generate_binary_structure(3, 1)
+        for label in (BOUNDARY_OUTER, BOUNDARY_INNER):
+            surface_masks[label] = ndimage.binary_dilation(
+                surface_masks[label],
+                structure=structure,
+                iterations=int(dilation_iterations),
+            )
+
+    labels[region & surface_masks[BOUNDARY_OUTER]] = BOUNDARY_OUTER
+    labels[region & surface_masks[BOUNDARY_INNER]] = BOUNDARY_INNER
+    outer_count = int(np.count_nonzero(labels == BOUNDARY_OUTER))
+    inner_count = int(np.count_nonzero(labels == BOUNDARY_INNER))
+    if outer_count == 0 or inner_count == 0:
+        raise ValueError(
+            "Surface meshes did not create usable boundary labels. "
+            f"outer voxels={outer_count}, inner voxels={inner_count}."
+        )
+    return labels, summaries
+
+
+def _surface_output_for_role(config: Dict[str, object], role: str) -> Optional[Path]:
+    outputs = config.get("surface_outputs")
+    if not isinstance(outputs, dict):
+        return None
+
+    role_text = str(role).strip().lower()
+    names = config.get("surface_names")
+    candidates: List[str] = []
+    if isinstance(names, list):
+        for index, raw_name in enumerate(names, start=1):
+            name = str(raw_name)
+            normalized = safe_surface_name(name, fallback=f"surface_{index}").lower()
+            words = re.split(r"[^a-z0-9]+", normalized)
+            if role_text in words or normalized == role_text:
+                candidates.extend(
+                    [
+                        f"{normalized}_surface_obj",
+                        f"{normalized}_surface",
+                    ]
+                )
+
+    candidates.extend(
+        [
+            f"{role_text}_surface_obj",
+            f"{role_text}_surface",
+            f"{role_text}_surface_surface_obj",
+            f"{role_text}_surface_surface",
+        ]
+    )
+    for key in candidates:
+        value = outputs.get(key)
+        if value:
+            path = _resolve_existing_input_path(value)
+            if path.exists():
+                return path
+
+    for key, value in outputs.items():
+        key_text = str(key).lower()
+        if role_text in re.split(r"[^a-z0-9]+", key_text) and key_text.endswith("_obj"):
+            path = _resolve_existing_input_path(value)
+            if path.exists():
+                return path
+    return None
+
+
+def resolve_3d_surface_depth_inputs(project_config: str | Path) -> Tuple[Path, Path]:
+    """Return outer and inner OBJ paths from a 3D surface build config."""
+
+    config_path = _resolve_existing_input_path(project_config)
+    if not config_path.exists():
+        raise FileNotFoundError(f"3D project config does not exist: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    outer_path = _surface_output_for_role(config, "outer")
+    inner_path = _surface_output_for_role(config, "inner")
+    if outer_path is None or inner_path is None:
+        names = config.get("surface_names") or []
+        raise ValueError(
+            "Could not find both outer and inner surface OBJ files in project_config.json. "
+            f"Found surface names: {names}. Name the two depth surfaces with outer and inner."
+        )
+    return outer_path, inner_path
+
+
 def _distance_depth(mask: np.ndarray, labels: np.ndarray) -> np.ndarray:
     region = _as_bool_mask(mask)
     outer = labels == BOUNDARY_OUTER
@@ -7158,6 +7396,7 @@ def write_cell_depth_table(
     depth: np.ndarray,
     normals: np.ndarray,
     labels: np.ndarray,
+    coordinate_origin: Optional[Sequence[float]] = None,
 ) -> List[Dict]:
     with Path(cell_csv).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -7173,6 +7412,8 @@ def write_cell_depth_table(
         [[float(row[x_col]), float(row[y_col]), float(row[z_col])] for row in rows],
         dtype=float,
     )
+    if coordinate_origin is not None:
+        points = points - np.asarray(coordinate_origin, dtype=float).reshape(1, 3)
     distance_outer = _distance_to_label(labels, BOUNDARY_OUTER)
     distance_inner = _distance_to_label(labels, BOUNDARY_INNER)
 
@@ -7225,8 +7466,14 @@ def summarize_dendrite_depth(
     normals: np.ndarray,
     output_csv: str | Path,
     dendrite_types: Sequence[int] = (3, 4),
+    coordinate_origin: Optional[Sequence[float]] = None,
 ) -> List[Dict]:
     rows: List[Dict] = []
+    origin = (
+        np.asarray(coordinate_origin, dtype=float).reshape(3)
+        if coordinate_origin is not None
+        else np.zeros(3, dtype=float)
+    )
     for swc_path in swc_paths:
         swc = _read_swc_array(swc_path)
         if len(swc) == 0:
@@ -7258,7 +7505,7 @@ def summarize_dendrite_depth(
             length = float(np.linalg.norm(segment))
             if length <= 0:
                 continue
-            midpoint = (p0 + p1) * 0.5
+            midpoint = (p0 + p1) * 0.5 - origin
             sampled_depth = float(_sample_nearest(depth, midpoint[None, :])[0])
             if not np.isfinite(sampled_depth):
                 continue
@@ -8258,6 +8505,156 @@ def run_laminar_depth_pipeline(
         "output_dir": output_dir,
         "laminar_depth": volume_path("laminar_depth"),
         "boundary_labels": volume_path("boundary_label_volume"),
+        "qc": qc_dir,
+    }
+
+
+def run_3d_surface_depth_pipeline(
+    mask_path: str | Path,
+    project_config: str | Path,
+    output_dir: str | Path,
+    template_path: Optional[str | Path] = None,
+    cell_csv: Optional[str | Path] = None,
+    swc_paths: Optional[Sequence[str | Path]] = None,
+    depth_method: str = "auto",
+    max_laplace_voxels: int = 250_000,
+    boundary_dilation: int = 1,
+    volume_format: str = "nrrd",
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Path]:
+    """Compute laminar depth from a 3D build folder with outer/inner OBJ surfaces."""
+
+    output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
+    volumes_dir = output_dir / "volumes"
+    tables_dir = output_dir / "tables"
+    qc_dir = output_dir / "qc"
+    volumes_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir.mkdir(parents=True, exist_ok=True)
+
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
+    mask_volume = load_volume(mask_path)
+    mask = _as_bool_mask(mask_volume.data)
+    crop_slices = _mask_bounding_slices(mask, padding=max(3, int(boundary_dilation) + 3))
+    crop_origin = _slice_origin(crop_slices)
+    crop_stop = [int(item.stop or mask.shape[index]) for index, item in enumerate(crop_slices)]
+    cropped_mask = mask[crop_slices]
+
+    _emit_progress(progress_callback, 16, "Reading 3D surface build", str(project_config))
+    project_config = _resolve_existing_input_path(project_config)
+    outer_surface, inner_surface = resolve_3d_surface_depth_inputs(project_config)
+
+    _emit_progress(
+        progress_callback,
+        28,
+        "Building boundary labels from OBJ surfaces",
+        f"Crop origin: {[int(value) for value in crop_origin]}",
+    )
+    labels, surface_summaries = make_boundary_label_volume_from_surface_meshes(
+        cropped_mask,
+        outer_surface,
+        inner_surface,
+        dilation_iterations=boundary_dilation,
+        coordinate_origin=crop_origin,
+    )
+    _emit_progress(progress_callback, 46, "Computing laminar depth", f"Method: {depth_method}")
+    depth = compute_laminar_depth(
+        cropped_mask,
+        labels,
+        method=depth_method,
+        max_laplace_voxels=max_laplace_voxels,
+    )
+    _emit_progress(progress_callback, 70, "Computing layer normals", "Sampling depth gradient")
+    normals = compute_layer_normals(depth, cropped_mask)
+
+    volume_format = volume_format.lower().lstrip(".")
+    if volume_format not in ("nrrd", "npy", "nii", "nii.gz"):
+        raise ValueError("volume_format must be nrrd, npy, nii, or nii.gz")
+
+    def volume_path(name: str) -> Path:
+        return volumes_dir / f"{name}.{volume_format}"
+
+    _emit_progress(progress_callback, 78, "Writing cropped volume outputs", str(volumes_dir))
+    save_volume(volume_path("target_mask"), cropped_mask.astype(np.uint8), reference=mask_volume)
+    save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
+    save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
+    save_volume(volume_path("layer_normal_x"), normals[..., 0], reference=mask_volume)
+    save_volume(volume_path("layer_normal_y"), normals[..., 1], reference=mask_volume)
+    save_volume(volume_path("layer_normal_z"), normals[..., 2], reference=mask_volume)
+
+    if cell_csv is not None:
+        _emit_progress(progress_callback, 86, "Writing cell depth table", str(cell_csv))
+        write_cell_depth_table(
+            cell_csv,
+            tables_dir / "cell_laminar_depth.csv",
+            depth,
+            normals,
+            labels,
+            coordinate_origin=crop_origin,
+        )
+
+    if swc_paths:
+        _emit_progress(progress_callback, 90, "Summarizing dendrite depth", f"{len(swc_paths)} SWC file(s)")
+        summarize_dendrite_depth(
+            swc_paths,
+            depth,
+            normals,
+            tables_dir / "dendrite_laminar_depth.csv",
+            coordinate_origin=crop_origin,
+        )
+
+    _emit_progress(progress_callback, 94, "Writing 3D depth QC", str(qc_dir))
+    with (qc_dir / "surface_mesh_depth_sources.csv").open("w", encoding="utf-8", newline="") as handle:
+        fieldnames = [
+            "surface",
+            "path",
+            "vertices",
+            "faces",
+            "labeled_voxels",
+            "mean_snap_distance",
+            "max_snap_distance",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in surface_summaries:
+            writer.writerow(row)
+
+    config = {
+        "mask_path": str(mask_path),
+        "project_config": str(project_config),
+        "outer_surface_obj": str(outer_surface),
+        "inner_surface_obj": str(inner_surface),
+        "template_path": str(template_path) if template_path else None,
+        "cell_csv": str(cell_csv) if cell_csv else None,
+        "swc_paths": [str(path) for path in swc_paths] if swc_paths else [],
+        "depth_method": depth_method,
+        "depth_source": "3d_surface_obj",
+        "volume_coordinate_space": "cropped_original_index",
+        "full_shape": [int(value) for value in mask.shape],
+        "crop_origin": [int(value) for value in crop_origin],
+        "crop_stop": crop_stop,
+        "volume_format": volume_format,
+        "max_laplace_voxels": max_laplace_voxels,
+        "boundary_dilation": boundary_dilation,
+        "boundary_label_values": {
+            "background": BOUNDARY_BACKGROUND,
+            "region": BOUNDARY_REGION,
+            "outer": BOUNDARY_OUTER,
+            "inner": BOUNDARY_INNER,
+            "lateral": BOUNDARY_LATERAL,
+        },
+    }
+    _emit_progress(progress_callback, 98, "Writing depth config", str(output_dir / "depth_config.json"))
+    with (output_dir / "depth_config.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+
+    _emit_progress(progress_callback, 100, "Depth volume finished", str(output_dir))
+    return {
+        "output_dir": output_dir,
+        "laminar_depth": volume_path("laminar_depth"),
+        "boundary_labels": volume_path("boundary_label_volume"),
+        "surface_depth_qc": qc_dir / "surface_mesh_depth_sources.csv",
         "qc": qc_dir,
     }
 
