@@ -66,12 +66,12 @@ QMainWindow, QWidget {
 }
 QFrame#header {
     background: #fffcff;
-    border: 1px solid #ded2ec;
+    border: 1px solid #e5dced;
     border-radius: 8px;
 }
 QLabel#title {
     color: #20182f;
-    font-size: 22px;
+    font-size: 20px;
     font-weight: 700;
 }
 QLabel#status {
@@ -98,7 +98,7 @@ QFrame#hint {
 }
 QLabel#hintText {
     color: #514267;
-    font-weight: 650;
+    font-weight: 600;
 }
 QLabel#sectionNote {
     color: #6b5d78;
@@ -106,12 +106,11 @@ QLabel#sectionNote {
     line-height: 130%;
 }
 QLabel#progressText {
-    background: #f4effc;
-    border: 1px solid #d8caea;
-    border-radius: 7px;
-    color: #51406d;
-    font-weight: 650;
-    padding: 7px 9px;
+    background: transparent;
+    border: 0;
+    color: #6b5d78;
+    font-weight: 550;
+    padding: 2px 0;
 }
 QLabel#nextPointText {
     background: #fcf9ff;
@@ -262,13 +261,13 @@ QWidget#parameterHelpRow {
 QToolButton#parameterHelpButton {
     background: transparent;
     border: 1px solid #c9badf;
-    border-radius: 9px;
+    border-radius: 14px;
     color: #766783;
     font-weight: 800;
-    min-width: 18px;
-    max-width: 18px;
-    min-height: 18px;
-    max-height: 18px;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
     padding: 0;
 }
 QToolButton#parameterHelpButton:hover {
@@ -317,11 +316,11 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
 }
 QGroupBox {
     background: #fffcff;
-    border: 1px solid #ded2ec;
+    border: 1px solid #e5dced;
     border-radius: 8px;
     margin-top: 12px;
     padding: 14px 12px 12px 12px;
-    font-weight: 700;
+    font-weight: 650;
 }
 QGroupBox::title {
     subcontrol-origin: margin;
@@ -386,7 +385,7 @@ QPushButton {
     min-height: 20px;
     background: #fbf8ff;
     color: #342842;
-    font-weight: 600;
+    font-weight: 550;
 }
 QPushButton:hover {
     background: #f3eefb;
@@ -411,6 +410,15 @@ QPushButton[role="primary"]:hover {
 QPushButton[role="secondary"] {
     background: #f4effb;
     color: #4e3d69;
+}
+QPushButton[modeActive="true"] {
+    background: #7552b8;
+    border-color: #7552b8;
+    color: white;
+    font-weight: 700;
+}
+QPushButton[modeActive="true"]:hover {
+    background: #6442a3;
 }
 QPushButton[role="danger"] {
     background: #fbefec;
@@ -454,6 +462,30 @@ QScrollArea#sideScroll {
 QScrollArea#buildScroll {
     border: 0;
     background: transparent;
+}
+QFrame#collapsibleSection {
+    background: #fffcff;
+    border: 1px solid #e5dced;
+    border-radius: 8px;
+}
+QToolButton#sectionToggle {
+    background: transparent;
+    border: 0;
+    border-radius: 7px;
+    color: #4a3b61;
+    font-weight: 650;
+    padding: 9px 10px;
+    text-align: left;
+}
+QToolButton#sectionToggle:hover {
+    background: #f7f2fc;
+}
+QWidget#sectionContent {
+    background: transparent;
+}
+QFrame#stickyActionBar {
+    background: #f4f0fb;
+    border: 0;
 }
 QScrollBar:vertical {
     background: #f3eef9;
@@ -595,7 +627,7 @@ ANNOTATE_HELP = {
     "output": (
         "Output folder",
         "Purpose: choose where 3D surface markers and build outputs will be saved.\n"
-        "Effect: Build Queued 3D Surfaces writes the surface OBJ files, project_config.json, and editable marker JSON.\n"
+        "Effect: Build 3D Surfaces writes the surface OBJ files, project_config.json, and editable marker JSON.\n"
         "Recommended: choose a project-specific folder so the annotation files are easy to find later.",
     ),
     "previous_csv": (
@@ -1133,6 +1165,64 @@ class CleanComboBox(QComboBox):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#715d8d"))
         painter.drawPolygon(arrow)
+
+
+class CollapsibleFormSection(QFrame):
+    """A form section whose header clearly behaves like an expand/collapse button."""
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, title: str, checked: bool = True, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("collapsibleSection")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+        self.toggle_button = QToolButton()
+        self.toggle_button.setObjectName("sectionToggle")
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.toggle_button.setMinimumHeight(40)
+        self.toggle_button.setCursor(Qt.PointingHandCursor)
+        self.toggle_button.setText(title)
+        self.toggle_button.clicked.connect(self._toggle)
+
+        self.content = QWidget()
+        self.content.setObjectName("sectionContent")
+        self.form = QFormLayout(self.content)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(self.content)
+
+        self._expanded = bool(checked)
+        self._apply_expanded_state(self._expanded)
+
+    def _apply_expanded_state(self, expanded: bool) -> None:
+        self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_button.setToolTip("Collapse section" if expanded else "Expand section")
+        self.content.setVisible(expanded)
+        collapsed_height = max(42, self.toggle_button.sizeHint().height() + 2)
+        self.setMaximumHeight(16777215 if expanded else collapsed_height)
+
+    def _toggle(self) -> None:
+        self.setChecked(not self._expanded)
+
+    def setChecked(self, checked: bool) -> None:
+        checked = bool(checked)
+        if self._expanded == checked:
+            self._apply_expanded_state(checked)
+            return
+        self._expanded = checked
+        self._apply_expanded_state(checked)
+        self.toggled.emit(checked)
+
+    def isChecked(self) -> bool:
+        return self._expanded
+
+    def setTitle(self, title: str) -> None:
+        self.toggle_button.setText(title)
 
 
 class SliceCanvas(QWidget):
@@ -2905,7 +2995,7 @@ class SurfacePreviewCanvas(QWidget):
             closed=False,
         )
         curve_count, point_count, patch_count = self.annotation_counts()
-        mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
+        mode_text = "Mode · Draw curve" if self.annotation_mode == "curve" else "Mode · Select surface"
         self._draw_message(
             painter,
             f"{mode_text}: {curve_count} curves · {point_count} points · {patch_count} seeds",
@@ -3453,13 +3543,14 @@ class LaminarBoundaryWindow(QMainWindow):
         title: str,
         checkable: bool = False,
         checked: bool = True,
-    ) -> tuple[QGroupBox, QFormLayout]:
-        section = QGroupBox(title)
-        section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+    ) -> tuple[QWidget, QFormLayout]:
         if checkable:
-            section.setCheckable(True)
-            section.setChecked(checked)
-        form = QFormLayout(section)
+            section = CollapsibleFormSection(title, checked=checked)
+            form = section.form
+        else:
+            section = QGroupBox(title)
+            section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            form = QFormLayout(section)
         self._tune_form(form)
         if checkable:
             section.toggled.connect(
@@ -3479,7 +3570,10 @@ class LaminarBoundaryWindow(QMainWindow):
                 if widget is not None:
                     widget.setVisible(visible)
 
-    def _set_collapsible_form_visible(self, section: QGroupBox, form: QFormLayout, visible: bool) -> None:
+    def _set_collapsible_form_visible(self, section: QWidget, form: QFormLayout, visible: bool) -> None:
+        if isinstance(section, CollapsibleFormSection):
+            section.setChecked(visible)
+            return
         self._set_form_widgets_visible(form, visible)
         section.setMaximumHeight(16777215 if visible else 48)
 
@@ -3504,8 +3598,24 @@ class LaminarBoundaryWindow(QMainWindow):
         button.setText("i")
         button.setCursor(Qt.PointingHandCursor)
         button.setToolTip("Show parameter help")
-        button.clicked.connect(lambda _checked=False, btn=button: self.toggle_help_popup(btn, title, body))
+        compact_body = self._compact_parameter_help(body)
+        button.clicked.connect(
+            lambda _checked=False, btn=button: self.toggle_help_popup(btn, title, compact_body)
+        )
         return button
+
+    def _compact_parameter_help(self, body: str) -> str:
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        purpose = next((line.removeprefix("Purpose: ") for line in lines if line.startswith("Purpose: ")), "")
+        recommendation = next(
+            (line.removeprefix("Recommended: ") for line in lines if line.startswith("Recommended: ")),
+            "",
+        )
+        if not purpose:
+            return body.strip()
+        if recommendation:
+            return f"{purpose}\n\nBest default: {recommendation}"
+        return purpose
 
     def toggle_help_popup(self, button: QToolButton, title: str, body: str) -> None:
         if self.active_help_popup is not None and self.active_help_popup.isVisible():
@@ -3623,19 +3733,38 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotation_preview_splitter = self._make_annotation_preview_area()
         self.annotate_settings_button = self._make_annotation_settings_button()
         self.annotate_controls_scroll = self._make_annotation_controls_scroll(controls)
+        annotation_sidebar = self._make_annotation_sidebar()
 
         layout.addWidget(self.annotate_settings_button)
-        layout.addWidget(self.annotate_controls_scroll)
+        layout.addWidget(annotation_sidebar)
         layout.addWidget(self.annotation_preview_splitter, 1)
         page_layout.addWidget(content, 1)
 
         self._init_annotation_state()
         return tab
 
+    def _make_annotation_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setMinimumWidth(420)
+        sidebar.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Expanding)
+
+        sticky_bar = QFrame()
+        sticky_bar.setObjectName("stickyActionBar")
+        sticky_layout = QVBoxLayout(sticky_bar)
+        sticky_layout.setContentsMargins(0, 2, 0, 0)
+        sticky_layout.setSpacing(0)
+        sticky_layout.addWidget(self.build_3d_button)
+
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(self.annotate_controls_scroll, 1)
+        layout.addWidget(sticky_bar)
+        return sidebar
+
     def _make_annotation_hint(self) -> QFrame:
         return self._make_hint(
-            "Choose one input source, then pick points directly on the 3D shell. "
-            "Close a curve, select the surface patch, then build."
+            "Load a region or mask, draw a closed curve, choose the enclosed surface, then build."
         )
 
     def _make_annotation_control_panel(self) -> QWidget:
@@ -3744,19 +3873,21 @@ class LaminarBoundaryWindow(QMainWindow):
         self.load_previous_csv_button = self._make_button("Load Previous Annotation JSON", "secondary")
         self.load_previous_csv_button.setToolTip("Load saved 3D surface annotation JSON into the annotation workspace.")
         self.load_previous_csv_button.clicked.connect(self.load_previous_annotation_csv)
-        self.draw_curve_button = self._make_button("Draw New Closed Curve", "secondary")
+        self.draw_curve_button = self._make_button("Draw Curve", "secondary")
+        self.draw_curve_button.setProperty("modeActive", "false")
         self.draw_curve_button.setToolTip("Start or continue a 3D shell cut curve.")
         self.draw_curve_button.clicked.connect(self.set_3d_curve_mode)
-        self.select_patch_button = self._make_button("Select Surface Patch", "secondary")
+        self.select_patch_button = self._make_button("Select Surface", "secondary")
+        self.select_patch_button.setProperty("modeActive", "false")
         self.select_patch_button.setToolTip("After at least one closed curve exists, click a surface patch to save.")
         self.select_patch_button.clicked.connect(self.set_3d_patch_mode)
-        self.undo_3d_button = self._make_button("Undo Last 3D Step (X)", "secondary")
+        self.undo_3d_button = self._make_button("Undo (X)", "secondary")
         self.undo_3d_button.setToolTip("Remove the last point, selected patch, or closed curve.")
         self.undo_3d_button.clicked.connect(self.undo_3d_annotation_action)
-        self.clear_3d_button = self._make_button("Clear 3D Annotation", "danger")
+        self.clear_3d_button = self._make_button("Clear All", "danger")
         self.clear_3d_button.setToolTip("Clear all 3D cut curves and selected surfaces.")
         self.clear_3d_button.clicked.connect(self.clear_3d_annotations)
-        self.build_3d_button = self._make_button("Build Queued 3D Surfaces", "primary")
+        self.build_3d_button = self._make_button("Build 3D Surfaces", "primary")
         self.build_3d_button.setToolTip(
             "Build all queued surfaces. Each closed curve creates one queue item; choose the item, name it, then select its seed patch."
         )
@@ -3806,7 +3937,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self.rebuild_review_button.setToolTip("Save review landmarks and rebuild into a new review output folder.")
         self.rebuild_review_button.clicked.connect(self.rebuild_review_round)
         self.export_button = self._make_button("Legacy 2D Export Removed", "secondary")
-        self.export_button.setToolTip("The old 2D slice export has been removed. Use Build Queued 3D Surfaces.")
+        self.export_button.setToolTip("The old 2D slice export has been removed. Use Build 3D Surfaces.")
         self.export_button.clicked.connect(self.export_annotation_csv)
         self.export_button.hide()
         self.export_mask_button = self._make_button("Export Current Mask", "secondary")
@@ -3816,6 +3947,18 @@ class LaminarBoundaryWindow(QMainWindow):
         action_layout = QVBoxLayout(action_row)
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(6)
+        mode_row = QWidget()
+        mode_layout = QHBoxLayout(mode_row)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.setSpacing(6)
+        mode_layout.addWidget(self.draw_curve_button)
+        mode_layout.addWidget(self.select_patch_button)
+        edit_row = QWidget()
+        edit_layout = QHBoxLayout(edit_row)
+        edit_layout.setContentsMargins(0, 0, 0, 0)
+        edit_layout.setSpacing(6)
+        edit_layout.addWidget(self.undo_3d_button)
+        edit_layout.addWidget(self.clear_3d_button)
         flip_row = QWidget()
         flip_layout = QHBoxLayout(flip_row)
         flip_layout.setContentsMargins(0, 0, 0, 0)
@@ -3828,15 +3971,11 @@ class LaminarBoundaryWindow(QMainWindow):
         single_surface_layout.setSpacing(6)
         single_surface_layout.addWidget(self.outer_only_slice_button)
         single_surface_layout.addWidget(self.inner_only_slice_button)
-        action_layout.addWidget(self.draw_curve_button)
-        action_layout.addWidget(self.select_patch_button)
-        action_layout.addWidget(self.undo_3d_button)
-        action_layout.addWidget(self.clear_3d_button)
+        action_layout.addWidget(mode_row)
+        action_layout.addWidget(edit_row)
         action_layout.addWidget(self.review_ok_button)
         action_layout.addWidget(self.save_review_button)
         action_layout.addWidget(self.rebuild_review_button)
-        action_layout.addWidget(self.export_mask_button)
-        action_layout.addWidget(self.build_3d_button)
         self._apply_review_mode_ui(False)
         return action_row
 
@@ -3868,7 +4007,7 @@ class LaminarBoundaryWindow(QMainWindow):
         source_form.addRow(
             "",
             self._make_note_label(
-                "Default: extract ENT from the whole Allen atlas into a temporary mask. Choose Mask only when you already have one."
+                "Default: extract ENT from the built-in Allen atlas. Choose Mask only when you already have one."
             ),
         )
         self._add_help_row(source_form, "Brain region", self.annotate_region, *ANNOTATE_HELP["region"])
@@ -3881,7 +4020,6 @@ class LaminarBoundaryWindow(QMainWindow):
         self.annotate_atlas_label = source_form.labelForField(self.annotate_atlas_row)
         self._update_custom_atlas_visibility(False)
         self._add_help_row(source_form, "Mask", self.annotate_mask, *ANNOTATE_HELP["mask"])
-        source_form.addRow("Checklist", self.annotation_readiness)
         source_form.addRow("", self.load_button)
         controls_layout.addWidget(source_box)
         self._update_annotation_source_title()
@@ -3937,6 +4075,7 @@ class LaminarBoundaryWindow(QMainWindow):
         self._add_help_row(save_form, "Output folder", self.annotate_output, *ANNOTATE_HELP["output"])
         self._add_help_row(save_form, "Previous annotation JSON", self.annotate_previous_csv, *ANNOTATE_HELP["previous_csv"])
         save_form.addRow("", self.load_previous_csv_button)
+        save_form.addRow("", self.export_mask_button)
         controls_layout.addWidget(save_box)
 
     def _add_annotation_advanced_section(self, controls_layout: QVBoxLayout) -> None:
@@ -4385,12 +4524,23 @@ class LaminarBoundaryWindow(QMainWindow):
         self.next_point_label.setText(text)
         if hasattr(self, "draw_curve_button"):
             can_close = point_count >= 3
-            self.draw_curve_button.setText("Close Current Curve" if can_close else "Draw New Closed Curve")
+            self.draw_curve_button.setText("Close Current Curve" if can_close else "Draw Curve")
             self.draw_curve_button.setToolTip(
                 "Close the current curve by connecting the last point back to the first point."
                 if can_close
                 else "Start or continue a 3D shell cut curve."
             )
+            shell_ready = self.surface_preview_canvas.shell_mesh is not None
+            self.draw_curve_button.setEnabled(shell_ready)
+            self.select_patch_button.setEnabled(shell_ready and bool(queue))
+            annotation_mode = getattr(self.surface_preview_canvas, "annotation_mode", "curve")
+            for button, active in (
+                (self.draw_curve_button, shell_ready and annotation_mode == "curve"),
+                (self.select_patch_button, shell_ready and annotation_mode == "patch"),
+            ):
+                button.setProperty("modeActive", "true" if active else "false")
+                button.style().unpolish(button)
+                button.style().polish(button)
         self.on_3d_build_ready_changed(self.surface_preview_canvas.can_build_3d_surfaces())
         if hasattr(self, "annotate_progress"):
             self._update_annotation_progress()
@@ -5294,7 +5444,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self,
             "2D slice build removed",
             "The app now builds surfaces from 3D shell curves and seed patches only.\n\n"
-            "Close a 3D curve, select the surface patch, name the queued surface, then click Build Queued 3D Surfaces.",
+            "Close a 3D curve, select the surface patch, name the queued surface, then click Build 3D Surfaces.",
         )
 
     def _go_to_next_annotation_slice(self) -> None:
@@ -5739,7 +5889,14 @@ class LaminarBoundaryWindow(QMainWindow):
             return
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if lines:
-            self.progress_dialog.setLabelText(lines[-1])
+            label = lines[-1]
+            chunk_match = re.search(r"chunk\s+(\d+)\s*/\s*(\d+)", label, flags=re.IGNORECASE)
+            if chunk_match:
+                current, total = (int(value) for value in chunk_match.groups())
+                self.progress_dialog.setRange(0, total)
+                self.progress_dialog.setValue(current)
+                label = f"Extracting target region · {current} of {total}"
+            self.progress_dialog.setLabelText(label)
 
     def _close_progress_dialog(self) -> None:
         if self.progress_dialog is not None:
@@ -5806,6 +5963,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setCancelButton(None)
         self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setMinimumWidth(380)
+        self.progress_dialog.setAutoClose(False)
+        self.progress_dialog.setAutoReset(False)
         self.progress_dialog.show()
 
         self.thread = QThread()
@@ -5904,6 +6064,9 @@ class LaminarBoundaryWindow(QMainWindow):
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setCancelButton(None)
         self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.setMinimumWidth(380)
+        self.progress_dialog.setAutoClose(False)
+        self.progress_dialog.setAutoReset(False)
         self.progress_dialog.show()
 
         self.thread = QThread()
@@ -7153,7 +7316,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self,
             "2D slice export removed",
             "The old 2D shell-cut export is no longer part of the app.\n\n"
-            "Use Build Queued 3D Surfaces; it saves the editable 3D marker JSON together with the surface build.",
+            "Use Build 3D Surfaces; it saves the editable 3D marker JSON together with the surface build.",
         )
 
     def export_current_annotation_mask(self) -> None:
@@ -7317,7 +7480,6 @@ class LaminarBoundaryWindow(QMainWindow):
         content_layout.addWidget(self._make_build_required_section())
         content_layout.addWidget(self._make_build_optional_section())
         content_layout.addWidget(self._make_build_advanced_section())
-        content_layout.addLayout(self._make_build_button_row())
         content_layout.addWidget(self._make_build_result_section())
         content_layout.addStretch(1)
 
@@ -7328,6 +7490,7 @@ class LaminarBoundaryWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(content)
         page_layout.addWidget(scroll, 1)
+        page_layout.addLayout(self._make_build_button_row())
         return tab
 
     def _make_build_hint(self) -> QFrame:
@@ -7648,7 +7811,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self,
             "2D review removed",
             "Rebuild Review Round belonged to the old 2D slice workflow.\n\n"
-            "Load the 3D annotation JSON, edit the points or seed patches, then click Build Queued 3D Surfaces.",
+            "Load the 3D annotation JSON, edit the points or seed patches, then click Build 3D Surfaces.",
         )
 
     def _finish_pending_review_after_mask_load(self, load_data: AnnotationLoadData) -> None:
@@ -7941,7 +8104,7 @@ class LaminarBoundaryWindow(QMainWindow):
             self,
             "2D surface extraction removed",
             "Extract Surfaces belonged to the old 2D slice workflow.\n\n"
-            "Use Build Queued 3D Surfaces on the Annotate page.",
+            "Use Build 3D Surfaces on the Annotate page.",
         )
 
     def run_build(self) -> None:

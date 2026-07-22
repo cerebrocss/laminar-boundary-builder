@@ -1683,7 +1683,7 @@ class ShellGLCanvas(QOpenGLWidget):
             self._draw_face_overlay(painter, int(self.hover_face), QColor(150, 120, 220, 95), QColor("#ffffff"), 1.6)
 
         curve_count, point_count, patch_count = self.annotation_counts()
-        mode_text = "Draw curve" if self.annotation_mode == "curve" else "Select surface"
+        mode_text = "Mode · Draw curve" if self.annotation_mode == "curve" else "Mode · Select surface"
         self._draw_message(
             painter,
             f"{mode_text}: {curve_count} curves · {point_count} points · {patch_count} seeds",
