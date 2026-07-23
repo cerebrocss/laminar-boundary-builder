@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import gc
 import gzip
+import heapq
 import json
 import math
 import os
@@ -25,7 +26,7 @@ import pickle
 import re
 import sys
 import warnings
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -36,11 +37,42 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 
+ProgressCallback = Callable[[int, str, str], None]
+
+
+def _emit_progress(
+    progress_callback: Optional[ProgressCallback],
+    value: float,
+    stage: str,
+    detail: str = "",
+) -> None:
+    if progress_callback is None:
+        return
+    clamped = max(0, min(100, int(round(float(value)))))
+    progress_callback(clamped, str(stage), str(detail or ""))
+
+
+def _progress_range(
+    progress_callback: Optional[ProgressCallback],
+    start: float,
+    stop: float,
+) -> Optional[ProgressCallback]:
+    if progress_callback is None:
+        return None
+
+    def emit(value: int, stage: str, detail: str = "") -> None:
+        scaled = float(start) + (float(stop) - float(start)) * (float(value) / 100.0)
+        _emit_progress(progress_callback, scaled, stage, detail)
+
+    return emit
+
+
 BOUNDARY_BACKGROUND = 0
 BOUNDARY_REGION = 1
 BOUNDARY_OUTER = 2
 BOUNDARY_INNER = 3
 BOUNDARY_LATERAL = 4
+BOUNDARY_UNKNOWN = 5
 
 SURFACE_MODE_NORMAL = "normal"
 SURFACE_MODE_OUTER_ONLY = "outer_only"
@@ -54,6 +86,41 @@ SURFACE_MODES = {
 SURFACE_BUILD_MASK_CONSTRAINED = "mask_constrained"
 SURFACE_BUILD_FAST_LOFT = "fast_loft"
 SURFACE_BUILD_CONTOUR_SHELL = "contour_shell"
+SURFACE_BUILD_ARC_GRAPH = "arc_graph"
+SURFACE_BUILD_SHELL_CUT = "shell_cut"
+
+SURFACE_METHOD_CATEGORY_SHELL_PATCH = "shell_patch"
+SURFACE_METHOD_CATEGORY_EXPERIMENTAL_STITCHING = "experimental_stitching"
+SURFACE_METHOD_CATEGORY_LEGACY_STITCHING = "legacy_stitching"
+SURFACE_METHOD_CATEGORY_LEGACY_MASK_LABELING = "legacy_mask_labeling"
+SURFACE_METHOD_CATEGORIES = {
+    SURFACE_BUILD_SHELL_CUT: SURFACE_METHOD_CATEGORY_SHELL_PATCH,
+    SURFACE_BUILD_ARC_GRAPH: SURFACE_METHOD_CATEGORY_EXPERIMENTAL_STITCHING,
+    SURFACE_BUILD_CONTOUR_SHELL: SURFACE_METHOD_CATEGORY_LEGACY_STITCHING,
+    SURFACE_BUILD_FAST_LOFT: SURFACE_METHOD_CATEGORY_LEGACY_STITCHING,
+    SURFACE_BUILD_MASK_CONSTRAINED: SURFACE_METHOD_CATEGORY_LEGACY_MASK_LABELING,
+}
+SURFACE_BUILD_LEGACY_METHODS = {
+    SURFACE_BUILD_MASK_CONSTRAINED,
+    SURFACE_BUILD_FAST_LOFT,
+    SURFACE_BUILD_CONTOUR_SHELL,
+}
+
+SHELL_BACKEND_VOXEL = "voxel"
+SHELL_BACKEND_MARCHING_CUBES = "marching_cubes"
+SHELL_BACKENDS = {
+    SHELL_BACKEND_VOXEL,
+    SHELL_BACKEND_MARCHING_CUBES,
+}
+
+SHELL_CUT_ANNOTATION_SCHEMA = "laminar_boundary_builder.shell_cut_annotations.v1"
+SURFACE_3D_ANNOTATION_SCHEMA = "laminar_boundary_builder.surface_3d_annotations.v1"
+SHELL_CUT_MANUAL_POINT_NAMES = (
+    "outer_cut_A",
+    "outer_cut_B",
+    "inner_cut_A",
+    "inner_cut_B",
+)
 
 
 def normalize_surface_mode(value: Optional[str]) -> str:
@@ -94,10 +161,72 @@ def normalize_surface_build_method(value: Optional[str]) -> str:
         "legacy": SURFACE_BUILD_FAST_LOFT,
         "contour": SURFACE_BUILD_CONTOUR_SHELL,
         "contour_shell": SURFACE_BUILD_CONTOUR_SHELL,
+        "arc": SURFACE_BUILD_ARC_GRAPH,
+        "arc_graph": SURFACE_BUILD_ARC_GRAPH,
+        "local_arc": SURFACE_BUILD_ARC_GRAPH,
+        "local_arc_graph": SURFACE_BUILD_ARC_GRAPH,
+        "shell": SURFACE_BUILD_SHELL_CUT,
+        "shell_cut": SURFACE_BUILD_SHELL_CUT,
+        "surface_patch": SURFACE_BUILD_SHELL_CUT,
+        "patch": SURFACE_BUILD_SHELL_CUT,
     }
     if method not in aliases:
         raise ValueError(f"Unknown surface_method: {value}")
     return aliases[method]
+
+
+def surface_build_method_category(value: Optional[str]) -> str:
+    method = normalize_surface_build_method(value)
+    return SURFACE_METHOD_CATEGORIES.get(method, "unknown")
+
+
+def surface_method_registry() -> Dict[str, Dict[str, str]]:
+    return {
+        SURFACE_BUILD_SHELL_CUT: {
+            "role": "main",
+            "category": SURFACE_METHOD_CATEGORY_SHELL_PATCH,
+            "description": "main shell-cut patch extraction workflow",
+        },
+        SURFACE_BUILD_ARC_GRAPH: {
+            "role": "experimental",
+            "category": SURFACE_METHOD_CATEGORY_EXPERIMENTAL_STITCHING,
+            "description": "experimental local arc graph stitcher and QC helper",
+        },
+        SURFACE_BUILD_CONTOUR_SHELL: {
+            "role": "legacy",
+            "category": SURFACE_METHOD_CATEGORY_LEGACY_STITCHING,
+            "description": "legacy whole-contour stitching baseline",
+        },
+        SURFACE_BUILD_FAST_LOFT: {
+            "role": "legacy",
+            "category": SURFACE_METHOD_CATEGORY_LEGACY_STITCHING,
+            "description": "legacy quick preview loft",
+        },
+        SURFACE_BUILD_MASK_CONSTRAINED: {
+            "role": "legacy",
+            "category": SURFACE_METHOD_CATEGORY_LEGACY_MASK_LABELING,
+            "description": "legacy voxel label baseline",
+        },
+    }
+
+
+def normalize_shell_backend(value: Optional[str]) -> str:
+    backend = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": SHELL_BACKEND_VOXEL,
+        "voxel": SHELL_BACKEND_VOXEL,
+        "voxel_shell": SHELL_BACKEND_VOXEL,
+        "debug_voxel": SHELL_BACKEND_VOXEL,
+        "marching": SHELL_BACKEND_MARCHING_CUBES,
+        "marching_cube": SHELL_BACKEND_MARCHING_CUBES,
+        "marching_cubes": SHELL_BACKEND_MARCHING_CUBES,
+        "mc": SHELL_BACKEND_MARCHING_CUBES,
+        "smooth": SHELL_BACKEND_MARCHING_CUBES,
+        "smooth_shell": SHELL_BACKEND_MARCHING_CUBES,
+    }
+    if backend not in aliases:
+        raise ValueError(f"Unknown shell_backend: {value}")
+    return aliases[backend]
 
 
 def _row_surface_mode(row: Dict[str, str]) -> str:
@@ -237,6 +366,123 @@ class SurfaceMesh:
     faces: np.ndarray
 
 
+@dataclass
+class ShellMesh:
+    vertices: np.ndarray
+    faces: np.ndarray
+    spacing: np.ndarray
+    backend: str
+    coordinate_space: str = "index"
+    face_sources: Optional[List[Dict]] = None
+
+
+@dataclass
+class SurfaceCutCurve:
+    curve_id: str
+    label_left: str
+    label_right: str
+    control_points: np.ndarray
+    source: str = "annotation_derived"
+    confidence: float = 1.0
+    snapped_vertices: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    snapped_points: np.ndarray = field(default_factory=lambda: np.empty((0, 3), dtype=float))
+    mesh_vertex_path: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
+    cut_edges: List[Tuple[int, int]] = field(default_factory=list)
+    is_closed: bool = False
+    closure_error: float = math.nan
+    mean_snap_distance: float = math.nan
+    max_snap_distance: float = math.nan
+    path_length: float = math.nan
+    control_polyline_length: float = math.nan
+    path_length_ratio: float = math.nan
+    status: str = "pending"
+    reason: str = ""
+
+
+@dataclass
+class SurfacePatchSeed:
+    patch_label: str
+    seed_point: np.ndarray
+    source: str = "auto_from_annotation"
+    snapped_face: Optional[int] = None
+    snap_distance: Optional[float] = None
+    status: str = "pending"
+    reason: str = ""
+
+
+@dataclass
+class ArcSegment:
+    arc_id: str
+    slice_index: int
+    contour_id: int
+    label: int
+    points: np.ndarray
+    scoring_points: np.ndarray
+    is_closed: bool
+    source: str
+    confidence: float
+    boundary_source: str
+    length: float
+    centroid: np.ndarray
+    start_point: np.ndarray
+    end_point: np.ndarray
+    tangent_start: np.ndarray
+    tangent_end: np.ndarray
+    curvature: np.ndarray
+
+
+@dataclass
+class ArcRange:
+    arc_id: str
+    start_fraction: float
+    end_fraction: float
+    start_index: int
+    end_index: int
+    length: float
+
+
+@dataclass
+class ArcMatch:
+    prev_arc_id: str
+    next_arc_id: str
+    label: int
+    prev_sample_indices: np.ndarray
+    next_sample_indices: np.ndarray
+    prev_fraction_start: float
+    prev_fraction_end: float
+    next_fraction_start: float
+    next_fraction_end: float
+    direction: int
+    event_type: str
+    cost: float
+    confidence: float
+    coverage_prev: float
+    coverage_next: float
+    mean_distance: float
+    max_distance: float
+    length_ratio: float
+    reason: str
+    accepted: bool = False
+
+
+@dataclass
+class TopologyEvent:
+    slice_left: int
+    slice_right: int
+    arc_id: str
+    label: int
+    event_type: str
+    severity: str
+    start_fraction: float
+    end_fraction: float
+    start_index: int
+    end_index: int
+    coverage_prev: float
+    coverage_next: float
+    cost: Optional[float]
+    reason: str
+
+
 def load_volume(path: str | Path) -> VolumeData:
     """Load a 3D volume from NRRD, NumPy, or NIfTI if nibabel is installed."""
 
@@ -276,6 +522,44 @@ def load_volume(path: str | Path) -> VolumeData:
         )
 
     raise ValueError(f"Unsupported volume format: {path}")
+
+
+def _voxel_spacing_from_volume(volume: VolumeData) -> np.ndarray:
+    """Best-effort voxel spacing used for geometry scoring, not output coordinates."""
+
+    if volume.affine is not None:
+        affine = np.asarray(volume.affine, dtype=float)
+        if affine.shape[0] >= 3 and affine.shape[1] >= 3:
+            spacing = np.linalg.norm(affine[:3, :3], axis=0)
+            if np.all(np.isfinite(spacing)) and np.all(spacing > 0):
+                return spacing.astype(float)
+
+    header = volume.header or {}
+    for key in ("space directions", "space_directions"):
+        directions = header.get(key)
+        if directions is None:
+            continue
+        try:
+            array = np.asarray(directions, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if array.ndim == 2 and array.shape[0] >= 3:
+            spacing = np.linalg.norm(array[:3, :3], axis=1)
+            if np.all(np.isfinite(spacing)) and np.all(spacing > 0):
+                return spacing.astype(float)
+
+    for key in ("spacings", "spacing"):
+        spacings = header.get(key)
+        if spacings is None:
+            continue
+        try:
+            spacing = np.asarray(spacings, dtype=float).reshape(-1)[:3]
+        except (TypeError, ValueError):
+            continue
+        if len(spacing) == 3 and np.all(np.isfinite(spacing)) and np.all(spacing > 0):
+            return spacing.astype(float)
+
+    return np.ones(3, dtype=float)
 
 
 def _read_nrrd_fallback(path: str | Path) -> Tuple[np.ndarray, Dict]:
@@ -1398,6 +1682,23 @@ def _write_csv_rows(
         writer.writerows(rows)
 
 
+def write_surface_method_registry(path: str | Path) -> None:
+    rows = [
+        {
+            "surface_method": method,
+            "role": meta["role"],
+            "category": meta["category"],
+            "description": meta["description"],
+        }
+        for method, meta in surface_method_registry().items()
+    ]
+    _write_csv_rows(
+        path,
+        rows,
+        fieldnames=["surface_method", "role", "category", "description"],
+    )
+
+
 def make_boundary_from_landmark_row(
     contour: Contour2D,
     row: Dict[str, str],
@@ -1522,6 +1823,29 @@ def build_manual_boundaries(
         contour = _select_contour_for_row(row, by_slice.get(slice_index, []))
         boundaries.append(make_boundary_from_landmark_row(contour, row, resample_points))
     return sorted(boundaries, key=lambda boundary: boundary.slice_index)
+
+
+def validate_endpoint_annotations(
+    contours: Sequence[Contour2D],
+    manual_boundaries: Sequence[BoundarySlice],
+) -> None:
+    if not contours or not manual_boundaries:
+        return
+
+    first_slice = min(contour.slice_index for contour in contours)
+    last_slice = max(contour.slice_index for contour in contours)
+    manual_slices = {boundary.slice_index for boundary in manual_boundaries}
+    missing = [
+        slice_index
+        for slice_index in (first_slice, last_slice)
+        if slice_index not in manual_slices
+    ]
+    if missing:
+        missing_text = ", ".join(str(slice_index) for slice_index in missing)
+        raise ValueError(
+            "The first and last contour slices must be manually annotated. "
+            f"Missing endpoint slice(s): {missing_text}."
+        )
 
 
 def _min_curve_distance(
@@ -1726,7 +2050,39 @@ def propagate_boundaries(
                 min_outer_inner_distance=min_distance,
             )
 
+    _extend_single_surface_tail(
+        output,
+        by_slice,
+        sorted_manual,
+        resample_points=resample_points,
+    )
     return [output[key] for key in sorted(output)]
+
+
+def _extend_single_surface_tail(
+    output: Dict[int, BoundarySlice],
+    by_slice: Dict[int, List[Contour2D]],
+    sorted_manual: Sequence[BoundarySlice],
+    resample_points: int,
+) -> None:
+    if not sorted_manual:
+        return
+
+    last = sorted_manual[-1]
+    last_mode = normalize_surface_mode(last.surface_mode)
+    if last_mode == SURFACE_MODE_NORMAL:
+        return
+
+    for slice_index in sorted(by_slice):
+        if slice_index <= last.slice_index or slice_index in output:
+            continue
+        contour = max(by_slice[slice_index], key=lambda item: item.area)
+        output[slice_index] = make_whole_contour_boundary(
+            contour,
+            surface_mode=last_mode,
+            resample_points=resample_points,
+            source="auto",
+        )
 
 
 def save_boundaries_json(boundaries: Sequence[BoundarySlice], path: str | Path) -> None:
@@ -2155,6 +2511,78 @@ def write_ply(path: str | Path, mesh: SurfaceMesh) -> None:
             handle.write(f"3 {face[0]} {face[1]} {face[2]}\n")
 
 
+def _write_colored_line_ply(
+    path: str | Path,
+    vertices: np.ndarray,
+    edges: Sequence[Tuple[int, int]],
+    vertex_colors: Optional[np.ndarray] = None,
+    edge_colors: Optional[np.ndarray] = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vertices = np.asarray(vertices, dtype=float).reshape(-1, 3)
+    if vertex_colors is None:
+        vertex_colors = np.full((len(vertices), 3), 255, dtype=np.uint8)
+    else:
+        vertex_colors = np.asarray(vertex_colors, dtype=np.uint8).reshape(-1, 3)
+    if edge_colors is None:
+        edge_colors = np.full((len(edges), 3), 255, dtype=np.uint8)
+    else:
+        edge_colors = np.asarray(edge_colors, dtype=np.uint8).reshape(-1, 3)
+
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\nformat ascii 1.0\n")
+        handle.write(f"element vertex {len(vertices)}\n")
+        handle.write("property float x\nproperty float y\nproperty float z\n")
+        handle.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        handle.write(f"element edge {len(edges)}\n")
+        handle.write("property int vertex1\nproperty int vertex2\n")
+        handle.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        handle.write("end_header\n")
+        for vertex, color in zip(vertices, vertex_colors):
+            handle.write(
+                f"{vertex[0]:.6f} {vertex[1]:.6f} {vertex[2]:.6f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+        for edge, color in zip(edges, edge_colors):
+            handle.write(
+                f"{int(edge[0])} {int(edge[1])} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+
+
+def _write_colored_mesh_ply(
+    path: str | Path,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    vertex_colors: Optional[np.ndarray] = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vertices = np.asarray(vertices, dtype=float).reshape(-1, 3)
+    faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+    if vertex_colors is None:
+        vertex_colors = np.full((len(vertices), 3), 220, dtype=np.uint8)
+    else:
+        vertex_colors = np.asarray(vertex_colors, dtype=np.uint8).reshape(-1, 3)
+
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\nformat ascii 1.0\n")
+        handle.write(f"element vertex {len(vertices)}\n")
+        handle.write("property float x\nproperty float y\nproperty float z\n")
+        handle.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        handle.write(f"element face {len(faces)}\n")
+        handle.write("property list uchar int vertex_indices\n")
+        handle.write("end_header\n")
+        for vertex, color in zip(vertices, vertex_colors):
+            handle.write(
+                f"{vertex[0]:.6f} {vertex[1]:.6f} {vertex[2]:.6f} "
+                f"{int(color[0])} {int(color[1])} {int(color[2])}\n"
+            )
+        for face in faces:
+            handle.write(f"3 {int(face[0])} {int(face[1])} {int(face[2])}\n")
+
+
 def write_obj(path: str | Path, mesh: SurfaceMesh) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2165,6 +2593,46 @@ def write_obj(path: str | Path, mesh: SurfaceMesh) -> None:
         for face in mesh.faces:
             # OBJ indices are 1-based.
             handle.write(f"f {face[0] + 1} {face[1] + 1} {face[2] + 1}\n")
+
+
+def _write_colored_obj(
+    path: str | Path,
+    name: str,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    face_materials: Optional[Sequence[str]] = None,
+    materials: Optional[Dict[str, Tuple[int, int, int]]] = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    vertices = np.asarray(vertices, dtype=float).reshape(-1, 3)
+    faces = np.asarray(faces, dtype=np.int32).reshape(-1, 3)
+    if face_materials is None:
+        face_materials = ["default"] * len(faces)
+    if materials is None:
+        materials = {"default": (220, 220, 220)}
+
+    mtl_path = path.with_suffix(".mtl")
+    with mtl_path.open("w", encoding="utf-8") as handle:
+        for material_name, color in materials.items():
+            rgb = np.asarray(color, dtype=float) / 255.0
+            handle.write(f"newmtl {material_name}\n")
+            handle.write(f"Kd {rgb[0]:.6f} {rgb[1]:.6f} {rgb[2]:.6f}\n")
+            handle.write("Ka 0.000000 0.000000 0.000000\n")
+            handle.write("Ks 0.000000 0.000000 0.000000\n")
+            handle.write("d 1.000000\n\n")
+
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write(f"mtllib {mtl_path.name}\n")
+        handle.write(f"o {name}\n")
+        for vertex in vertices:
+            handle.write(f"v {vertex[0]:.6f} {vertex[1]:.6f} {vertex[2]:.6f}\n")
+        active_material = None
+        for face, material_name in zip(faces, face_materials):
+            if material_name != active_material:
+                handle.write(f"usemtl {material_name}\n")
+                active_material = material_name
+            handle.write(f"f {int(face[0]) + 1} {int(face[1]) + 1} {int(face[2]) + 1}\n")
 
 
 def mask_constrained_surface_patches(
@@ -2182,6 +2650,17 @@ def mask_constrained_surface_patches(
     if quad_count > max_surface_quads:
         raise ValueError(
             f"Mask surface has {quad_count:,} exposed faces; limit is {max_surface_quads:,}"
+        )
+
+    slice_axis_int = _slice_axis_to_int(slice_axis)
+    guarded_slice_planes = _large_slice_transition_planes(mask, slice_axis_int)
+    if guarded_slice_planes:
+        preview = ", ".join(f"{plane:g}" for plane in sorted(guarded_slice_planes)[:8])
+        extra = "" if len(guarded_slice_planes) <= 8 else f", +{len(guarded_slice_planes) - 8} more"
+        warnings.warn(
+            "Skipping large slice-transition cap faces while building surfaces: "
+            f"{preview}{extra}",
+            RuntimeWarning,
         )
 
     seed_trees = _surface_seed_trees(boundaries)
@@ -2222,6 +2701,18 @@ def mask_constrained_surface_patches(
         if len(y_values) == 0:
             return
         centers = _voxel_face_centers(side, x, y_values, z_values)
+        keep = _surface_face_guard_mask(
+            side,
+            centers,
+            slice_axis_int,
+            guarded_slice_planes,
+        )
+        if not np.any(keep):
+            return
+        if not np.all(keep):
+            centers = centers[keep]
+            y_values = y_values[keep]
+            z_values = z_values[keep]
         labels = _classify_surface_centers(centers, seed_trees)
         for label, y, z in zip(labels, y_values, z_values):
             add_quad(int(label), _voxel_face_vertices2(side, x, int(y), int(z)))
@@ -2280,6 +2771,63 @@ def mask_constrained_surface_patches(
         missing = ", ".join(name for name in ("outer", "inner") if name not in meshes)
         raise ValueError(f"Voxel surface build produced no {missing} mesh")
     return meshes
+
+
+def _large_slice_transition_planes(
+    mask: np.ndarray,
+    slice_axis: int,
+    min_changed_faces: int = 1000,
+    percentile: float = 99.0,
+) -> set[float]:
+    """Find abrupt slice-to-slice mask jumps that would become artificial caps."""
+
+    if mask.shape[slice_axis] < 2:
+        return set()
+
+    changes: List[int] = []
+    for index in range(mask.shape[slice_axis] - 1):
+        left = _take_slice(mask, index, slice_axis)
+        right = _take_slice(mask, index + 1, slice_axis)
+        changes.append(int(np.count_nonzero(left != right)))
+
+    nonzero = np.asarray([value for value in changes if value > 0], dtype=float)
+    if len(nonzero) == 0:
+        return set()
+
+    threshold = max(float(min_changed_faces), float(np.percentile(nonzero, percentile)))
+    return {
+        float(index) + 0.5
+        for index, changed_faces in enumerate(changes)
+        if float(changed_faces) >= threshold
+    }
+
+
+def _surface_side_axis(side: str) -> int:
+    if side.startswith("x_"):
+        return 0
+    if side.startswith("y_"):
+        return 1
+    if side.startswith("z_"):
+        return 2
+    raise ValueError(f"Unknown voxel face side: {side}")
+
+
+def _surface_face_guard_mask(
+    side: str,
+    centers: np.ndarray,
+    slice_axis: int,
+    guarded_slice_planes: set[float],
+) -> np.ndarray:
+    keep = np.ones(len(centers), dtype=bool)
+    if not guarded_slice_planes or _surface_side_axis(side) != slice_axis:
+        return keep
+
+    guarded = {round(float(value), 3) for value in guarded_slice_planes}
+    center_planes = np.round(centers[:, slice_axis].astype(float), 3)
+    for index, plane in enumerate(center_planes):
+        if float(plane) in guarded:
+            keep[index] = False
+    return keep
 
 
 def _count_exposed_voxel_quads(mask: np.ndarray) -> int:
@@ -2532,10 +3080,3534 @@ def _voxel_face_vertices2(side: str, x: int, y: int, z: int) -> List[Tuple[int, 
     raise ValueError(f"Unknown voxel face side: {side}")
 
 
+def build_voxel_shell_mesh(
+    mask: np.ndarray,
+    spacing: Optional[np.ndarray] = None,
+    max_surface_quads: int = 1_500_000,
+) -> ShellMesh:
+    """Build one complete voxel shell mesh from all exposed mask faces."""
+
+    mask = _as_bool_mask(mask)
+    quad_count = _count_exposed_voxel_quads(mask)
+    if quad_count > max_surface_quads:
+        raise ValueError(
+            f"Mask surface has {quad_count:,} exposed faces; limit is {max_surface_quads:,}"
+        )
+
+    vertices: List[Tuple[int, int, int]] = []
+    vertex_by_key: Dict[Tuple[int, int, int], int] = {}
+    faces: List[List[int]] = []
+    face_sources: List[Dict] = []
+
+    def vertex_index(vertex: Tuple[int, int, int]) -> int:
+        existing = vertex_by_key.get(vertex)
+        if existing is not None:
+            return existing
+        index = len(vertices)
+        vertex_by_key[vertex] = index
+        vertices.append(vertex)
+        return index
+
+    def add_quad(side: str, x: int, y: int, z: int) -> None:
+        quad = _voxel_face_vertices2(side, x, y, z)
+        indices = [vertex_index(tuple(vertex)) for vertex in quad]
+        faces.append([indices[0], indices[1], indices[2]])
+        faces.append([indices[2], indices[1], indices[3]])
+        source = {"voxel_x": int(x), "voxel_y": int(y), "voxel_z": int(z), "side": side}
+        face_sources.append(dict(source))
+        face_sources.append(dict(source))
+
+    def emit(side: str, x: int, y_values: np.ndarray, z_values: np.ndarray) -> None:
+        for y, z in zip(y_values, z_values):
+            add_quad(side, x, int(y), int(z))
+
+    previous = np.zeros(mask.shape[1:], dtype=bool)
+    for x in range(mask.shape[0]):
+        current = np.asarray(mask[x], dtype=bool)
+
+        y_values, z_values = np.nonzero(current & ~previous)
+        emit("x_minus", x, y_values, z_values)
+        if x > 0:
+            y_values, z_values = np.nonzero(previous & ~current)
+            emit("x_plus", x - 1, y_values, z_values)
+
+        z_values = np.nonzero(current[0, :])[0]
+        emit("y_minus", x, np.zeros(len(z_values), dtype=int), z_values)
+        z_values = np.nonzero(current[-1, :])[0]
+        emit("y_plus", x, np.full(len(z_values), current.shape[0] - 1, dtype=int), z_values)
+        y_values, z_values = np.nonzero(current[1:, :] & ~current[:-1, :])
+        emit("y_minus", x, y_values + 1, z_values)
+        y_values, z_values = np.nonzero(current[:-1, :] & ~current[1:, :])
+        emit("y_plus", x, y_values, z_values)
+
+        y_values = np.nonzero(current[:, 0])[0]
+        emit("z_minus", x, y_values, np.zeros(len(y_values), dtype=int))
+        y_values = np.nonzero(current[:, -1])[0]
+        emit("z_plus", x, y_values, np.full(len(y_values), current.shape[1] - 1, dtype=int))
+        y_values, z_values = np.nonzero(current[:, 1:] & ~current[:, :-1])
+        emit("z_minus", x, y_values, z_values + 1)
+        y_values, z_values = np.nonzero(current[:, :-1] & ~current[:, 1:])
+        emit("z_plus", x, y_values, z_values)
+
+        previous = current
+
+    y_values, z_values = np.nonzero(previous)
+    emit("x_plus", mask.shape[0] - 1, y_values, z_values)
+
+    return ShellMesh(
+        vertices=np.asarray(vertices, dtype=float) * 0.5,
+        faces=np.asarray(faces, dtype=np.int32).reshape(-1, 3),
+        spacing=np.asarray(spacing if spacing is not None else np.ones(3), dtype=float),
+        backend="voxel",
+        coordinate_space="index",
+        face_sources=face_sources,
+    )
+
+
+_MARCHING_CUBE_CORNERS = np.asarray(
+    [
+        [0, 0, 0],
+        [1, 0, 0],
+        [1, 1, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+        [1, 0, 1],
+        [1, 1, 1],
+        [0, 1, 1],
+    ],
+    dtype=np.int16,
+)
+_MARCHING_TETRAHEDRA = (
+    (0, 5, 1, 6),
+    (0, 1, 2, 6),
+    (0, 2, 3, 6),
+    (0, 3, 7, 6),
+    (0, 7, 4, 6),
+    (0, 4, 5, 6),
+)
+
+
+def _marching_edge_key(left: np.ndarray, right: np.ndarray) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    left_key = tuple(int(value) for value in left)
+    right_key = tuple(int(value) for value in right)
+    return (left_key, right_key) if left_key <= right_key else (right_key, left_key)
+
+
+def _add_unique_triangle(
+    faces: List[List[int]],
+    seen_faces: set[Tuple[int, int, int]],
+    a: int,
+    b: int,
+    c: int,
+) -> None:
+    if a == b or b == c or a == c:
+        return
+    key = tuple(sorted((int(a), int(b), int(c))))
+    if key in seen_faces:
+        return
+    seen_faces.add(key)
+    faces.append([int(a), int(b), int(c)])
+
+
+def build_marching_cubes_shell_mesh(
+    mask: np.ndarray,
+    spacing: Optional[np.ndarray] = None,
+    max_surface_quads: int = 1_500_000,
+    smoothing_sigma: float = 0.65,
+    iso_value: float = 0.5,
+) -> ShellMesh:
+    """Build a smoother isosurface shell without adding a scikit-image dependency.
+
+    The implementation uses marching tetrahedra inside each cube. It serves the
+    same purpose as marching cubes here: turn the mask into a triangle shell that
+    is less blocky than the debug voxel backend.
+    """
+
+    mask = _as_bool_mask(mask)
+    if not np.any(mask):
+        raise ValueError("Cannot build a marching-cubes shell from an empty mask")
+
+    padded = np.pad(mask.astype(float), 1, mode="constant", constant_values=0.0)
+    field = ndimage.gaussian_filter(padded, sigma=float(smoothing_sigma)) if smoothing_sigma > 0 else padded
+
+    corner_fields = [
+        field[
+            corner[0] : corner[0] + field.shape[0] - 1,
+            corner[1] : corner[1] + field.shape[1] - 1,
+            corner[2] : corner[2] + field.shape[2] - 1,
+        ]
+        for corner in _MARCHING_CUBE_CORNERS
+    ]
+    cell_min = np.minimum.reduce(corner_fields)
+    cell_max = np.maximum.reduce(corner_fields)
+    active = (cell_min <= iso_value) & (cell_max >= iso_value) & (cell_max > cell_min)
+    active_cells = np.argwhere(active)
+    if len(active_cells) == 0:
+        raise ValueError("Marching-cubes shell has no active cells; mask may be too small after smoothing")
+    if len(active_cells) > max_surface_quads:
+        raise ValueError(
+            f"Marching-cubes shell has {len(active_cells):,} active cells; limit is {max_surface_quads:,}"
+        )
+
+    vertices: List[np.ndarray] = []
+    vertex_by_edge: Dict[Tuple[Tuple[int, int, int], Tuple[int, int, int]], int] = {}
+    faces: List[List[int]] = []
+    seen_faces: set[Tuple[int, int, int]] = set()
+
+    def edge_vertex(corner_a: np.ndarray, value_a: float, corner_b: np.ndarray, value_b: float) -> int:
+        key = _marching_edge_key(corner_a, corner_b)
+        existing = vertex_by_edge.get(key)
+        if existing is not None:
+            return existing
+        denom = float(value_b - value_a)
+        if abs(denom) <= 1e-12:
+            t = 0.5
+        else:
+            t = float(np.clip((iso_value - value_a) / denom, 0.0, 1.0))
+        point = np.asarray(corner_a, dtype=float) + t * (np.asarray(corner_b, dtype=float) - np.asarray(corner_a, dtype=float))
+        point -= 1.0
+        index = len(vertices)
+        vertex_by_edge[key] = index
+        vertices.append(point)
+        return index
+
+    def add_tetra(cell_origin: np.ndarray, tetra: Tuple[int, int, int, int]) -> None:
+        corner_ids = list(tetra)
+        coords = [cell_origin + _MARCHING_CUBE_CORNERS[corner] for corner in corner_ids]
+        values = [float(field[tuple(coord)]) for coord in coords]
+        inside = [index for index, value in enumerate(values) if value >= iso_value]
+        outside = [index for index, value in enumerate(values) if value < iso_value]
+
+        if len(inside) == 0 or len(inside) == 4:
+            return
+        if len(inside) == 1:
+            center = inside[0]
+            verts = [
+                edge_vertex(coords[center], values[center], coords[index], values[index])
+                for index in outside
+            ]
+            _add_unique_triangle(faces, seen_faces, verts[0], verts[1], verts[2])
+            return
+        if len(inside) == 3:
+            center = outside[0]
+            verts = [
+                edge_vertex(coords[center], values[center], coords[index], values[index])
+                for index in inside
+            ]
+            _add_unique_triangle(faces, seen_faces, verts[0], verts[2], verts[1])
+            return
+
+        left, right = inside
+        outer_left, outer_right = outside
+        v00 = edge_vertex(coords[left], values[left], coords[outer_left], values[outer_left])
+        v01 = edge_vertex(coords[left], values[left], coords[outer_right], values[outer_right])
+        v10 = edge_vertex(coords[right], values[right], coords[outer_left], values[outer_left])
+        v11 = edge_vertex(coords[right], values[right], coords[outer_right], values[outer_right])
+        _add_unique_triangle(faces, seen_faces, v00, v10, v01)
+        _add_unique_triangle(faces, seen_faces, v01, v10, v11)
+
+    for cell_origin in active_cells:
+        origin = np.asarray(cell_origin, dtype=np.int64)
+        for tetra in _MARCHING_TETRAHEDRA:
+            add_tetra(origin, tetra)
+
+    if not vertices or not faces:
+        raise ValueError("Marching-cubes shell produced no triangles")
+
+    return ShellMesh(
+        vertices=np.asarray(vertices, dtype=float),
+        faces=np.asarray(faces, dtype=np.int32).reshape(-1, 3),
+        spacing=np.asarray(spacing if spacing is not None else np.ones(3), dtype=float),
+        backend=SHELL_BACKEND_MARCHING_CUBES,
+        coordinate_space="index",
+        face_sources=None,
+    )
+
+
+def _crop_mask_to_foreground(mask: np.ndarray, padding: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+    mask = _as_bool_mask(mask)
+    points = np.argwhere(mask)
+    if len(points) == 0:
+        return mask, np.zeros(3, dtype=float)
+    start = np.maximum(points.min(axis=0) - int(padding), 0)
+    stop = np.minimum(points.max(axis=0) + int(padding) + 1, np.asarray(mask.shape, dtype=int))
+    slices = tuple(slice(int(left), int(right)) for left, right in zip(start, stop))
+    return mask[slices], start.astype(float)
+
+
+def _offset_shell_mesh(mesh: ShellMesh, offset: np.ndarray) -> ShellMesh:
+    offset = np.asarray(offset, dtype=float).reshape(3)
+    if not np.any(offset):
+        return mesh
+    mesh.vertices = np.asarray(mesh.vertices, dtype=float) + offset.reshape(1, 3)
+    if mesh.face_sources:
+        int_offset = np.rint(offset).astype(int)
+        for source in mesh.face_sources:
+            for axis_index, key in enumerate(("voxel_x", "voxel_y", "voxel_z")):
+                if key in source:
+                    source[key] = int(source[key]) + int(int_offset[axis_index])
+    return mesh
+
+
+def build_shell_mesh(
+    mask: np.ndarray,
+    spacing: Optional[np.ndarray] = None,
+    shell_backend: str = SHELL_BACKEND_VOXEL,
+    max_surface_quads: int = 1_500_000,
+) -> ShellMesh:
+    backend = normalize_shell_backend(shell_backend)
+    mask, offset = _crop_mask_to_foreground(mask)
+    if backend == SHELL_BACKEND_VOXEL:
+        return _offset_shell_mesh(
+            build_voxel_shell_mesh(mask, spacing=spacing, max_surface_quads=max_surface_quads),
+            offset,
+        )
+    if backend == SHELL_BACKEND_MARCHING_CUBES:
+        return _offset_shell_mesh(
+            build_marching_cubes_shell_mesh(mask, spacing=spacing, max_surface_quads=max_surface_quads),
+            offset,
+        )
+    raise ValueError(f"Unknown shell_backend: {shell_backend}")
+
+
+def _dedupe_polyline_points(points: np.ndarray, tolerance: float = 1e-6) -> np.ndarray:
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    if len(points) == 0:
+        return points
+    kept = [points[0]]
+    for point in points[1:]:
+        if float(np.linalg.norm(point - kept[-1])) > tolerance:
+            kept.append(point)
+    return np.asarray(kept, dtype=float)
+
+
+def _closed_polyline(points: np.ndarray, tolerance: float = 1e-6) -> np.ndarray:
+    points = _dedupe_polyline_points(points, tolerance=tolerance)
+    if len(points) == 0:
+        return points
+    if float(np.linalg.norm(points[0] - points[-1])) > tolerance:
+        points = np.vstack([points, points[0]])
+    return points
+
+
+def _oriented_boundary_arcs(
+    boundaries: Sequence[BoundarySlice],
+    arc_name: str,
+) -> List[np.ndarray]:
+    arcs: List[np.ndarray] = []
+    for boundary in sorted(boundaries, key=lambda item: item.slice_index):
+        arc = np.asarray(getattr(boundary, arc_name), dtype=float)
+        if len(arc) < 2:
+            continue
+        if arcs:
+            previous = arcs[-1]
+            direct = float(np.linalg.norm(arc[0] - previous[0]) + np.linalg.norm(arc[-1] - previous[-1]))
+            swapped = float(np.linalg.norm(arc[-1] - previous[0]) + np.linalg.norm(arc[0] - previous[-1]))
+            if swapped < direct:
+                arc = arc[::-1]
+        arcs.append(arc)
+    return arcs
+
+
+def _cut_curve_from_boundary_arcs(
+    boundaries: Sequence[BoundarySlice],
+    arc_name: str,
+    curve_id: str,
+    label_left: str,
+    label_right: str,
+) -> Optional[SurfaceCutCurve]:
+    arcs = _oriented_boundary_arcs(boundaries, arc_name)
+    if len(arcs) < 2:
+        return None
+
+    start_track = np.asarray([arc[0] for arc in arcs], dtype=float)
+    end_track = np.asarray([arc[-1] for arc in arcs], dtype=float)
+    loop = np.vstack(
+        [
+            start_track,
+            arcs[-1],
+            end_track[::-1],
+            arcs[0][::-1],
+        ]
+    )
+    loop = _closed_polyline(loop)
+    return SurfaceCutCurve(
+        curve_id=curve_id,
+        label_left=label_left,
+        label_right=label_right,
+        control_points=loop,
+        source="annotation_derived",
+    )
+
+
+def infer_cut_curves_from_boundaries(
+    boundaries: Sequence[BoundarySlice],
+) -> List[SurfaceCutCurve]:
+    curves: List[SurfaceCutCurve] = []
+    outer = _cut_curve_from_boundary_arcs(
+        boundaries,
+        "outer_arc",
+        "outer_lateral_boundary",
+        "outer",
+        "lateral",
+    )
+    inner = _cut_curve_from_boundary_arcs(
+        boundaries,
+        "inner_arc",
+        "inner_lateral_boundary",
+        "inner",
+        "lateral",
+    )
+    if outer is not None:
+        curves.append(outer)
+    if inner is not None:
+        curves.append(inner)
+    return curves
+
+
+def _shell_cut_warning_row(
+    warning_type: str,
+    severity: str,
+    object_id: str,
+    message: str,
+    suggested_action: str,
+) -> Dict:
+    return {
+        "warning_type": warning_type,
+        "severity": severity,
+        "object_id": object_id,
+        "message": message,
+        "suggested_action": suggested_action,
+    }
+
+
+def _is_manual_shell_cut_annotation_data(data: object) -> bool:
+    return isinstance(data, dict) and (
+        data.get("schema") == SHELL_CUT_ANNOTATION_SCHEMA
+        or data.get("annotation_type") == "manual_2d_shell_cut_boundary"
+    )
+
+
+def shell_cut_json_source(path: Optional[str | Path]) -> str:
+    if path is None:
+        return "annotation_derived"
+    with Path(path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, dict) and data.get("schema") == SURFACE_3D_ANNOTATION_SCHEMA:
+        return "manual_3d"
+    if _is_manual_shell_cut_annotation_data(data):
+        return "manual_2d"
+    return "json"
+
+
+def _resolve_shell_cut_json_path(
+    output_dir: Path,
+    surface_method: str,
+    cut_curve_json: Optional[str | Path],
+) -> Optional[Path]:
+    if cut_curve_json:
+        return Path(cut_curve_json).expanduser()
+    if normalize_surface_build_method(surface_method) != SURFACE_BUILD_SHELL_CUT:
+        return None
+
+    candidates = [
+        output_dir / "shell_cut_annotations.json",
+        output_dir.parent / "shell_cut_annotations.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _read_explicit_shell_cut_json(data: object) -> Tuple[List[SurfaceCutCurve], List[SurfacePatchSeed]]:
+    curve_items = data if isinstance(data, list) else data.get("cut_curves", data.get("curves", []))
+    seed_items = [] if isinstance(data, list) else data.get(
+        "selected_patches",
+        data.get("seeds", data.get("patch_seeds", [])),
+    )
+
+    curves: List[SurfaceCutCurve] = []
+    for index, item in enumerate(curve_items):
+        points = item.get("control_points", item.get("points"))
+        if points is None:
+            raise ValueError(f"Cut curve {index} is missing control_points/points")
+        curve_id = str(item.get("curve_id", item.get("id", f"cut_curve_{index}")))
+        label_left = str(item.get("label_left", "inner" if "inner" in curve_id else "outer"))
+        label_right = str(item.get("label_right", "lateral"))
+        curves.append(
+            SurfaceCutCurve(
+                curve_id=curve_id,
+                label_left=label_left,
+                label_right=label_right,
+                control_points=_closed_polyline(np.asarray(points, dtype=float)),
+                source=str(item.get("source", "json")),
+                confidence=float(item.get("confidence", 1.0)),
+            )
+        )
+
+    seeds: List[SurfacePatchSeed] = []
+    for index, item in enumerate(seed_items):
+        point = item.get("seed_point", item.get("point"))
+        if point is None:
+            raise ValueError(f"Patch seed {index} is missing seed_point/point")
+        seeds.append(
+            SurfacePatchSeed(
+                patch_label=str(
+                    item.get(
+                        "patch_label",
+                        item.get("surface_name", item.get("label", f"seed_{index}")),
+                    )
+                ),
+                seed_point=np.asarray(point, dtype=float),
+                source=str(item.get("source", "json")),
+            )
+        )
+    return curves, seeds
+
+
+def _manual_shell_cut_contour_lookup(contours: Sequence[Contour2D]) -> Dict[Tuple[int, int], Contour2D]:
+    return {
+        (int(contour.slice_index), int(contour.contour_id)): contour
+        for contour in contours
+    }
+
+
+def _manual_shell_cut_object_id(row: Dict) -> str:
+    return f"slice={int(row['slice_index'])},contour={int(row['contour_id'])}"
+
+
+def _manual_shell_cut_point(
+    raw_row: Dict,
+    point_name: str,
+    contour_points: np.ndarray,
+) -> Tuple[int, np.ndarray, List[Dict]]:
+    point_items = raw_row.get("points", {})
+    item = point_items.get(point_name)
+    if item is None:
+        raise ValueError(
+            f"Shell-cut annotation slice {raw_row.get('slice_index')} is missing {point_name}"
+        )
+
+    saved_point = None
+    index = None
+    if isinstance(item, dict):
+        if item.get("index") is not None:
+            index = int(item["index"])
+        if item.get("point") is not None:
+            saved_point = np.asarray(item["point"], dtype=float).reshape(-1)
+    else:
+        saved_point = np.asarray(item, dtype=float).reshape(-1)
+
+    if index is None:
+        if saved_point is None or len(saved_point) != 3:
+            raise ValueError(
+                f"Shell-cut annotation slice {raw_row.get('slice_index')} has no usable {point_name}"
+            )
+        index = _nearest_index(contour_points, saved_point)
+
+    if index < 0 or index >= len(contour_points):
+        raise ValueError(
+            f"Shell-cut annotation slice {raw_row.get('slice_index')} has out-of-range "
+            f"{point_name} index {index}"
+        )
+
+    point = np.asarray(contour_points[index], dtype=float)
+    warnings_out: List[Dict] = []
+    if saved_point is not None and len(saved_point) == 3:
+        distance = float(np.linalg.norm(saved_point - point))
+        if distance > 1.0:
+            warnings_out.append(
+                _shell_cut_warning_row(
+                    "point_index_mismatch",
+                    "warning",
+                    f"{raw_row.get('slice_index')}:{point_name}",
+                    f"{point_name} saved point is {distance:.3f} voxels from its saved contour index",
+                    "reload the annotation on the current contour and re-accept the slice",
+                )
+            )
+    return int(index), point, warnings_out
+
+
+def _parse_manual_shell_cut_row(
+    raw_row: Dict,
+    row_index: int,
+    contour_lookup: Dict[Tuple[int, int], Contour2D],
+) -> Tuple[Dict, List[Dict]]:
+    try:
+        slice_index = int(raw_row["slice_index"])
+        contour_id = int(raw_row.get("contour_id", 0))
+    except Exception as exc:
+        raise ValueError(f"Shell-cut annotation row {row_index} is missing slice_index/contour_id") from exc
+
+    contour = contour_lookup.get((slice_index, contour_id))
+    if contour is None:
+        raise ValueError(
+            f"Shell-cut annotation row {row_index} references missing contour "
+            f"slice={slice_index}, contour={contour_id}"
+        )
+
+    contour_points = _normalize_contour(contour.points)
+    if len(contour_points) < 3:
+        raise ValueError(
+            f"Shell-cut annotation row {row_index} uses a contour with fewer than 3 points"
+        )
+
+    surface_mode = normalize_surface_mode(raw_row.get("surface_mode"))
+    if surface_mode != SURFACE_MODE_NORMAL:
+        return (
+            {
+                "slice_index": slice_index,
+                "contour_id": contour_id,
+                "contour_points": contour_points,
+                "surface_mode": surface_mode,
+                "outer_path": "whole" if surface_mode == SURFACE_MODE_OUTER_ONLY else "",
+                "inner_path": "whole" if surface_mode == SURFACE_MODE_INNER_ONLY else "",
+                "points": {},
+            },
+            [],
+        )
+
+    warnings_out: List[Dict] = []
+    points: Dict[str, Dict[str, object]] = {}
+    for point_name in SHELL_CUT_MANUAL_POINT_NAMES:
+        index, point, point_warnings = _manual_shell_cut_point(raw_row, point_name, contour_points)
+        warnings_out.extend(point_warnings)
+        points[point_name] = {
+            "index": index,
+            "point": point,
+        }
+
+    row = {
+        "slice_index": slice_index,
+        "contour_id": contour_id,
+        "contour_points": contour_points,
+        "surface_mode": SURFACE_MODE_NORMAL,
+        "outer_path": str(raw_row.get("outer_path", "auto")),
+        "inner_path": str(raw_row.get("inner_path", "auto")),
+        "points": points,
+    }
+    return row, warnings_out
+
+
+def _manual_shell_cut_cap_arc(
+    row: Dict,
+    prefix: str,
+) -> Tuple[np.ndarray, float, float]:
+    contour_points = np.asarray(row["contour_points"], dtype=float)
+    a_name = f"{prefix}_cut_A"
+    b_name = f"{prefix}_cut_B"
+    if int(row["points"][a_name]["index"]) == int(row["points"][b_name]["index"]):
+        raise ValueError("Shell-cut cap endpoints cannot use the same contour point")
+
+    (
+        outer_arc,
+        _outer_indices,
+        _outer_direction,
+        _outer_score,
+        inner_arc,
+        _inner_indices,
+        _inner_direction,
+        _inner_score,
+    ) = _choose_outer_inner_arcs(
+        contour_points,
+        int(row["points"]["outer_cut_A"]["index"]),
+        int(row["points"]["outer_cut_B"]["index"]),
+        int(row["points"]["inner_cut_A"]["index"]),
+        int(row["points"]["inner_cut_B"]["index"]),
+        outer_choice=row.get("outer_path", "auto"),
+        inner_choice=row.get("inner_path", "auto"),
+    )
+    cap = outer_arc if prefix == "outer" else inner_arc
+    cap_length = _polyline_length(cap, closed=False)
+    contour_length = _polyline_length(_closed_contour_points(contour_points), closed=False)
+    ratio = float(cap_length / contour_length) if contour_length > 0 else math.inf
+    return cap, float(cap_length), ratio
+
+
+def _manual_shell_cut_endpoint_warnings(rows: Sequence[Dict], prefix: str) -> List[Dict]:
+    warnings_out: List[Dict] = []
+    if len(rows) < 2:
+        return warnings_out
+
+    for left, right in zip(rows[:-1], rows[1:]):
+        gap = int(right["slice_index"]) - int(left["slice_index"])
+        if gap > 1:
+            warnings_out.append(
+                _shell_cut_warning_row(
+                    "missing_slice_gap",
+                    "warning",
+                    f"{prefix}:slice={left['slice_index']}->{right['slice_index']}",
+                    f"{prefix} cut annotations skip {gap - 1} slice(s)",
+                    "add intermediate shell-cut annotations if this transition is not intentionally sparse",
+                )
+            )
+
+        left_a = np.asarray(left["points"][f"{prefix}_cut_A"]["point"], dtype=float)
+        left_b = np.asarray(left["points"][f"{prefix}_cut_B"]["point"], dtype=float)
+        right_a = np.asarray(right["points"][f"{prefix}_cut_A"]["point"], dtype=float)
+        right_b = np.asarray(right["points"][f"{prefix}_cut_B"]["point"], dtype=float)
+        same = float(np.linalg.norm(left_a - right_a) + np.linalg.norm(left_b - right_b))
+        swapped = float(np.linalg.norm(left_a - right_b) + np.linalg.norm(left_b - right_a))
+        if same > 2.0 and swapped + 1e-6 < same * 0.65:
+            warnings_out.append(
+                _shell_cut_warning_row(
+                    "endpoint_swap_warning",
+                    "warning",
+                    f"{prefix}:slice={left['slice_index']}->{right['slice_index']}",
+                    f"{prefix} A/B endpoints look closer if swapped between these slices",
+                    "check whether A and B were clicked in opposite order on one slice",
+                )
+            )
+
+    for suffix in ("A", "B"):
+        distances: List[Tuple[int, int, float, float]] = []
+        for left, right in zip(rows[:-1], rows[1:]):
+            gap = max(1, int(right["slice_index"]) - int(left["slice_index"]))
+            left_point = np.asarray(left["points"][f"{prefix}_cut_{suffix}"]["point"], dtype=float)
+            right_point = np.asarray(right["points"][f"{prefix}_cut_{suffix}"]["point"], dtype=float)
+            distance = float(np.linalg.norm(left_point - right_point))
+            distances.append((int(left["slice_index"]), int(right["slice_index"]), distance, distance / gap))
+
+        per_slice = np.asarray([item[3] for item in distances if item[3] > 1e-6], dtype=float)
+        if len(per_slice) == 0:
+            continue
+        typical = float(np.median(per_slice))
+        threshold = max(12.0, typical * 3.0)
+        for left_slice, right_slice, distance, normalized in distances:
+            if normalized > threshold:
+                warnings_out.append(
+                    _shell_cut_warning_row(
+                        f"endpoint_{suffix}_jump",
+                        "warning",
+                        f"{prefix}:slice={left_slice}->{right_slice}",
+                        (
+                            f"{prefix}_cut_{suffix} jumps {distance:.3f} voxels "
+                            f"({normalized:.3f} per slice)"
+                        ),
+                        "check whether this endpoint should be re-clicked or an intermediate slice should be added",
+                    )
+                )
+    return warnings_out
+
+
+def _manual_shell_cut_curve(
+    rows: Sequence[Dict],
+    prefix: str,
+    curve_id: str,
+    label_left: str,
+    label_right: str,
+) -> Tuple[SurfaceCutCurve, List[Dict]]:
+    warnings_out = _manual_shell_cut_endpoint_warnings(rows, prefix)
+    first = rows[0]
+    last = rows[-1]
+    a_name = f"{prefix}_cut_A"
+    b_name = f"{prefix}_cut_B"
+
+    first_cap, _first_cap_length, first_ratio = _manual_shell_cut_cap_arc(first, prefix)
+    last_cap, _last_cap_length, last_ratio = _manual_shell_cut_cap_arc(last, prefix)
+    for cap_name, row, ratio in (
+        ("first_slice_cap_arc", first, first_ratio),
+        ("last_slice_cap_arc", last, last_ratio),
+    ):
+        if ratio > 0.45:
+            warnings_out.append(
+                _shell_cut_warning_row(
+                    "cap_arc_too_long",
+                    "warning",
+                    f"{curve_id}:{cap_name}:slice={row['slice_index']}",
+                    f"{cap_name} uses {ratio:.3f} of the contour perimeter",
+                    "check whether the two cut endpoints are too far apart or on the wrong contour side",
+                )
+            )
+
+    a_track = np.asarray([row["points"][a_name]["point"] for row in rows], dtype=float)
+    b_track = np.asarray([row["points"][b_name]["point"] for row in rows], dtype=float)
+    raw_loop = np.vstack([a_track, last_cap, b_track[::-1], first_cap[::-1]])
+    if len(raw_loop) > 1:
+        closure_error = float(np.linalg.norm(raw_loop[0] - raw_loop[-1]))
+        if closure_error > 1e-6:
+            warnings_out.append(
+                _shell_cut_warning_row(
+                    "cut_curve_not_closed",
+                    "error",
+                    curve_id,
+                    f"manual {curve_id} loop has closure error {closure_error:.6f}",
+                    "re-save the shell-cut annotation; the first and last cap should meet the A/B tracks",
+                )
+            )
+
+    return (
+        SurfaceCutCurve(
+            curve_id=curve_id,
+            label_left=label_left,
+            label_right=label_right,
+            control_points=_closed_polyline(raw_loop),
+            source="manual_2d",
+        ),
+        warnings_out,
+    )
+
+
+def _manual_shell_cut_annotations_to_input(
+    data: Dict,
+    contours: Optional[Sequence[Contour2D]],
+) -> Tuple[List[SurfaceCutCurve], List[SurfacePatchSeed], List[Dict]]:
+    if contours is None:
+        raise ValueError("Manual shell-cut annotations need contours from the current mask")
+
+    raw_rows = data.get("rows", [])
+    if not raw_rows:
+        raise ValueError("shell_cut_annotations.json has no rows")
+
+    contour_lookup = _manual_shell_cut_contour_lookup(contours)
+    parsed_rows: List[Dict] = []
+    warnings_out: List[Dict] = []
+    seen_slices: set[int] = set()
+    for row_index, raw_row in enumerate(raw_rows):
+        row, row_warnings = _parse_manual_shell_cut_row(raw_row, row_index, contour_lookup)
+        if int(row["slice_index"]) in seen_slices:
+            raise ValueError(f"Duplicate shell-cut annotation for slice {row['slice_index']}")
+        seen_slices.add(int(row["slice_index"]))
+        parsed_rows.append(row)
+        warnings_out.extend(row_warnings)
+
+    parsed_rows = sorted(parsed_rows, key=lambda item: int(item["slice_index"]))
+    cut_rows = [
+        row
+        for row in parsed_rows
+        if normalize_surface_mode(row.get("surface_mode")) == SURFACE_MODE_NORMAL
+    ]
+    for row in parsed_rows:
+        surface_mode = normalize_surface_mode(row.get("surface_mode"))
+        if surface_mode == SURFACE_MODE_NORMAL:
+            continue
+        warnings_out.append(
+            _shell_cut_warning_row(
+                "single_surface_shell_cut_row",
+                "warning",
+                f"slice={row['slice_index']},contour={row['contour_id']}",
+                (
+                    f"manual shell-cut row is marked {surface_mode}; it is used in the "
+                    "derived boundary CSV but not as a four-point cut-curve slice"
+                ),
+                "use four shell-cut endpoints on nearby transition slices if the cut curve needs a tighter boundary",
+            )
+        )
+    if len(cut_rows) < 2:
+        raise ValueError("Manual shell-cut annotations need at least two four-point cut-curve slices")
+
+    outer, outer_warnings = _manual_shell_cut_curve(
+        cut_rows,
+        "outer",
+        "outer_lateral_boundary",
+        "outer",
+        "lateral",
+    )
+    inner, inner_warnings = _manual_shell_cut_curve(
+        cut_rows,
+        "inner",
+        "inner_lateral_boundary",
+        "inner",
+        "lateral",
+    )
+    warnings_out.extend(outer_warnings)
+    warnings_out.extend(inner_warnings)
+
+    return [outer, inner], [], warnings_out
+
+
+def read_shell_cut_json_with_qc(
+    path: str | Path,
+    contours: Optional[Sequence[Contour2D]] = None,
+) -> Tuple[List[SurfaceCutCurve], List[SurfacePatchSeed], List[Dict]]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if _is_manual_shell_cut_annotation_data(data):
+        return _manual_shell_cut_annotations_to_input(data, contours)
+
+    curves, seeds = _read_explicit_shell_cut_json(data)
+    return curves, seeds, []
+
+
+def read_shell_cut_json(path: str | Path) -> Tuple[List[SurfaceCutCurve], List[SurfacePatchSeed]]:
+    curves, seeds, _warnings = read_shell_cut_json_with_qc(path)
+    return curves, seeds
+
+
+def read_manual_shell_cut_annotations_json(
+    path: str | Path,
+    contours: Sequence[Contour2D],
+) -> Tuple[List[SurfaceCutCurve], List[SurfacePatchSeed], List[Dict]]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not _is_manual_shell_cut_annotation_data(data):
+        raise ValueError(f"{path} is not a manual shell-cut annotation JSON")
+    return _manual_shell_cut_annotations_to_input(data, contours)
+
+
+
+def _shell_vertices_scaled(shell: ShellMesh) -> np.ndarray:
+    return np.asarray(shell.vertices, dtype=float) * np.asarray(shell.spacing, dtype=float).reshape(1, 3)
+
+
+def _edge_key(left: int, right: int) -> Tuple[int, int]:
+    left = int(left)
+    right = int(right)
+    return (left, right) if left < right else (right, left)
+
+
+def _mesh_edge_pairs(faces: np.ndarray) -> Iterable[Tuple[int, int]]:
+    for a, b, c in np.asarray(faces, dtype=np.int64):
+        yield _edge_key(int(a), int(b))
+        yield _edge_key(int(b), int(c))
+        yield _edge_key(int(c), int(a))
+
+
+def _unique_mesh_edges_array(faces: np.ndarray) -> np.ndarray:
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.size == 0:
+        return np.empty((0, 2), dtype=np.int64)
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    edges.sort(axis=1)
+    return np.unique(edges, axis=0)
+
+
+def _build_shell_edge_graph(shell: ShellMesh) -> Tuple[Dict[int, List[Tuple[int, float]]], set[Tuple[int, int]]]:
+    vertices_scaled = _shell_vertices_scaled(shell)
+    adjacency: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
+    edge_array = _unique_mesh_edges_array(shell.faces)
+    edge_set: set[Tuple[int, int]] = set()
+    for left_value, right_value in edge_array:
+        left, right = int(left_value), int(right_value)
+        edge_set.add((left, right))
+        weight = float(np.linalg.norm(vertices_scaled[left] - vertices_scaled[right]))
+        adjacency[left].append((right, weight))
+        adjacency[right].append((left, weight))
+    return adjacency, edge_set
+
+
+def _shortest_shell_path(
+    adjacency: Dict[int, List[Tuple[int, float]]],
+    vertices_scaled: np.ndarray,
+    start: int,
+    goal: int,
+    max_visited: int = 200_000,
+) -> Optional[List[int]]:
+    start = int(start)
+    goal = int(goal)
+    if start == goal:
+        return [start]
+
+    def heuristic(node: int) -> float:
+        return float(np.linalg.norm(vertices_scaled[node] - vertices_scaled[goal]))
+
+    heap: List[Tuple[float, float, int]] = [(heuristic(start), 0.0, start)]
+    best_cost = {start: 0.0}
+    parent: Dict[int, int] = {}
+    visited: set[int] = set()
+
+    while heap and len(visited) < max_visited:
+        _estimate, cost, node = heapq.heappop(heap)
+        if node in visited:
+            continue
+        if node == goal:
+            path = [goal]
+            while path[-1] != start:
+                path.append(parent[path[-1]])
+            path.reverse()
+            return path
+        visited.add(node)
+        for neighbor, weight in adjacency.get(node, []):
+            if neighbor in visited:
+                continue
+            next_cost = cost + float(weight)
+            if next_cost >= best_cost.get(neighbor, math.inf):
+                continue
+            best_cost[neighbor] = next_cost
+            parent[neighbor] = node
+            heapq.heappush(heap, (next_cost + heuristic(neighbor), next_cost, neighbor))
+    return None
+
+
+def snap_cut_curve_to_shell(curve: SurfaceCutCurve, shell: ShellMesh) -> SurfaceCutCurve:
+    control_points = _closed_polyline(curve.control_points)
+    vertices_scaled = _shell_vertices_scaled(shell)
+    tree = cKDTree(vertices_scaled)
+    distances, vertex_ids = tree.query(_scaled_points(control_points, shell.spacing), k=1)
+    curve.control_points = control_points
+    curve.snapped_vertices = np.asarray(vertex_ids, dtype=np.int64)
+    curve.snapped_points = np.asarray(shell.vertices[curve.snapped_vertices], dtype=float)
+    curve.mean_snap_distance = float(np.mean(distances)) if len(distances) else math.nan
+    curve.max_snap_distance = float(np.max(distances)) if len(distances) else math.nan
+    curve.closure_error = (
+        float(np.linalg.norm((control_points[0] - control_points[-1]) * shell.spacing))
+        if len(control_points) > 1
+        else math.inf
+    )
+    curve.is_closed = bool(curve.closure_error <= max(float(np.max(shell.spacing)), 1e-6))
+    curve.control_polyline_length = float(_polyline_length(_scaled_points(control_points, shell.spacing)))
+    return curve
+
+
+def trace_cut_curve_on_shell(
+    curve: SurfaceCutCurve,
+    shell: ShellMesh,
+    adjacency: Dict[int, List[Tuple[int, float]]],
+    edge_set: set[Tuple[int, int]],
+) -> SurfaceCutCurve:
+    vertex_ids: List[int] = []
+    for vertex_id in np.asarray(curve.snapped_vertices, dtype=np.int64):
+        value = int(vertex_id)
+        if not vertex_ids or vertex_ids[-1] != value:
+            vertex_ids.append(value)
+    if len(vertex_ids) > 1 and vertex_ids[0] == vertex_ids[-1]:
+        vertex_ids.pop()
+    if len(vertex_ids) < 2:
+        curve.status = "error"
+        curve.reason = "cut curve collapsed to fewer than two shell vertices"
+        return curve
+
+    vertices_scaled = _shell_vertices_scaled(shell)
+    full_path: List[int] = []
+    for left, right in zip(vertex_ids, vertex_ids[1:] + [vertex_ids[0]]):
+        if _edge_key(left, right) in edge_set:
+            path = [left, right]
+        else:
+            path = _shortest_shell_path(adjacency, vertices_scaled, left, right)
+        if path is None:
+            curve.status = "error"
+            curve.reason = f"no shell path between snapped vertices {left} and {right}"
+            return curve
+        if full_path and full_path[-1] == path[0]:
+            full_path.extend(path[1:])
+        else:
+            full_path.extend(path)
+
+    if full_path and full_path[-1] != full_path[0]:
+        full_path.append(full_path[0])
+
+    curve.mesh_vertex_path = np.asarray(full_path, dtype=np.int64)
+    curve.cut_edges = [
+        _edge_key(left, right)
+        for left, right in zip(curve.mesh_vertex_path[:-1], curve.mesh_vertex_path[1:])
+        if int(left) != int(right)
+    ]
+    curve.path_length = float(
+        _polyline_length(vertices_scaled[np.asarray(curve.mesh_vertex_path, dtype=np.int64)])
+    )
+    if curve.control_polyline_length > 0:
+        curve.path_length_ratio = float(curve.path_length / curve.control_polyline_length)
+    else:
+        curve.path_length_ratio = math.inf
+
+    max_snap = float(np.max(shell.spacing)) * 2.0
+    if not curve.cut_edges:
+        curve.status = "error"
+        curve.reason = "cut curve produced no blocking edges"
+    elif curve.max_snap_distance > max_snap:
+        curve.status = "warning"
+        curve.reason = "cut curve is far from the shell"
+    elif curve.path_length_ratio > 4.0:
+        curve.status = "warning"
+        curve.reason = "traced shell path is much longer than the input curve"
+    else:
+        curve.status = "ok"
+        curve.reason = ""
+    return curve
+
+
+def _build_face_adjacency(
+    faces: np.ndarray,
+) -> Tuple[List[List[int]], Dict[Tuple[int, int], Tuple[int, int]], Dict[Tuple[int, int], List[int]]]:
+    edge_to_faces: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+    for face_id, face in enumerate(np.asarray(faces, dtype=np.int64)):
+        a, b, c = [int(value) for value in face]
+        for edge in (_edge_key(a, b), _edge_key(b, c), _edge_key(c, a)):
+            edge_to_faces[edge].append(int(face_id))
+
+    adjacency: List[List[int]] = [[] for _ in range(len(faces))]
+    shared_edges: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    for edge, face_ids in edge_to_faces.items():
+        if len(face_ids) < 2:
+            continue
+        for left_index, left in enumerate(face_ids):
+            for right in face_ids[left_index + 1 :]:
+                adjacency[left].append(right)
+                adjacency[right].append(left)
+                shared_edges[(left, right)] = edge
+                shared_edges[(right, left)] = edge
+    return adjacency, shared_edges, edge_to_faces
+
+
+def _flood_fill_faces(
+    seed_face: int,
+    adjacency: Sequence[Sequence[int]],
+    shared_edges: Dict[Tuple[int, int], Tuple[int, int]],
+    blocked_edges: set[Tuple[int, int]],
+) -> np.ndarray:
+    seed_face = int(seed_face)
+    visited = np.zeros(len(adjacency), dtype=bool)
+    queue: deque[int] = deque([seed_face])
+    visited[seed_face] = True
+    while queue:
+        face = queue.popleft()
+        for neighbor in adjacency[face]:
+            edge = shared_edges.get((face, int(neighbor)))
+            if edge in blocked_edges or visited[int(neighbor)]:
+                continue
+            visited[int(neighbor)] = True
+            queue.append(int(neighbor))
+    return np.nonzero(visited)[0].astype(np.int64)
+
+
+def _face_components_after_cut(
+    adjacency: Sequence[Sequence[int]],
+    shared_edges: Dict[Tuple[int, int], Tuple[int, int]],
+    blocked_edges: set[Tuple[int, int]],
+) -> List[np.ndarray]:
+    visited = np.zeros(len(adjacency), dtype=bool)
+    components: List[np.ndarray] = []
+    for face_id in range(len(adjacency)):
+        if visited[face_id]:
+            continue
+        component = _flood_fill_faces(face_id, adjacency, shared_edges, blocked_edges)
+        visited[component] = True
+        components.append(component)
+    return components
+
+
+def _vertex_to_faces(faces: np.ndarray, vertex_count: int) -> List[List[int]]:
+    mapping: List[List[int]] = [[] for _ in range(vertex_count)]
+    for face_id, face in enumerate(np.asarray(faces, dtype=np.int64)):
+        for vertex_id in face:
+            mapping[int(vertex_id)].append(int(face_id))
+    return mapping
+
+
+def snap_seed_to_shell_face(
+    seed: SurfacePatchSeed,
+    shell: ShellMesh,
+    vertex_faces: Sequence[Sequence[int]],
+) -> SurfacePatchSeed:
+    vertices_scaled = _shell_vertices_scaled(shell)
+    seed_scaled = np.asarray(seed.seed_point, dtype=float) * shell.spacing
+    vertex_tree = cKDTree(vertices_scaled)
+    distance, vertex_id = vertex_tree.query(seed_scaled, k=1)
+    candidate_faces = list(vertex_faces[int(vertex_id)])
+    if not candidate_faces:
+        seed.status = "error"
+        seed.reason = "nearest shell vertex has no faces"
+        seed.snap_distance = float(distance)
+        return seed
+
+    centers = vertices_scaled[shell.faces[np.asarray(candidate_faces, dtype=np.int64)]].mean(axis=1)
+    center_distances = np.linalg.norm(centers - seed_scaled.reshape(1, 3), axis=1)
+    best_index = int(np.argmin(center_distances))
+    seed.snapped_face = int(candidate_faces[best_index])
+    seed.snap_distance = float(center_distances[best_index])
+    if seed.snap_distance > float(np.max(shell.spacing)) * 3.0:
+        seed.status = "warning"
+        seed.reason = "seed is far from the shell"
+    else:
+        seed.status = "ok"
+        seed.reason = ""
+    return seed
+
+
+def _shell_triangle_area(vertices: np.ndarray) -> float:
+    if len(vertices) != 3:
+        return 0.0
+    return float(np.linalg.norm(np.cross(vertices[1] - vertices[0], vertices[2] - vertices[0])) * 0.5)
+
+
+def _mesh_area(vertices: np.ndarray, faces: np.ndarray) -> float:
+    faces = np.asarray(faces, dtype=np.int64)
+    if len(faces) == 0:
+        return 0.0
+    triangles = np.asarray(vertices, dtype=float)[faces]
+    cross = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+    return float(np.linalg.norm(cross, axis=1).sum() * 0.5)
+
+
+def _boundary_edges_for_faces(faces: np.ndarray) -> List[Tuple[int, int]]:
+    counts: Counter[Tuple[int, int]] = Counter(_mesh_edge_pairs(faces))
+    return [edge for edge, count in counts.items() if count == 1]
+
+
+def _edge_length(vertices: np.ndarray, edge: Tuple[int, int]) -> float:
+    return float(np.linalg.norm(vertices[int(edge[0])] - vertices[int(edge[1])]))
+
+
+def _extract_shell_submesh(name: str, shell: ShellMesh, face_indices: np.ndarray) -> SurfaceMesh:
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    if len(face_indices) == 0:
+        return SurfaceMesh(name=name, vertices=np.empty((0, 3), dtype=float), faces=np.empty((0, 3), dtype=np.int32))
+    return _compact_surface_mesh(name, shell.vertices, shell.faces[face_indices])
+
+
+def _surface_cut_curve_row(curve: SurfaceCutCurve) -> Dict:
+    repeated = 0
+    if len(curve.mesh_vertex_path) > 0:
+        counts = Counter(int(value) for value in curve.mesh_vertex_path[:-1])
+        repeated = sum(1 for count in counts.values() if count > 1)
+    return {
+        "curve_id": curve.curve_id,
+        "label_left": curve.label_left,
+        "label_right": curve.label_right,
+        "source": curve.source,
+        "confidence": float(curve.confidence),
+        "num_control_points": int(len(curve.control_points)),
+        "num_snapped_vertices": int(len(curve.snapped_vertices)),
+        "num_path_vertices": int(len(curve.mesh_vertex_path)),
+        "num_cut_edges": int(len(curve.cut_edges)),
+        "is_closed": bool(curve.is_closed),
+        "closure_error": float(curve.closure_error),
+        "mean_snap_distance": float(curve.mean_snap_distance),
+        "max_snap_distance": float(curve.max_snap_distance),
+        "path_length": float(curve.path_length),
+        "control_polyline_length": float(curve.control_polyline_length),
+        "path_length_ratio": float(curve.path_length_ratio),
+        "revisited_vertex_count": int(repeated),
+        "status": curve.status,
+        "reason": curve.reason,
+    }
+
+
+def _surface_patch_seed_row(seed: SurfacePatchSeed) -> Dict:
+    point = np.asarray(seed.seed_point, dtype=float)
+    return {
+        "patch_label": seed.patch_label,
+        "source": seed.source,
+        "seed_x": float(point[0]),
+        "seed_y": float(point[1]),
+        "seed_z": float(point[2]),
+        "snapped_face": "" if seed.snapped_face is None else int(seed.snapped_face),
+        "snap_distance": "" if seed.snap_distance is None else float(seed.snap_distance),
+        "status": seed.status,
+        "reason": seed.reason,
+    }
+
+
+def _shell_summary_row(
+    shell: ShellMesh,
+    mask: np.ndarray,
+    edge_to_faces: Dict[Tuple[int, int], List[int]],
+) -> Dict:
+    boundary_edges = sum(1 for face_ids in edge_to_faces.values() if len(face_ids) == 1)
+    nonmanifold_edges = sum(1 for face_ids in edge_to_faces.values() if len(face_ids) > 2)
+    mask = _as_bool_mask(mask)
+    cropped_mask, _offset = _crop_mask_to_foreground(mask, padding=0)
+    structure = ndimage.generate_binary_structure(3, 3)
+    _components, component_count = ndimage.label(cropped_mask, structure=structure)
+    return {
+        "backend": shell.backend,
+        "coordinate_space": shell.coordinate_space,
+        "num_vertices": int(len(shell.vertices)),
+        "num_faces": int(len(shell.faces)),
+        "num_edges": int(len(edge_to_faces)),
+        "num_boundary_edges": int(boundary_edges),
+        "num_nonmanifold_edges": int(nonmanifold_edges),
+        "mask_shape": "x".join(str(int(value)) for value in mask.shape),
+        "foreground_voxel_count": int(np.count_nonzero(cropped_mask)),
+        "mask_component_count": int(component_count),
+        "spacing_x": float(shell.spacing[0]),
+        "spacing_y": float(shell.spacing[1]),
+        "spacing_z": float(shell.spacing[2]),
+    }
+
+
+def _patch_summary_row(name: str, shell: ShellMesh, face_indices: np.ndarray) -> Dict:
+    face_indices = np.asarray(face_indices, dtype=np.int64)
+    faces = shell.faces[face_indices] if len(face_indices) else np.empty((0, 3), dtype=np.int32)
+    boundary_edges = _boundary_edges_for_faces(faces) if len(faces) else []
+    vertices_scaled = _shell_vertices_scaled(shell)
+    area = _mesh_area(vertices_scaled, faces)
+    boundary_length = sum(_edge_length(vertices_scaled, edge) for edge in boundary_edges)
+    return {
+        "patch_id": name,
+        "label": name,
+        "num_faces": int(len(faces)),
+        "num_vertices": int(len(np.unique(faces.reshape(-1)))) if len(faces) else 0,
+        "area": float(area),
+        "boundary_length": float(boundary_length),
+        "num_boundary_edges": int(len(boundary_edges)),
+        "status": "ok" if len(faces) else "error",
+        "reason": "" if len(faces) else "patch is empty",
+    }
+
+
+def _face_edges(face: Sequence[int]) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
+    a, b, c = [int(value) for value in face]
+    return (_edge_key(a, b), _edge_key(b, c), _edge_key(c, a))
+
+
+def _cut_curve_boundary_labels(curve: SurfaceCutCurve) -> set[str]:
+    labels: set[str] = set()
+    for value in (curve.curve_id, curve.label_left, curve.label_right):
+        text = str(value).lower()
+        if "outer" in text:
+            labels.add("outer")
+        if "inner" in text:
+            labels.add("inner")
+    return labels
+
+
+def _cut_edge_label_lookup(
+    curves: Sequence[SurfaceCutCurve],
+) -> Tuple[Dict[Tuple[int, int], set[str]], Dict[Tuple[int, int], set[str]]]:
+    edge_labels: Dict[Tuple[int, int], set[str]] = defaultdict(set)
+    edge_curve_ids: Dict[Tuple[int, int], set[str]] = defaultdict(set)
+    for curve in curves:
+        labels = _cut_curve_boundary_labels(curve)
+        for edge in curve.cut_edges:
+            key = _edge_key(edge[0], edge[1])
+            if labels:
+                edge_labels[key].update(labels)
+            edge_curve_ids[key].add(str(curve.curve_id))
+    return edge_labels, edge_curve_ids
+
+
+def _cut_edge_rows(curves: Sequence[SurfaceCutCurve]) -> List[Dict]:
+    edge_curve_ids: Dict[Tuple[int, int], set[str]] = defaultdict(set)
+    for curve in curves:
+        for edge in curve.cut_edges:
+            edge_curve_ids[_edge_key(edge[0], edge[1])].add(str(curve.curve_id))
+
+    rows: List[Dict] = []
+    for curve in curves:
+        for left, right in curve.cut_edges:
+            edge = _edge_key(left, right)
+            curve_ids = sorted(edge_curve_ids.get(edge, {str(curve.curve_id)}))
+            rows.append(
+                {
+                    "curve_id": curve.curve_id,
+                    "edge_start": int(edge[0]),
+                    "edge_end": int(edge[1]),
+                    "curve_ids": ";".join(curve_ids),
+                    "shared_by_curve_count": int(len(curve_ids)),
+                }
+            )
+    return rows
+
+
+def _shared_cut_edge_rows(
+    shell: ShellMesh,
+    edge_curve_ids: Dict[Tuple[int, int], set[str]],
+) -> List[Dict]:
+    rows: List[Dict] = []
+    vertices = np.asarray(shell.vertices, dtype=float)
+    for edge, curve_ids in sorted(edge_curve_ids.items()):
+        if len(curve_ids) < 2:
+            continue
+        left, right = int(edge[0]), int(edge[1])
+        center = (vertices[left] + vertices[right]) * 0.5
+        rows.append(
+            {
+                "edge_start": left,
+                "edge_end": right,
+                "curve_ids": ";".join(sorted(curve_ids)),
+                "shared_by_curve_count": int(len(curve_ids)),
+                "center_x": float(center[0]),
+                "center_y": float(center[1]),
+                "center_z": float(center[2]),
+            }
+        )
+    return rows
+
+
+def _component_cut_touch_info(
+    component: np.ndarray,
+    shell: ShellMesh,
+    edge_labels: Dict[Tuple[int, int], set[str]],
+    edge_curve_ids: Dict[Tuple[int, int], set[str]],
+) -> Tuple[set[str], set[str]]:
+    labels: set[str] = set()
+    curve_ids: set[str] = set()
+    for face_id in np.asarray(component, dtype=np.int64):
+        for edge in _face_edges(shell.faces[int(face_id)]):
+            labels.update(edge_labels.get(edge, set()))
+            curve_ids.update(edge_curve_ids.get(edge, set()))
+    return labels, curve_ids
+
+
+def _assigned_label_from_cut_touches(labels: set[str]) -> Tuple[str, str]:
+    touches_outer = "outer" in labels
+    touches_inner = "inner" in labels
+    if touches_outer and touches_inner:
+        return "lateral", "touches both outer and inner cut curves"
+    if touches_outer:
+        return "outer", "touches only the outer cut curve"
+    if touches_inner:
+        return "inner", "touches only the inner cut curve"
+    return "lateral", "does not touch a cut curve; kept with lateral as unclaimed shell"
+
+
+def _label_cut_components(
+    components: Sequence[np.ndarray],
+    shell: ShellMesh,
+    edge_labels: Dict[Tuple[int, int], set[str]],
+    edge_curve_ids: Dict[Tuple[int, int], set[str]],
+) -> Tuple[Dict[str, np.ndarray], List[Dict]]:
+    faces_by_label: Dict[str, List[np.ndarray]] = {
+        "outer": [],
+        "inner": [],
+        "lateral": [],
+    }
+    rows: List[Dict] = []
+    vertices_scaled = _shell_vertices_scaled(shell)
+    for component_id, component in enumerate(components):
+        component = np.asarray(component, dtype=np.int64)
+        labels, curve_ids = _component_cut_touch_info(component, shell, edge_labels, edge_curve_ids)
+        assigned_label, reason = _assigned_label_from_cut_touches(labels)
+        faces_by_label[assigned_label].append(component)
+        rows.append(
+            {
+                "component_id": int(component_id),
+                "num_faces": int(len(component)),
+                "area": float(_mesh_area(vertices_scaled, shell.faces[component])),
+                "touches_outer_cut": bool("outer" in labels),
+                "touches_inner_cut": bool("inner" in labels),
+                "cut_curves": ";".join(sorted(curve_ids)),
+                "assigned_label": assigned_label,
+                "assignment_reason": reason,
+            }
+        )
+
+    combined: Dict[str, np.ndarray] = {}
+    for label, component_faces in faces_by_label.items():
+        if component_faces:
+            combined[label] = np.concatenate(component_faces).astype(np.int64)
+        else:
+            combined[label] = np.empty(0, dtype=np.int64)
+    return combined, rows
+
+
+def _shell_cut_warning_rows(
+    curves: Sequence[SurfaceCutCurve],
+    seeds: Sequence[SurfacePatchSeed],
+    patch_rows: Sequence[Dict],
+    component_rows: Optional[Sequence[Dict]] = None,
+    shell_summary: Optional[Dict] = None,
+    overlap_count: int = 0,
+    shared_cut_edge_count: int = 0,
+    minimum_component_count: int = 3,
+    warn_unclaimed_components: bool = True,
+) -> List[Dict]:
+    rows: List[Dict] = []
+    backend = str(shell_summary.get("backend", "")) if shell_summary is not None else ""
+    for curve in curves:
+        if curve.status != "ok":
+            action = "review or redraw the cut curve"
+            if backend == SHELL_BACKEND_MARCHING_CUBES:
+                action += "; if the curve looks correct in 3D, retry voxel backend as a baseline"
+            rows.append(
+                {
+                    "warning_type": "cut_curve",
+                    "severity": "error" if curve.status == "error" else "warning",
+                    "object_id": curve.curve_id,
+                    "message": curve.reason,
+                    "suggested_action": action,
+                }
+            )
+    for seed in seeds:
+        if seed.status != "ok":
+            rows.append(
+                {
+                    "warning_type": "seed",
+                    "severity": "error" if seed.status == "error" else "warning",
+                    "object_id": seed.patch_label,
+                    "message": seed.reason,
+                    "suggested_action": "move the explicit seed point onto the intended patch or remove the legacy seed override",
+                }
+            )
+    for patch in patch_rows:
+        if patch.get("status") != "ok":
+            rows.append(
+                {
+                    "warning_type": "patch",
+                    "severity": "error",
+                    "object_id": patch.get("patch_id", ""),
+                    "message": patch.get("reason", ""),
+                    "suggested_action": "check whether the cut curves separate the shell",
+                }
+            )
+    component_rows = list(component_rows or [])
+    if len(component_rows) < int(minimum_component_count):
+        rows.append(
+            {
+                "warning_type": "cut_curve_does_not_separate_shell",
+                "severity": "error",
+                "object_id": "shell",
+                "message": f"cut curves split the shell into only {len(component_rows)} component(s)",
+                "suggested_action": "check whether the closed cut curve really separates the shell",
+            }
+        )
+    if warn_unclaimed_components:
+        for component in component_rows:
+            touches_outer = bool(component.get("touches_outer_cut", False))
+            touches_inner = bool(component.get("touches_inner_cut", False))
+            assigned_label = str(component.get("assigned_label", ""))
+            if not touches_outer and not touches_inner:
+                rows.append(
+                    {
+                        "warning_type": "unclaimed_cut_component",
+                        "severity": "warning",
+                        "object_id": f"component={component.get('component_id', '')}",
+                        "message": (
+                            f"component does not touch any cut curve and was assigned to {assigned_label}"
+                        ),
+                        "suggested_action": "inspect shell_with_cut_curves.obj; this may be a disconnected mask fragment",
+                    }
+                )
+    if shell_summary is not None and int(shell_summary.get("num_nonmanifold_edges", 0) or 0) > 0:
+        rows.append(
+            {
+                "warning_type": "nonmanifold_edges",
+                "severity": "warning",
+                "object_id": str(shell_summary.get("backend", "shell")),
+                "message": f"shell has {shell_summary.get('num_nonmanifold_edges')} nonmanifold edge(s)",
+                "suggested_action": "inspect shell_with_cut_curves.obj; if flood fill is unstable, retry voxel backend",
+            }
+        )
+    if overlap_count > 0:
+        rows.append(
+            {
+                "warning_type": "outer_inner_overlap",
+                "severity": "error",
+                "object_id": "outer;inner",
+                "message": f"outer and inner flood fills overlap on {overlap_count} faces",
+                "suggested_action": "check cut curves and component assignment",
+            }
+        )
+    if shared_cut_edge_count > 0:
+        rows.append(
+            {
+                "warning_type": "shared_cut_edges",
+                "severity": "info",
+                "object_id": "cut_curves",
+                "message": f"{shared_cut_edge_count} cut edge(s) are shared by more than one closed curve",
+                "suggested_action": "this is allowed; inspect shared_cut_edges.csv if the selected patch is not the intended region",
+            }
+        )
+    return rows
+
+
+def _shell_cut_debug_color(name: str) -> Tuple[int, int, int]:
+    normalized = str(name).lower()
+    if "outer" in normalized:
+        return (230, 70, 55)
+    if "inner" in normalized:
+        return (55, 115, 230)
+    if "lateral" in normalized:
+        return (230, 180, 55)
+    return (245, 245, 245)
+
+
+def _append_debug_box(
+    vertices: List[np.ndarray],
+    faces: List[List[int]],
+    colors: List[Tuple[int, int, int]],
+    center: np.ndarray,
+    radius: float,
+    color: Tuple[int, int, int],
+) -> None:
+    center = np.asarray(center, dtype=float)
+    radius = float(radius)
+    offsets = np.asarray(
+        [
+            [-1, -1, -1],
+            [1, -1, -1],
+            [1, 1, -1],
+            [-1, 1, -1],
+            [-1, -1, 1],
+            [1, -1, 1],
+            [1, 1, 1],
+            [-1, 1, 1],
+        ],
+        dtype=float,
+    )
+    start = len(vertices)
+    for offset in offsets:
+        vertices.append(center + offset * radius)
+        colors.append(color)
+    faces.extend(
+        [
+            [start + 0, start + 1, start + 2],
+            [start + 0, start + 2, start + 3],
+            [start + 4, start + 6, start + 5],
+            [start + 4, start + 7, start + 6],
+            [start + 0, start + 4, start + 5],
+            [start + 0, start + 5, start + 1],
+            [start + 1, start + 5, start + 6],
+            [start + 1, start + 6, start + 2],
+            [start + 2, start + 6, start + 7],
+            [start + 2, start + 7, start + 3],
+            [start + 3, start + 7, start + 4],
+            [start + 3, start + 4, start + 0],
+        ]
+    )
+
+
+def _debug_box_points_mesh(
+    point_groups: Sequence[Tuple[np.ndarray, Tuple[int, int, int], str]],
+    radius: float,
+) -> Tuple[np.ndarray, np.ndarray, List[str], Dict[str, Tuple[int, int, int]], np.ndarray]:
+    vertices: List[np.ndarray] = []
+    faces: List[List[int]] = []
+    colors: List[Tuple[int, int, int]] = []
+    face_materials: List[str] = []
+    materials: Dict[str, Tuple[int, int, int]] = {}
+    for points, color, material_name in point_groups:
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        materials[material_name] = color
+        for point in points:
+            face_start = len(faces)
+            _append_debug_box(vertices, faces, colors, point, radius, color)
+            face_materials.extend([material_name] * (len(faces) - face_start))
+    return (
+        np.asarray(vertices, dtype=float).reshape(-1, 3),
+        np.asarray(faces, dtype=np.int32).reshape(-1, 3),
+        face_materials,
+        materials,
+        np.asarray(colors, dtype=np.uint8).reshape(-1, 3),
+    )
+
+
+def _write_debug_box_points(
+    path: str | Path,
+    point_groups: Sequence[Tuple[np.ndarray, Tuple[int, int, int], str]],
+    radius: float,
+) -> None:
+    vertices, faces, face_materials, materials, colors = _debug_box_points_mesh(
+        point_groups,
+        radius,
+    )
+    _write_colored_mesh_ply(
+        path,
+        vertices,
+        faces,
+        vertex_colors=colors,
+    )
+    _write_colored_obj(
+        Path(path).with_suffix(".obj"),
+        Path(path).stem,
+        vertices,
+        faces,
+        face_materials=face_materials,
+        materials=materials,
+    )
+
+
+def _write_shell_cut_curve_debug_ply(
+    path: str | Path,
+    shell: ShellMesh,
+    curves: Sequence[SurfaceCutCurve],
+    source: str,
+) -> None:
+    point_groups: List[Tuple[np.ndarray, Tuple[int, int, int], str]] = []
+    extent = float(np.max(np.ptp(shell.vertices, axis=0))) if len(shell.vertices) else 1.0
+    radius = max(0.35, extent * 0.004)
+
+    for curve in curves:
+        if source == "control":
+            points = np.asarray(curve.control_points, dtype=float).reshape(-1, 3)
+        else:
+            if len(curve.mesh_vertex_path) == 0:
+                continue
+            points = np.asarray(shell.vertices[curve.mesh_vertex_path], dtype=float).reshape(-1, 3)
+        if len(points) < 2:
+            continue
+        color = _shell_cut_debug_color(curve.label_left)
+        point_groups.append((points, color, curve.label_left))
+
+    _write_debug_box_points(path, point_groups, radius)
+
+
+def _write_shell_cut_seed_debug_ply(
+    path: str | Path,
+    shell: ShellMesh,
+    seeds: Sequence[SurfacePatchSeed],
+) -> None:
+    extent = float(np.max(np.ptp(shell.vertices, axis=0))) if len(shell.vertices) else 1.0
+    marker_radius = max(1.0, extent * 0.025)
+    point_groups: List[Tuple[np.ndarray, Tuple[int, int, int], str]] = []
+
+    for seed in seeds:
+        if seed.snapped_face is not None and 0 <= int(seed.snapped_face) < len(shell.faces):
+            center = np.mean(shell.vertices[shell.faces[int(seed.snapped_face)]], axis=0)
+        else:
+            center = np.asarray(seed.seed_point, dtype=float)
+        color = _shell_cut_debug_color(seed.patch_label)
+        point_groups.append((center.reshape(1, 3), color, seed.patch_label))
+
+    _write_debug_box_points(path, point_groups, marker_radius)
+
+
+def _shell_cut_curve_point_groups(
+    shell: ShellMesh,
+    curves: Sequence[SurfaceCutCurve],
+) -> List[Tuple[np.ndarray, Tuple[int, int, int], str]]:
+    point_groups: List[Tuple[np.ndarray, Tuple[int, int, int], str]] = []
+    for curve in curves:
+        if len(curve.mesh_vertex_path) == 0:
+            continue
+        points = np.asarray(shell.vertices[curve.mesh_vertex_path], dtype=float).reshape(-1, 3)
+        if len(points) < 2:
+            continue
+        point_groups.append((points, _shell_cut_debug_color(curve.label_left), curve.label_left))
+    return point_groups
+
+
+def _shell_cut_seed_point_groups(
+    shell: ShellMesh,
+    seeds: Sequence[SurfacePatchSeed],
+) -> List[Tuple[np.ndarray, Tuple[int, int, int], str]]:
+    point_groups: List[Tuple[np.ndarray, Tuple[int, int, int], str]] = []
+    for seed in seeds:
+        if seed.snapped_face is not None and 0 <= int(seed.snapped_face) < len(shell.faces):
+            center = np.mean(shell.vertices[shell.faces[int(seed.snapped_face)]], axis=0)
+        else:
+            center = np.asarray(seed.seed_point, dtype=float)
+        material_name = f"{seed.patch_label}_seed"
+        point_groups.append((center.reshape(1, 3), _shell_cut_debug_color(seed.patch_label), material_name))
+    return point_groups
+
+
+def _write_shell_with_cut_curves_obj(
+    path: str | Path,
+    shell: ShellMesh,
+    curves: Sequence[SurfaceCutCurve],
+    seeds: Sequence[SurfacePatchSeed],
+) -> None:
+    extent = float(np.max(np.ptp(shell.vertices, axis=0))) if len(shell.vertices) else 1.0
+    curve_radius = max(0.45, extent * 0.006)
+    seed_radius = max(1.2, extent * 0.03)
+
+    curve_vertices, curve_faces, curve_materials, curve_mtls, _curve_colors = _debug_box_points_mesh(
+        _shell_cut_curve_point_groups(shell, curves),
+        curve_radius,
+    )
+    seed_vertices, seed_faces, seed_materials, seed_mtls, _seed_colors = _debug_box_points_mesh(
+        _shell_cut_seed_point_groups(shell, seeds),
+        seed_radius,
+    )
+
+    vertices = [np.asarray(shell.vertices, dtype=float)]
+    faces = [np.asarray(shell.faces, dtype=np.int32)]
+    face_materials: List[str] = ["shell"] * len(shell.faces)
+    materials: Dict[str, Tuple[int, int, int]] = {"shell": (200, 200, 200)}
+    materials.update(curve_mtls)
+    materials.update(seed_mtls)
+
+    offset = len(shell.vertices)
+    if len(curve_vertices) > 0:
+        vertices.append(curve_vertices)
+        faces.append(curve_faces + offset)
+        face_materials.extend(curve_materials)
+        offset += len(curve_vertices)
+    if len(seed_vertices) > 0:
+        vertices.append(seed_vertices)
+        faces.append(seed_faces + offset)
+        face_materials.extend(seed_materials)
+
+    _write_colored_obj(
+        path,
+        "shell_with_cut_curves",
+        np.vstack(vertices),
+        np.vstack(faces),
+        face_materials=face_materials,
+        materials=materials,
+    )
+
+
+def _write_shell_cut_debug_geometry(
+    output_dir: str | Path,
+    shell: ShellMesh,
+    curves: Sequence[SurfaceCutCurve],
+    seeds: Sequence[SurfacePatchSeed],
+) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    full_shell = SurfaceMesh("full_shell", shell.vertices, shell.faces)
+    write_ply(output_dir / "full_shell.ply", full_shell)
+    write_obj(output_dir / "full_shell.obj", full_shell)
+    _write_shell_cut_curve_debug_ply(
+        output_dir / "cut_curves_on_shell.ply",
+        shell,
+        curves,
+        source="snapped",
+    )
+    _write_shell_cut_curve_debug_ply(
+        output_dir / "cut_curve_control_points.ply",
+        shell,
+        curves,
+        source="control",
+    )
+    if seeds:
+        _write_shell_cut_seed_debug_ply(output_dir / "patch_seed_markers.ply", shell, seeds)
+    _write_shell_with_cut_curves_obj(
+        output_dir / "shell_with_cut_curves.obj",
+        shell,
+        curves,
+        seeds,
+    )
+
+
+def _write_shell_cut_qc_tables(qc: Dict[str, List[Dict]], output_dir: str | Path) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv_rows(
+        output_dir / "shell_summary.csv",
+        qc.get("shell_summary", []),
+        fieldnames=[
+            "backend",
+            "coordinate_space",
+            "num_vertices",
+            "num_faces",
+            "num_edges",
+            "num_boundary_edges",
+            "num_nonmanifold_edges",
+            "mask_shape",
+            "foreground_voxel_count",
+            "mask_component_count",
+            "spacing_x",
+            "spacing_y",
+            "spacing_z",
+        ],
+    )
+    _write_csv_rows(
+        output_dir / "cut_curves.csv",
+        qc.get("cut_curves", []),
+        fieldnames=[
+            "curve_id",
+            "label_left",
+            "label_right",
+            "source",
+            "confidence",
+            "num_control_points",
+            "num_snapped_vertices",
+            "num_path_vertices",
+            "num_cut_edges",
+            "is_closed",
+            "closure_error",
+            "mean_snap_distance",
+            "max_snap_distance",
+            "path_length",
+            "control_polyline_length",
+            "path_length_ratio",
+            "revisited_vertex_count",
+            "status",
+            "reason",
+        ],
+    )
+    seed_rows = qc.get("seeds", [])
+    if seed_rows:
+        _write_csv_rows(
+            output_dir / "seeds.csv",
+            seed_rows,
+            fieldnames=[
+                "patch_label",
+                "source",
+                "seed_x",
+                "seed_y",
+                "seed_z",
+                "snapped_face",
+                "snap_distance",
+                "status",
+                "reason",
+            ],
+        )
+    _write_csv_rows(
+        output_dir / "patch_summary.csv",
+        qc.get("patch_summary", []),
+        fieldnames=[
+            "patch_id",
+            "label",
+            "num_faces",
+            "num_vertices",
+            "area",
+            "boundary_length",
+            "num_boundary_edges",
+            "status",
+            "reason",
+        ],
+    )
+    _write_csv_rows(
+        output_dir / "cut_components.csv",
+        qc.get("cut_components", []),
+        fieldnames=[
+            "component_id",
+            "num_faces",
+            "area",
+            "touches_outer_cut",
+            "touches_inner_cut",
+            "cut_curves",
+            "assigned_label",
+            "assignment_reason",
+            "selected_patch_labels",
+        ],
+    )
+    _write_csv_rows(
+        output_dir / "cut_edges.csv",
+        qc.get("cut_edges", []),
+        fieldnames=["curve_id", "edge_start", "edge_end", "curve_ids", "shared_by_curve_count"],
+    )
+    shared_cut_edge_rows = qc.get("shared_cut_edges", [])
+    if shared_cut_edge_rows:
+        _write_csv_rows(
+            output_dir / "shared_cut_edges.csv",
+            shared_cut_edge_rows,
+            fieldnames=[
+                "edge_start",
+                "edge_end",
+                "curve_ids",
+                "shared_by_curve_count",
+                "center_x",
+                "center_y",
+                "center_z",
+            ],
+        )
+    _write_csv_rows(
+        output_dir / "shell_cut_warnings.csv",
+        qc.get("warnings", []),
+        fieldnames=[
+            "warning_type",
+            "severity",
+            "object_id",
+            "message",
+            "suggested_action",
+        ],
+    )
+
+
+def safe_surface_name(name: object, fallback: str = "surface") -> str:
+    """Return a readable file-safe surface name."""
+
+    text = str(name or "").strip()
+    if not text:
+        text = fallback
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or fallback
+
+
+def _unique_surface_name(name: object, used: set[str], fallback: str = "surface") -> str:
+    base = safe_surface_name(name, fallback=fallback)
+    candidate = base
+    index = 2
+    while candidate in used:
+        candidate = f"{base}_{index}"
+        index += 1
+    used.add(candidate)
+    return candidate
+
+
+def _face_component_lookup(components: Sequence[np.ndarray], face_count: int) -> np.ndarray:
+    lookup = np.full(int(face_count), -1, dtype=np.int64)
+    for component_id, component in enumerate(components):
+        lookup[np.asarray(component, dtype=np.int64)] = int(component_id)
+    return lookup
+
+
+def _named_patch_component_rows(
+    components: Sequence[np.ndarray],
+    shell: ShellMesh,
+    edge_curve_ids: Dict[Tuple[int, int], set[str]],
+    labels_by_component: Dict[int, set[str]],
+) -> List[Dict]:
+    rows: List[Dict] = []
+    vertices_scaled = _shell_vertices_scaled(shell)
+    for component_id, component in enumerate(components):
+        component = np.asarray(component, dtype=np.int64)
+        curve_ids: set[str] = set()
+        for face_id in component:
+            for edge in _face_edges(shell.faces[int(face_id)]):
+                curve_ids.update(edge_curve_ids.get(edge, set()))
+        labels = sorted(labels_by_component.get(int(component_id), set()))
+        rows.append(
+            {
+                "component_id": int(component_id),
+                "num_faces": int(len(component)),
+                "area": float(_mesh_area(vertices_scaled, shell.faces[component])),
+                "touches_outer_cut": False,
+                "touches_inner_cut": False,
+                "cut_curves": ";".join(sorted(curve_ids)),
+                "assigned_label": ";".join(labels),
+                "assignment_reason": "selected by 3D seed" if labels else "not selected",
+                "selected_patch_labels": ";".join(labels),
+            }
+        )
+    return rows
+
+
+def named_shell_cut_surface_patches(
+    mask: np.ndarray,
+    cut_curves: Sequence[SurfaceCutCurve],
+    patch_seeds: Sequence[SurfacePatchSeed],
+    spacing: Optional[np.ndarray] = None,
+    shell_backend: str = "marching_cubes",
+    output_qc_dir: Optional[str | Path] = None,
+    max_surface_quads: int = 1_500_000,
+    input_warnings: Optional[Sequence[Dict]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Tuple[Dict[str, SurfaceMesh], Dict[str, List[Dict]]]:
+    """Cut named patches from the complete shell using user-selected seed faces."""
+
+    mask = _as_bool_mask(mask)
+    if not cut_curves:
+        raise ValueError("3D shell patch build needs at least one closed cut curve")
+    if not patch_seeds:
+        raise ValueError("3D shell patch build needs at least one selected surface patch")
+
+    _emit_progress(
+        progress_callback,
+        5,
+        "Reading shell annotations",
+        f"{len(cut_curves)} curve(s), {len(patch_seeds)} patch seed(s)",
+    )
+    _emit_progress(
+        progress_callback,
+        18,
+        "Building shell mesh",
+        f"Backend: {normalize_shell_backend(shell_backend)}",
+    )
+    shell = build_shell_mesh(
+        mask,
+        spacing=spacing,
+        shell_backend=shell_backend,
+        max_surface_quads=max_surface_quads,
+    )
+    if len(shell.faces) == 0:
+        raise ValueError("3D shell patch build could not build a shell from an empty mask")
+
+    _emit_progress(
+        progress_callback,
+        40,
+        "Tracing cut curves on shell",
+        f"{len(cut_curves)} closed curve(s)",
+    )
+    edge_graph, edge_set = _build_shell_edge_graph(shell)
+    traced_curves: List[SurfaceCutCurve] = []
+    blocked_edges: set[Tuple[int, int]] = set()
+    for curve in cut_curves:
+        traced = trace_cut_curve_on_shell(
+            snap_cut_curve_to_shell(curve, shell),
+            shell,
+            edge_graph,
+            edge_set,
+        )
+        traced_curves.append(traced)
+        blocked_edges.update(traced.cut_edges)
+
+    _emit_progress(
+        progress_callback,
+        58,
+        "Finding selected surface patches",
+        f"{len(patch_seeds)} seed point(s)",
+    )
+    adjacency, shared_edges, edge_to_faces = _build_face_adjacency(shell.faces)
+    vertex_faces = _vertex_to_faces(shell.faces, len(shell.vertices))
+    snapped_seeds = [snap_seed_to_shell_face(seed, shell, vertex_faces) for seed in patch_seeds]
+    components = _face_components_after_cut(adjacency, shared_edges, blocked_edges)
+    face_to_component = _face_component_lookup(components, len(shell.faces))
+
+    labels_by_component: Dict[int, set[str]] = defaultdict(set)
+    component_ids_by_label: Dict[str, set[int]] = defaultdict(set)
+    seed_name_lookup: Dict[int, str] = {}
+    warning_rows = list(input_warnings or [])
+    for seed_index, seed in enumerate(snapped_seeds):
+        label = safe_surface_name(seed.patch_label, fallback=f"surface_{seed_index + 1}")
+        seed_name_lookup[seed_index] = label
+        if seed.status == "error" or seed.snapped_face is None:
+            continue
+        component_id = int(face_to_component[int(seed.snapped_face)])
+        if component_id < 0:
+            seed.status = "error"
+            seed.reason = "selected seed face is not part of any cut component"
+            continue
+        labels_by_component[component_id].add(label)
+        component_ids_by_label[label].add(component_id)
+
+    meshes: Dict[str, SurfaceMesh] = {}
+    for label, component_ids in component_ids_by_label.items():
+        face_indices = np.concatenate(
+            [np.asarray(components[component_id], dtype=np.int64) for component_id in sorted(component_ids)]
+        )
+        meshes[label] = _extract_shell_submesh(label, shell, np.unique(face_indices))
+
+    _emit_progress(progress_callback, 72, "Preparing shell-cut QC", f"{len(meshes)} selected surface(s)")
+    patch_rows = [
+        _patch_summary_row(label, shell, np.concatenate([
+            np.asarray(components[component_id], dtype=np.int64)
+            for component_id in sorted(component_ids)
+        ]))
+        for label, component_ids in sorted(component_ids_by_label.items())
+    ]
+    shell_summary = _shell_summary_row(shell, mask, edge_to_faces)
+    _edge_labels, edge_curve_ids = _cut_edge_label_lookup(traced_curves)
+    shared_cut_edge_rows = _shared_cut_edge_rows(shell, edge_curve_ids)
+    component_rows = _named_patch_component_rows(
+        components,
+        shell,
+        edge_curve_ids,
+        labels_by_component,
+    )
+    cut_edge_rows = _cut_edge_rows(traced_curves)
+    warning_rows.extend(
+        _shell_cut_warning_rows(
+            traced_curves,
+            snapped_seeds,
+            patch_rows,
+            component_rows=component_rows,
+            shell_summary=shell_summary,
+            shared_cut_edge_count=len(shared_cut_edge_rows),
+            minimum_component_count=2,
+            warn_unclaimed_components=False,
+        )
+    )
+    if not meshes:
+        warning_rows.append(
+            _shell_cut_warning_row(
+                "no_selected_patch",
+                "error",
+                "selected_patches",
+                "no selected surface patch produced any faces",
+                "click inside the shell area that should be saved as a named surface",
+            )
+        )
+
+    qc = {
+        "shell_summary": [shell_summary],
+        "cut_curves": [_surface_cut_curve_row(curve) for curve in traced_curves],
+        "seeds": [_surface_patch_seed_row(seed) for seed in snapped_seeds],
+        "patch_summary": patch_rows,
+        "cut_components": component_rows,
+        "cut_edges": cut_edge_rows,
+        "shared_cut_edges": shared_cut_edge_rows,
+        "warnings": warning_rows,
+    }
+
+    if output_qc_dir is not None:
+        output_qc_path = Path(output_qc_dir)
+        _emit_progress(progress_callback, 86, "Writing shell-cut QC", str(output_qc_path))
+        _write_shell_cut_qc_tables(qc, output_qc_path)
+        _write_shell_cut_debug_geometry(
+            output_qc_path,
+            shell,
+            traced_curves,
+            snapped_seeds,
+        )
+
+    error_messages = [
+        str(row.get("message", ""))
+        for row in qc["warnings"]
+        if row.get("severity") == "error"
+    ]
+    if error_messages:
+        raise ValueError("3D shell patch build failed: " + "; ".join(error_messages))
+    _emit_progress(progress_callback, 100, "Shell patches ready", f"{len(meshes)} selected surface(s)")
+    return meshes, qc
+
+
+def shell_cut_surface_patches(
+    mask: np.ndarray,
+    boundaries: Sequence[BoundarySlice],
+    cut_curves: Optional[Sequence[SurfaceCutCurve]] = None,
+    patch_seeds: Optional[Sequence[SurfacePatchSeed]] = None,
+    spacing: Optional[np.ndarray] = None,
+    shell_backend: str = "voxel",
+    output_qc_dir: Optional[str | Path] = None,
+    max_surface_quads: int = 1_500_000,
+    input_warnings: Optional[Sequence[Dict]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Tuple[Dict[str, SurfaceMesh], Dict[str, List[Dict]]]:
+    """Cut outer/inner/lateral patches from the complete mask shell."""
+
+    mask = _as_bool_mask(mask)
+    _emit_progress(progress_callback, 5, "Reading shell-cut boundaries", "Preparing cut curves and seed points")
+    _emit_progress(
+        progress_callback,
+        18,
+        "Building shell mesh",
+        f"Backend: {normalize_shell_backend(shell_backend)}",
+    )
+    shell = build_shell_mesh(
+        mask,
+        spacing=spacing,
+        shell_backend=shell_backend,
+        max_surface_quads=max_surface_quads,
+    )
+    if len(shell.faces) == 0:
+        raise ValueError("Shell-cut could not build a shell from an empty mask")
+
+    curves = list(cut_curves) if cut_curves is not None else infer_cut_curves_from_boundaries(boundaries)
+    if len(curves) < 2:
+        raise ValueError("shell-cut needs outer and inner cut curves")
+
+    seeds = list(patch_seeds or [])
+
+    _emit_progress(progress_callback, 40, "Tracing cut curves on shell", f"{len(curves)} cut curve(s)")
+    edge_graph, edge_set = _build_shell_edge_graph(shell)
+    traced_curves: List[SurfaceCutCurve] = []
+    blocked_edges: set[Tuple[int, int]] = set()
+    for curve in curves:
+        traced = trace_cut_curve_on_shell(
+            snap_cut_curve_to_shell(curve, shell),
+            shell,
+            edge_graph,
+            edge_set,
+        )
+        traced_curves.append(traced)
+        blocked_edges.update(traced.cut_edges)
+
+    _emit_progress(progress_callback, 58, "Finding shell components", "Flood filling patches between cut curves")
+    adjacency, shared_edges, edge_to_faces = _build_face_adjacency(shell.faces)
+    vertex_faces = _vertex_to_faces(shell.faces, len(shell.vertices))
+    snapped_seeds = [snap_seed_to_shell_face(seed, shell, vertex_faces) for seed in seeds]
+    components = _face_components_after_cut(adjacency, shared_edges, blocked_edges)
+    edge_labels, edge_curve_ids = _cut_edge_label_lookup(traced_curves)
+    faces_by_label, component_rows = _label_cut_components(
+        components,
+        shell,
+        edge_labels,
+        edge_curve_ids,
+    )
+
+    outer_faces = faces_by_label["outer"]
+    inner_faces = faces_by_label["inner"]
+    lateral_faces = faces_by_label["lateral"]
+    overlap = np.intersect1d(outer_faces, inner_faces)
+
+    meshes = {
+        "outer": _extract_shell_submesh("outer", shell, outer_faces),
+        "inner": _extract_shell_submesh("inner", shell, inner_faces),
+        "lateral": _extract_shell_submesh("lateral", shell, lateral_faces),
+    }
+
+    _emit_progress(progress_callback, 72, "Preparing shell-cut QC", f"{len(components)} shell component(s)")
+    patch_rows = [
+        _patch_summary_row("outer", shell, outer_faces),
+        _patch_summary_row("inner", shell, inner_faces),
+        _patch_summary_row("lateral", shell, lateral_faces),
+    ]
+    shell_summary = _shell_summary_row(shell, mask, edge_to_faces)
+    shared_cut_edge_rows = _shared_cut_edge_rows(shell, edge_curve_ids)
+    cut_edge_rows = _cut_edge_rows(traced_curves)
+    warning_rows = list(input_warnings or [])
+    warning_rows.extend(
+        _shell_cut_warning_rows(
+            traced_curves,
+            snapped_seeds,
+            patch_rows,
+            component_rows=component_rows,
+            shell_summary=shell_summary,
+            overlap_count=int(len(overlap)),
+            shared_cut_edge_count=len(shared_cut_edge_rows),
+        )
+    )
+    qc = {
+        "shell_summary": [shell_summary],
+        "cut_curves": [_surface_cut_curve_row(curve) for curve in traced_curves],
+        "seeds": [_surface_patch_seed_row(seed) for seed in snapped_seeds],
+        "patch_summary": patch_rows,
+        "cut_components": component_rows,
+        "cut_edges": cut_edge_rows,
+        "shared_cut_edges": shared_cut_edge_rows,
+        "warnings": warning_rows,
+    }
+
+    if output_qc_dir is not None:
+        output_qc_path = Path(output_qc_dir)
+        _emit_progress(progress_callback, 86, "Writing shell-cut QC", str(output_qc_path))
+        _write_shell_cut_qc_tables(qc, output_qc_path)
+        _write_shell_cut_debug_geometry(
+            output_qc_path,
+            shell,
+            traced_curves,
+            snapped_seeds,
+        )
+
+    error_messages = [
+        str(row.get("message", ""))
+        for row in qc["warnings"]
+        if row.get("severity") == "error"
+    ]
+    if error_messages:
+        raise ValueError("Shell-cut failed: " + "; ".join(error_messages))
+    _emit_progress(progress_callback, 100, "Shell-cut surfaces ready", "Outer, inner, and lateral patches are isolated")
+    return meshes, qc
+
+
+def _surface_label_name(label: int) -> str:
+    names = {
+        BOUNDARY_OUTER: "outer",
+        BOUNDARY_INNER: "inner",
+        BOUNDARY_LATERAL: "lateral",
+        BOUNDARY_UNKNOWN: "unknown",
+    }
+    return names.get(int(label), f"label_{int(label)}")
+
+
+def _label_mesh_name(label: int) -> Optional[str]:
+    if int(label) == BOUNDARY_OUTER:
+        return "outer"
+    if int(label) == BOUNDARY_INNER:
+        return "inner"
+    if int(label) == BOUNDARY_LATERAL:
+        return "lateral"
+    return None
+
+
+def _scaled_points(points: np.ndarray, spacing: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    spacing = np.asarray(spacing, dtype=float).reshape(1, 3)
+    return points * spacing
+
+
+def _polyline_cumulative_distances(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return np.empty(0, dtype=float)
+    distances = np.zeros(len(points), dtype=float)
+    if len(points) > 1:
+        distances[1:] = np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=1))
+    return distances
+
+
+def _polyline_fraction_positions(points: np.ndarray) -> np.ndarray:
+    distances = _polyline_cumulative_distances(points)
+    if len(distances) == 0:
+        return distances
+    total = float(distances[-1])
+    if total <= 0:
+        return np.linspace(0.0, 1.0, len(distances))
+    return distances / total
+
+
+def _unit_vector(vector: np.ndarray) -> np.ndarray:
+    vector = np.asarray(vector, dtype=float)
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        return np.zeros_like(vector, dtype=float)
+    return vector / norm
+
+
+def _arc_tangent(points: np.ndarray, start: bool) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) < 2:
+        return np.zeros(3, dtype=float)
+    if start:
+        return _unit_vector(points[1] - points[0])
+    return _unit_vector(points[-1] - points[-2])
+
+
+def _arc_curvature_profile(points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) < 3:
+        return np.empty(0, dtype=float)
+    values: List[float] = []
+    for index in range(1, len(points) - 1):
+        left = points[index] - points[index - 1]
+        right = points[index + 1] - points[index]
+        left_unit = _unit_vector(left)
+        right_unit = _unit_vector(right)
+        if not np.any(left_unit) or not np.any(right_unit):
+            values.append(0.0)
+            continue
+        dot = float(np.clip(np.dot(left_unit, right_unit), -1.0, 1.0))
+        angle = math.acos(dot)
+        local_length = max(1e-6, 0.5 * (float(np.linalg.norm(left)) + float(np.linalg.norm(right))))
+        values.append(angle / local_length)
+    return np.asarray(values, dtype=float)
+
+
+def _make_arc_segment(
+    boundary: BoundarySlice,
+    label: int,
+    points: np.ndarray,
+    local_index: int,
+    spacing: np.ndarray,
+) -> ArcSegment:
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    scoring_points = _scaled_points(points, spacing)
+    length = _polyline_length(scoring_points, closed=False)
+    name = _surface_label_name(label)
+    return ArcSegment(
+        arc_id=f"s{boundary.slice_index}_c{boundary.contour_id}_{name}_{local_index}",
+        slice_index=int(boundary.slice_index),
+        contour_id=int(boundary.contour_id),
+        label=int(label),
+        points=points,
+        scoring_points=scoring_points,
+        is_closed=_is_closed_polyline(points),
+        source=str(boundary.source),
+        confidence=float(boundary.confidence),
+        boundary_source=str(boundary.source),
+        length=float(length),
+        centroid=np.asarray(scoring_points.mean(axis=0), dtype=float) if len(scoring_points) else np.zeros(3),
+        start_point=np.asarray(scoring_points[0], dtype=float) if len(scoring_points) else np.zeros(3),
+        end_point=np.asarray(scoring_points[-1], dtype=float) if len(scoring_points) else np.zeros(3),
+        tangent_start=_arc_tangent(scoring_points, start=True),
+        tangent_end=_arc_tangent(scoring_points, start=False),
+        curvature=_arc_curvature_profile(scoring_points),
+    )
+
+
+def build_labeled_arcs(
+    boundaries: Sequence[BoundarySlice],
+    spacing: np.ndarray,
+) -> Dict[int, List[ArcSegment]]:
+    arcs_by_slice: Dict[int, List[ArcSegment]] = {}
+    for boundary in sorted(boundaries, key=lambda item: item.slice_index):
+        arcs: List[ArcSegment] = []
+        if len(boundary.outer_arc) >= 2:
+            arcs.append(_make_arc_segment(boundary, BOUNDARY_OUTER, boundary.outer_arc, 0, spacing))
+        if len(boundary.inner_arc) >= 2:
+            arcs.append(_make_arc_segment(boundary, BOUNDARY_INNER, boundary.inner_arc, 0, spacing))
+        for lateral_index, lateral_arc in enumerate(boundary.lateral_arcs):
+            if len(lateral_arc) >= 2:
+                arcs.append(
+                    _make_arc_segment(
+                        boundary,
+                        BOUNDARY_LATERAL,
+                        lateral_arc,
+                        lateral_index,
+                        spacing,
+                    )
+                )
+        arcs_by_slice[int(boundary.slice_index)] = arcs
+    return arcs_by_slice
+
+
+def _arc_range_length(arc: ArcSegment, start_fraction: float, end_fraction: float) -> float:
+    if arc.length <= 0:
+        return 0.0
+    spans = _split_fraction_range(start_fraction, end_fraction, arc.is_closed)
+    return float(sum(max(0.0, end - start) for start, end in spans) * arc.length)
+
+
+def _fraction_to_index(points: np.ndarray, fraction: float) -> int:
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return 0
+    fractions = _polyline_fraction_positions(points)
+    fraction = max(0.0, min(1.0, float(fraction)))
+    index = int(np.searchsorted(fractions, fraction, side="left"))
+    return max(0, min(index, len(points) - 1))
+
+
+def _split_fraction_range(
+    start_fraction: float,
+    end_fraction: float,
+    is_closed: bool,
+) -> List[Tuple[float, float]]:
+    start = float(start_fraction)
+    end = float(end_fraction)
+    if not is_closed:
+        start = max(0.0, min(1.0, start))
+        end = max(0.0, min(1.0, end))
+        if end < start:
+            start, end = end, start
+        return [(start, end)] if end - start > 1e-9 else []
+
+    span = end - start
+    if span >= 1.0:
+        return [(0.0, 1.0)]
+    start_mod = start % 1.0
+    end_mod = end % 1.0
+    if end <= start or end_mod < start_mod:
+        ranges = []
+        if start_mod < 1.0:
+            ranges.append((start_mod, 1.0))
+        if end_mod > 0.0:
+            ranges.append((0.0, end_mod))
+        return ranges
+    return [(start_mod, end_mod)] if end_mod - start_mod > 1e-9 else []
+
+
+def _merge_fraction_ranges(ranges: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    valid = sorted((max(0.0, start), min(1.0, end)) for start, end in ranges if end - start > 1e-9)
+    if not valid:
+        return []
+    merged: List[Tuple[float, float]] = [valid[0]]
+    for start, end in valid[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end + 1e-6:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+class ArcUsageMap:
+    def __init__(self, arcs: Sequence[ArcSegment]):
+        self.arc_by_id = {arc.arc_id: arc for arc in arcs}
+        self.used_ranges_by_arc: Dict[str, List[Tuple[float, float]]] = {
+            arc.arc_id: [] for arc in arcs
+        }
+
+    def add_used_range(self, arc_id: str, start_fraction: float, end_fraction: float) -> None:
+        arc = self.arc_by_id[arc_id]
+        self.used_ranges_by_arc.setdefault(arc_id, []).extend(
+            _split_fraction_range(start_fraction, end_fraction, arc.is_closed)
+        )
+        self.used_ranges_by_arc[arc_id] = _merge_fraction_ranges(self.used_ranges_by_arc[arc_id])
+
+    def overlap_fraction(self, arc_id: str, start_fraction: float, end_fraction: float) -> float:
+        arc = self.arc_by_id[arc_id]
+        candidate_ranges = _split_fraction_range(start_fraction, end_fraction, arc.is_closed)
+        candidate_length = sum(end - start for start, end in candidate_ranges)
+        if candidate_length <= 1e-9:
+            return 0.0
+        used_ranges = self.used_ranges_by_arc.get(arc_id, [])
+        overlap = 0.0
+        for start, end in candidate_ranges:
+            for used_start, used_end in used_ranges:
+                overlap += max(0.0, min(end, used_end) - max(start, used_start))
+        return float(overlap / candidate_length)
+
+    def coverage_fraction(self, arc_id: str) -> float:
+        ranges = self.used_ranges_by_arc.get(arc_id, [])
+        return float(sum(end - start for start, end in ranges))
+
+    def unmatched_ranges(self, arc_id: str) -> List[Tuple[float, float]]:
+        used = _merge_fraction_ranges(self.used_ranges_by_arc.get(arc_id, []))
+        if not used:
+            return [(0.0, 1.0)]
+        output: List[Tuple[float, float]] = []
+        cursor = 0.0
+        for start, end in used:
+            if start > cursor + 1e-6:
+                output.append((cursor, start))
+            cursor = max(cursor, end)
+        if cursor < 1.0 - 1e-6:
+            output.append((cursor, 1.0))
+        return output
+
+
+def _interpolate_polyline(points: np.ndarray, fraction: float) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return np.zeros(3, dtype=float)
+    if len(points) == 1:
+        return points[0].copy()
+    fractions = _polyline_fraction_positions(points)
+    fraction = max(0.0, min(1.0, float(fraction)))
+    index = int(np.searchsorted(fractions, fraction, side="right") - 1)
+    index = max(0, min(index, len(points) - 2))
+    left_fraction = float(fractions[index])
+    right_fraction = float(fractions[index + 1])
+    if right_fraction <= left_fraction:
+        return points[index].copy()
+    t = (fraction - left_fraction) / (right_fraction - left_fraction)
+    return (1.0 - t) * points[index] + t * points[index + 1]
+
+
+def _extract_open_polyline_range(
+    points: np.ndarray,
+    start_fraction: float,
+    end_fraction: float,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    if len(points) == 0:
+        return points
+    start = max(0.0, min(1.0, float(start_fraction)))
+    end = max(0.0, min(1.0, float(end_fraction)))
+    if end < start:
+        start, end = end, start
+    if abs(end - start) <= 1e-9:
+        point = _interpolate_polyline(points, start)
+        return np.vstack([point, point])
+
+    fractions = _polyline_fraction_positions(points)
+    keep = (fractions > start + 1e-9) & (fractions < end - 1e-9)
+    selected = [_interpolate_polyline(points, start)]
+    selected.extend(points[keep])
+    selected.append(_interpolate_polyline(points, end))
+    return np.asarray(selected, dtype=float)
+
+
+def extract_polyline_range(
+    points: np.ndarray,
+    start_fraction: float,
+    end_fraction: float,
+    closed: bool = False,
+) -> np.ndarray:
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    if len(points) == 0:
+        return points
+    if not closed:
+        return _extract_open_polyline_range(points, start_fraction, end_fraction)
+
+    unique = _normalize_contour(points)
+    if len(unique) < 2:
+        return unique
+    closed_points = np.vstack([unique, unique[:1]])
+    start = float(start_fraction)
+    end = float(end_fraction)
+    if end < start:
+        end += 1.0
+    if end - start >= 1.0:
+        return closed_points
+
+    start_mod = start % 1.0
+    end_mod = end % 1.0
+    if end > 1.0 or end_mod < start_mod:
+        first = _extract_open_polyline_range(closed_points, start_mod, 1.0)
+        second = _extract_open_polyline_range(closed_points, 0.0, end_mod)
+        return np.vstack([first[:-1], second])
+    return _extract_open_polyline_range(closed_points, start_mod, end_mod)
+
+
+def _normalization_radius(spacing: np.ndarray, slice_gap: int = 1) -> float:
+    spacing = np.asarray(spacing, dtype=float).reshape(-1)
+    if len(spacing) < 3 or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+        return 1.0
+    xy_spacing = float(max(spacing[1], spacing[2]))
+    z_spacing = float(spacing[0]) * max(1, int(slice_gap))
+    return max(z_spacing, xy_spacing, 1e-6)
+
+
+def _sample_points_with_fractions(
+    points: np.ndarray,
+    sample_count: int,
+    closed: bool = False,
+    duplicate_closed: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    if closed:
+        unique = _normalize_contour(points)
+        if len(unique) < 2:
+            return unique, np.zeros(len(unique), dtype=float)
+        loop = np.vstack([unique, unique[:1]])
+        count = max(3, int(sample_count))
+        sampled = resample_polyline(loop, count + 1)[:-1]
+        fractions = np.linspace(0.0, 1.0, count, endpoint=False)
+        if duplicate_closed:
+            sampled = np.vstack([sampled, sampled])
+            fractions = np.r_[fractions, fractions + 1.0]
+        return sampled, fractions
+
+    count = max(2, int(sample_count))
+    sampled = resample_polyline(points, count)
+    fractions = np.linspace(0.0, 1.0, len(sampled))
+    return sampled, fractions
+
+
+def _sample_count_for_arc(arc: ArcSegment, base: int = 48, maximum: int = 160) -> int:
+    if arc.length <= 0:
+        return base
+    return max(16, min(maximum, int(round(base * max(1.0, arc.length / 48.0)))))
+
+
+def _subsequence_dtw(
+    query: np.ndarray,
+    reference: np.ndarray,
+    query_fractions: np.ndarray,
+    reference_fractions: np.ndarray,
+    normalization: float,
+    min_reference_span_fraction: float = 0.15,
+) -> Dict[str, object]:
+    query = np.asarray(query, dtype=float)
+    reference = np.asarray(reference, dtype=float)
+    if len(query) < 2 or len(reference) < 2:
+        return {"valid": False, "reason": "too_few_points"}
+
+    distances = np.linalg.norm(query[:, None, :] - reference[None, :, :], axis=2)
+    distances = distances / max(float(normalization), 1e-6)
+    rows, cols = distances.shape
+    cost = np.full((rows, cols), np.inf, dtype=float)
+    previous = np.full((rows, cols, 2), -1, dtype=np.int32)
+    cost[0, :] = distances[0, :]
+
+    for row in range(1, rows):
+        for col in range(cols):
+            choices = [(cost[row - 1, col], row - 1, col)]
+            if col > 0:
+                choices.append((cost[row, col - 1], row, col - 1))
+                choices.append((cost[row - 1, col - 1], row - 1, col - 1))
+            best_cost, prev_row, prev_col = min(choices, key=lambda item: item[0])
+            cost[row, col] = distances[row, col] + best_cost
+            previous[row, col] = [prev_row, prev_col]
+
+    end_col = int(np.argmin(cost[-1]))
+    if not np.isfinite(cost[-1, end_col]):
+        return {"valid": False, "reason": "no_finite_path"}
+
+    path_rows: List[int] = []
+    path_cols: List[int] = []
+    row = rows - 1
+    col = end_col
+    while row >= 0 and col >= 0:
+        path_rows.append(row)
+        path_cols.append(col)
+        if row == 0:
+            break
+        prev_row, prev_col = previous[row, col]
+        if prev_row < 0 or prev_col < 0:
+            break
+        row, col = int(prev_row), int(prev_col)
+
+    path_rows = list(reversed(path_rows))
+    path_cols = list(reversed(path_cols))
+    if len(path_rows) < 2:
+        return {"valid": False, "reason": "short_path"}
+
+    ref_start_fraction = float(reference_fractions[min(path_cols)])
+    ref_end_fraction = float(reference_fractions[max(path_cols)])
+    ref_span = abs(ref_end_fraction - ref_start_fraction)
+    if ref_span < min_reference_span_fraction:
+        return {
+            "valid": False,
+            "reason": "reference_span_too_short",
+            "reference_span": ref_span,
+        }
+
+    unique_reference_steps = len(np.unique(path_cols))
+    progress_ratio = unique_reference_steps / float(max(1, len(path_cols)))
+    if progress_ratio < 0.25:
+        return {
+            "valid": False,
+            "reason": "dtw_collapse",
+            "reference_progress_ratio": progress_ratio,
+        }
+
+    path_distances = distances[np.asarray(path_rows, dtype=int), np.asarray(path_cols, dtype=int)]
+    return {
+        "valid": True,
+        "query_indices": np.asarray(path_rows, dtype=np.int32),
+        "reference_indices": np.asarray(path_cols, dtype=np.int32),
+        "query_fraction_start": float(query_fractions[min(path_rows)]),
+        "query_fraction_end": float(query_fractions[max(path_rows)]),
+        "reference_fraction_start": ref_start_fraction,
+        "reference_fraction_end": ref_end_fraction,
+        "mean_distance": float(np.mean(path_distances)),
+        "max_distance": float(np.max(path_distances)),
+        "cost": float(cost[-1, end_col] / max(1, len(path_rows))),
+    }
+
+
+def generate_arc_match_candidates(
+    arcs_left: Sequence[ArcSegment],
+    arcs_right: Sequence[ArcSegment],
+    spacing: np.ndarray,
+) -> List[Tuple[ArcSegment, ArcSegment]]:
+    candidates: List[Tuple[ArcSegment, ArcSegment]] = []
+    for left in arcs_left:
+        for right in arcs_right:
+            if left.label != right.label:
+                continue
+            if len(left.points) < 2 or len(right.points) < 2:
+                continue
+            centroid_distance = float(np.linalg.norm(left.centroid - right.centroid))
+            scale = max(40.0, 2.5 * max(1.0, min(left.length, right.length)))
+            if centroid_distance > scale + _normalization_radius(spacing):
+                continue
+            candidates.append((left, right))
+    return candidates
+
+
+def _curve_cost_components(
+    left: ArcSegment,
+    right: ArcSegment,
+    left_start: float,
+    left_end: float,
+    right_start: float,
+    right_end: float,
+    mean_distance: float,
+    max_distance: float,
+    normalization: float,
+    direction: int,
+) -> Tuple[float, float, float, float, float]:
+    left_points = extract_polyline_range(left.scoring_points, left_start, left_end, left.is_closed)
+    right_points = extract_polyline_range(right.scoring_points, right_start, right_end, right.is_closed)
+    if direction < 0:
+        right_points = right_points[::-1]
+    if len(left_points) == 0 or len(right_points) == 0:
+        return float("inf"), float("inf"), float("inf"), float("inf"), float("inf")
+
+    endpoint_cost = (
+        float(np.linalg.norm(left_points[0] - right_points[0]))
+        + float(np.linalg.norm(left_points[-1] - right_points[-1]))
+    ) / (2.0 * max(normalization, 1e-6))
+    left_start_tangent = _arc_tangent(left_points, start=True)
+    right_start_tangent = _arc_tangent(right_points, start=True)
+    left_end_tangent = _arc_tangent(left_points, start=False)
+    right_end_tangent = _arc_tangent(right_points, start=False)
+    tangent_cost = 0.5 * (
+        1.0 - float(np.clip(np.dot(left_start_tangent, right_start_tangent), -1.0, 1.0))
+        + 1.0 - float(np.clip(np.dot(left_end_tangent, right_end_tangent), -1.0, 1.0))
+    )
+    left_length = max(1e-6, _polyline_length(left_points))
+    right_length = max(1e-6, _polyline_length(right_points))
+    length_cost = abs(math.log(left_length / right_length))
+    left_curvature = _arc_curvature_profile(left_points)
+    right_curvature = _arc_curvature_profile(right_points)
+    if len(left_curvature) and len(right_curvature):
+        curvature_cost = abs(float(np.mean(left_curvature)) - float(np.mean(right_curvature)))
+    else:
+        curvature_cost = 0.0
+    return mean_distance, endpoint_cost, tangent_cost, length_cost, curvature_cost
+
+
+def _match_cost(
+    curve_cost: float,
+    endpoint_cost: float,
+    tangent_cost: float,
+    length_cost: float,
+    curvature_cost: float,
+) -> float:
+    return float(
+        0.45 * curve_cost
+        + 0.20 * endpoint_cost
+        + 0.15 * tangent_cost
+        + 0.15 * length_cost
+        + 0.05 * curvature_cost
+    )
+
+
+def _classify_arc_match(cost: float, coverage_prev: float, coverage_next: float, left: ArcSegment, right: ArcSegment) -> str:
+    if cost <= 2.5 and coverage_prev >= 0.85 and coverage_next >= 0.85:
+        return "normal_match"
+    if left.is_closed != right.is_closed and cost <= 4.0:
+        return "open_to_closed" if right.is_closed else "closed_to_open"
+    if cost <= 4.0 and (coverage_prev >= 0.70 or coverage_next >= 0.70):
+        return "partial_match"
+    return "rejected"
+
+
+def score_arc_match(left: ArcSegment, right: ArcSegment, spacing: np.ndarray) -> ArcMatch:
+    slice_gap = abs(int(right.slice_index) - int(left.slice_index))
+    normalization = _normalization_radius(spacing, slice_gap=slice_gap)
+
+    left_count = min(96, max(24, _sample_count_for_arc(left, base=32, maximum=96)))
+    right_count = min(160, max(24, _sample_count_for_arc(right, base=32, maximum=160)))
+    left_sample, left_fractions = _sample_points_with_fractions(
+        left.scoring_points, left_count, closed=left.is_closed
+    )
+    right_sample, right_fractions = _sample_points_with_fractions(
+        right.scoring_points,
+        right_count,
+        closed=right.is_closed,
+        duplicate_closed=right.is_closed and not left.is_closed,
+    )
+
+    scored: List[ArcMatch] = []
+    for direction, sample, fractions in (
+        (1, right_sample, right_fractions),
+        (-1, right_sample[::-1], right_fractions[::-1]),
+    ):
+        direct_count = min(len(left_sample), len(sample), 64)
+        if direct_count >= 2:
+            left_direct = resample_polyline(left_sample, direct_count)
+            right_direct = resample_polyline(sample, direct_count)
+            distances = np.linalg.norm(left_direct - right_direct, axis=1) / max(normalization, 1e-6)
+            right_start = float(min(fractions[0], fractions[-1]))
+            right_end = float(max(fractions[0], fractions[-1]))
+            components = _curve_cost_components(
+                left,
+                right,
+                0.0,
+                1.0,
+                right_start,
+                right_end,
+                float(np.mean(distances)),
+                float(np.max(distances)),
+                normalization,
+                direction,
+            )
+            cost = _match_cost(*components)
+            coverage_prev = 1.0
+            coverage_next = min(1.0, max(0.0, right_end - right_start))
+            event_type = _classify_arc_match(cost, coverage_prev, coverage_next, left, right)
+            scored.append(
+                ArcMatch(
+                    prev_arc_id=left.arc_id,
+                    next_arc_id=right.arc_id,
+                    label=left.label,
+                    prev_sample_indices=np.arange(direct_count, dtype=np.int32),
+                    next_sample_indices=np.arange(direct_count, dtype=np.int32),
+                    prev_fraction_start=0.0,
+                    prev_fraction_end=1.0,
+                    next_fraction_start=right_start,
+                    next_fraction_end=right_end,
+                    direction=direction,
+                    event_type=event_type,
+                    cost=cost,
+                    confidence=1.0 / (1.0 + max(0.0, cost)),
+                    coverage_prev=coverage_prev,
+                    coverage_next=coverage_next,
+                    mean_distance=components[0],
+                    max_distance=float(np.max(distances)),
+                    length_ratio=math.exp(components[3]) if np.isfinite(components[3]) else float("inf"),
+                    reason="direct_full_arc_match",
+                )
+            )
+
+        if left.length <= right.length:
+            query = left_sample
+            query_fractions = left_fractions
+            reference = sample
+            reference_fractions = fractions
+            partial = _subsequence_dtw(query, reference, query_fractions, reference_fractions, normalization)
+            if partial.get("valid"):
+                right_start = float(min(partial["reference_fraction_start"], partial["reference_fraction_end"]))
+                right_end = float(max(partial["reference_fraction_start"], partial["reference_fraction_end"]))
+                components = _curve_cost_components(
+                    left,
+                    right,
+                    0.0,
+                    1.0,
+                    right_start,
+                    right_end,
+                    float(partial["mean_distance"]),
+                    float(partial["max_distance"]),
+                    normalization,
+                    direction,
+                )
+                cost = _match_cost(*components)
+                coverage_prev = 1.0
+                coverage_next = min(1.0, max(0.0, right_end - right_start))
+                event_type = _classify_arc_match(cost, coverage_prev, coverage_next, left, right)
+                if event_type == "normal_match":
+                    right_start, right_end = 0.0, 1.0
+                    coverage_next = 1.0
+                scored.append(
+                    ArcMatch(
+                        prev_arc_id=left.arc_id,
+                        next_arc_id=right.arc_id,
+                        label=left.label,
+                        prev_sample_indices=np.asarray(partial["query_indices"], dtype=np.int32),
+                        next_sample_indices=np.asarray(partial["reference_indices"], dtype=np.int32),
+                        prev_fraction_start=0.0,
+                        prev_fraction_end=1.0,
+                        next_fraction_start=right_start,
+                        next_fraction_end=right_end,
+                        direction=direction,
+                        event_type=event_type,
+                        cost=cost,
+                        confidence=1.0 / (1.0 + max(0.0, cost)),
+                        coverage_prev=coverage_prev,
+                        coverage_next=coverage_next,
+                        mean_distance=components[0],
+                        max_distance=float(partial["max_distance"]),
+                        length_ratio=math.exp(components[3]) if np.isfinite(components[3]) else float("inf"),
+                        reason="subsequence_dtw_left_full",
+                    )
+                )
+        else:
+            partial = _subsequence_dtw(sample, left_sample, fractions, left_fractions, normalization)
+            if partial.get("valid"):
+                left_start = float(min(partial["reference_fraction_start"], partial["reference_fraction_end"]))
+                left_end = float(max(partial["reference_fraction_start"], partial["reference_fraction_end"]))
+                right_start = float(min(fractions[0], fractions[-1]))
+                right_end = float(max(fractions[0], fractions[-1]))
+                components = _curve_cost_components(
+                    left,
+                    right,
+                    left_start,
+                    left_end,
+                    right_start,
+                    right_end,
+                    float(partial["mean_distance"]),
+                    float(partial["max_distance"]),
+                    normalization,
+                    direction,
+                )
+                cost = _match_cost(*components)
+                coverage_prev = min(1.0, max(0.0, left_end - left_start))
+                coverage_next = min(1.0, max(0.0, right_end - right_start))
+                event_type = _classify_arc_match(cost, coverage_prev, coverage_next, left, right)
+                if event_type == "normal_match":
+                    left_start, left_end = 0.0, 1.0
+                    right_start, right_end = 0.0, 1.0
+                    coverage_prev = 1.0
+                    coverage_next = 1.0
+                scored.append(
+                    ArcMatch(
+                        prev_arc_id=left.arc_id,
+                        next_arc_id=right.arc_id,
+                        label=left.label,
+                        prev_sample_indices=np.asarray(partial["reference_indices"], dtype=np.int32),
+                        next_sample_indices=np.asarray(partial["query_indices"], dtype=np.int32),
+                        prev_fraction_start=left_start,
+                        prev_fraction_end=left_end,
+                        next_fraction_start=right_start,
+                        next_fraction_end=right_end,
+                        direction=direction,
+                        event_type=event_type,
+                        cost=cost,
+                        confidence=1.0 / (1.0 + max(0.0, cost)),
+                        coverage_prev=coverage_prev,
+                        coverage_next=coverage_next,
+                        mean_distance=components[0],
+                        max_distance=float(partial["max_distance"]),
+                        length_ratio=math.exp(components[3]) if np.isfinite(components[3]) else float("inf"),
+                        reason="subsequence_dtw_right_full",
+                    )
+                )
+
+    if not scored:
+        return ArcMatch(
+            prev_arc_id=left.arc_id,
+            next_arc_id=right.arc_id,
+            label=left.label,
+            prev_sample_indices=np.empty(0, dtype=np.int32),
+            next_sample_indices=np.empty(0, dtype=np.int32),
+            prev_fraction_start=0.0,
+            prev_fraction_end=0.0,
+            next_fraction_start=0.0,
+            next_fraction_end=0.0,
+            direction=1,
+            event_type="rejected",
+            cost=float("inf"),
+            confidence=0.0,
+            coverage_prev=0.0,
+            coverage_next=0.0,
+            mean_distance=float("inf"),
+            max_distance=float("inf"),
+            length_ratio=float("inf"),
+            reason="no_valid_match",
+        )
+
+    return min(scored, key=lambda item: item.cost)
+
+
+def solve_arc_assignment(
+    arcs_left: Sequence[ArcSegment],
+    arcs_right: Sequence[ArcSegment],
+    matches: Sequence[ArcMatch],
+    max_interval_overlap: float = 0.20,
+    ambiguous_relative_margin: float = 0.10,
+) -> Tuple[List[ArcMatch], List[TopologyEvent]]:
+    all_arcs = list(arcs_left) + list(arcs_right)
+    usage = ArcUsageMap(all_arcs)
+    events: List[TopologyEvent] = []
+    accepted: List[ArcMatch] = []
+    viable = [
+        match
+        for match in matches
+        if match.event_type != "rejected" and np.isfinite(match.cost) and match.confidence >= 0.10
+    ]
+    viable.sort(key=lambda item: item.cost)
+
+    for index, match in enumerate(viable):
+        left_overlap = usage.overlap_fraction(
+            match.prev_arc_id, match.prev_fraction_start, match.prev_fraction_end
+        )
+        right_overlap = usage.overlap_fraction(
+            match.next_arc_id, match.next_fraction_start, match.next_fraction_end
+        )
+        if left_overlap > max_interval_overlap or right_overlap > max_interval_overlap:
+            continue
+
+        ambiguous = False
+        for other in viable[index + 1 :]:
+            if other.prev_arc_id != match.prev_arc_id and other.next_arc_id != match.next_arc_id:
+                continue
+            relative_margin = (other.cost - match.cost) / max(match.cost, 1e-6)
+            if relative_margin < ambiguous_relative_margin:
+                ambiguous = True
+                break
+        if ambiguous:
+            continue
+
+        match.accepted = True
+        accepted.append(match)
+        usage.add_used_range(match.prev_arc_id, match.prev_fraction_start, match.prev_fraction_end)
+        usage.add_used_range(match.next_arc_id, match.next_fraction_start, match.next_fraction_end)
+
+    return accepted, events
+
+
+def _arc_range_event(
+    arc: ArcSegment,
+    slice_left: int,
+    slice_right: int,
+    event_type: str,
+    start: float,
+    end: float,
+    coverage_prev: float,
+    coverage_next: float,
+    reason: str,
+) -> TopologyEvent:
+    return TopologyEvent(
+        slice_left=int(slice_left),
+        slice_right=int(slice_right),
+        arc_id=arc.arc_id,
+        label=int(arc.label),
+        event_type=event_type,
+        severity="review",
+        start_fraction=float(start),
+        end_fraction=float(end),
+        start_index=_fraction_to_index(arc.points, start),
+        end_index=_fraction_to_index(arc.points, end),
+        coverage_prev=float(coverage_prev),
+        coverage_next=float(coverage_next),
+        cost=None,
+        reason=reason,
+    )
+
+
+def emit_unmatched_range_events(
+    usage: ArcUsageMap,
+    arcs_left: Sequence[ArcSegment],
+    arcs_right: Sequence[ArcSegment],
+    slice_left: int,
+    slice_right: int,
+) -> Tuple[List[TopologyEvent], List[Dict]]:
+    events: List[TopologyEvent] = []
+    open_edges: List[Dict] = []
+    for arc in arcs_left:
+        coverage = usage.coverage_fraction(arc.arc_id)
+        for start, end in usage.unmatched_ranges(arc.arc_id):
+            if end - start <= 1e-6:
+                continue
+            events.append(
+                _arc_range_event(
+                    arc,
+                    slice_left,
+                    slice_right,
+                    "death",
+                    start,
+                    end,
+                    coverage,
+                    0.0,
+                    "left arc range has no reliable next-slice match",
+                )
+            )
+            open_edges.append(_open_edge_row_from_arc(arc, slice_left, slice_right, start, end, "unmatched_arc_range", "death"))
+    for arc in arcs_right:
+        coverage = usage.coverage_fraction(arc.arc_id)
+        for start, end in usage.unmatched_ranges(arc.arc_id):
+            if end - start <= 1e-6:
+                continue
+            events.append(
+                _arc_range_event(
+                    arc,
+                    slice_left,
+                    slice_right,
+                    "birth",
+                    start,
+                    end,
+                    0.0,
+                    coverage,
+                    "right arc range has no reliable previous-slice match",
+                )
+            )
+            open_edges.append(_open_edge_row_from_arc(arc, slice_left, slice_right, start, end, "partial_match_remainder", "birth"))
+    return events, open_edges
+
+
+def _open_edge_row_from_arc(
+    arc: ArcSegment,
+    slice_left: int,
+    slice_right: int,
+    start: float,
+    end: float,
+    source: str,
+    reason: str,
+) -> Dict:
+    points = extract_polyline_range(arc.points, start, end, closed=arc.is_closed)
+    if len(points) == 0:
+        start_point = end_point = np.zeros(3, dtype=float)
+    else:
+        start_point = points[0]
+        end_point = points[-1]
+    return {
+        "mesh_label": _surface_label_name(arc.label),
+        "slice_left": int(slice_left),
+        "slice_right": int(slice_right),
+        "match_id": "",
+        "edge_start_x": float(start_point[0]),
+        "edge_start_y": float(start_point[1]),
+        "edge_start_z": float(start_point[2]),
+        "edge_end_x": float(end_point[0]),
+        "edge_end_y": float(end_point[1]),
+        "edge_end_z": float(end_point[2]),
+        "source": source,
+        "reason": reason,
+    }
+
+
+class _MeshBuilder:
+    def __init__(self, name: str):
+        self.name = name
+        self.vertices: List[np.ndarray] = []
+        self.faces: List[np.ndarray] = []
+        self.offset = 0
+
+    def add_patch(self, vertices: np.ndarray, faces: np.ndarray) -> None:
+        if len(vertices) == 0 or len(faces) == 0:
+            return
+        self.vertices.append(np.asarray(vertices, dtype=float))
+        self.faces.append(np.asarray(faces, dtype=np.int32) + self.offset)
+        self.offset += len(vertices)
+
+    def has_faces(self) -> bool:
+        return bool(self.faces)
+
+    def to_mesh(self) -> SurfaceMesh:
+        vertices = np.vstack(self.vertices)
+        faces = np.vstack(self.faces)
+        return _compact_surface_mesh(self.name, vertices, faces)
+
+
+def _build_arc_strip(left_points: np.ndarray, right_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    left_points = np.asarray(left_points, dtype=float).reshape(-1, 3)
+    right_points = np.asarray(right_points, dtype=float).reshape(-1, 3)
+    if len(left_points) < 2 or len(right_points) < 2:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=np.int32)
+    vertices = np.vstack([left_points, right_points])
+    left_indices = list(range(len(left_points)))
+    right_indices = list(range(len(left_points), len(left_points) + len(right_points)))
+    faces = _strip_faces_between_polylines(left_indices, left_points, right_indices, right_points)
+    return vertices, np.asarray(faces, dtype=np.int32)
+
+
+def _triangle_area(points: np.ndarray) -> float:
+    return float(0.5 * np.linalg.norm(np.cross(points[1] - points[0], points[2] - points[0])))
+
+
+def _triangle_aspect(points: np.ndarray) -> float:
+    edges = [
+        float(np.linalg.norm(points[0] - points[1])),
+        float(np.linalg.norm(points[1] - points[2])),
+        float(np.linalg.norm(points[2] - points[0])),
+    ]
+    longest = max(edges)
+    area = _triangle_area(points)
+    if area <= 1e-12:
+        return float("inf")
+    shortest_altitude = 2.0 * area / max(longest, 1e-12)
+    return float(longest / max(shortest_altitude, 1e-12))
+
+
+def filter_mesh_faces_by_quality(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    spacing: np.ndarray,
+    mesh_label: str,
+    slice_left: int,
+    slice_right: int,
+    match_id: str,
+) -> Tuple[np.ndarray, List[Dict], List[Dict]]:
+    if len(faces) == 0:
+        return faces, [], []
+    spacing = np.asarray(spacing, dtype=float).reshape(-1)
+    spacing_scale = float(np.nanmax(spacing[:3])) if len(spacing) >= 3 else 1.0
+    max_edge_limit = max(50.0, 5.0 * max(1.0, spacing_scale))
+    kept: List[np.ndarray] = []
+    quality_rows: List[Dict] = []
+    open_edges: List[Dict] = []
+
+    for face_index, face in enumerate(np.asarray(faces, dtype=np.int32)):
+        points = vertices[face]
+        edge_lengths = [
+            float(np.linalg.norm(points[0] - points[1])),
+            float(np.linalg.norm(points[1] - points[2])),
+            float(np.linalg.norm(points[2] - points[0])),
+        ]
+        max_edge = max(edge_lengths)
+        area = _triangle_area(points)
+        aspect = _triangle_aspect(points)
+        status = "kept"
+        reason = ""
+        if area <= 1e-9:
+            status = "rejected"
+            reason = "zero_area"
+        elif aspect > 50.0:
+            status = "rejected"
+            reason = "aspect_ratio"
+        elif max_edge > max_edge_limit:
+            status = "warn"
+            reason = "long_edge"
+
+        quality_rows.append(
+            {
+                "mesh_label": mesh_label,
+                "slice_left": int(slice_left),
+                "slice_right": int(slice_right),
+                "match_id": match_id,
+                "face_local_id": int(face_index),
+                "max_edge": max_edge,
+                "aspect_ratio": aspect,
+                "area": area,
+                "status": status,
+                "reason": reason,
+            }
+        )
+        if status == "rejected":
+            open_edges.append(
+                {
+                    "mesh_label": mesh_label,
+                    "slice_left": int(slice_left),
+                    "slice_right": int(slice_right),
+                    "match_id": match_id,
+                    "edge_start_x": float(points[0, 0]),
+                    "edge_start_y": float(points[0, 1]),
+                    "edge_start_z": float(points[0, 2]),
+                    "edge_end_x": float(points[1, 0]),
+                    "edge_end_y": float(points[1, 1]),
+                    "edge_end_z": float(points[1, 2]),
+                    "source": "rejected_bad_face",
+                    "reason": reason,
+                }
+            )
+            continue
+        kept.append(face)
+    return np.asarray(kept, dtype=np.int32), quality_rows, open_edges
+
+
+def _match_to_row(match: ArcMatch, slice_left: int, slice_right: int) -> Dict:
+    return {
+        "slice_left": int(slice_left),
+        "slice_right": int(slice_right),
+        "prev_arc_id": match.prev_arc_id,
+        "next_arc_id": match.next_arc_id,
+        "label": _surface_label_name(match.label),
+        "event_type": match.event_type,
+        "confidence": float(match.confidence),
+        "cost": float(match.cost),
+        "coverage_prev": float(match.coverage_prev),
+        "coverage_next": float(match.coverage_next),
+        "prev_fraction_start": float(match.prev_fraction_start),
+        "prev_fraction_end": float(match.prev_fraction_end),
+        "next_fraction_start": float(match.next_fraction_start),
+        "next_fraction_end": float(match.next_fraction_end),
+        "mean_distance": float(match.mean_distance),
+        "max_distance": float(match.max_distance),
+        "length_ratio": float(match.length_ratio),
+        "direction": int(match.direction),
+        "accepted": bool(match.accepted),
+        "reason": match.reason,
+    }
+
+
+def _event_to_row(event: TopologyEvent) -> Dict:
+    return {
+        "slice_left": int(event.slice_left),
+        "slice_right": int(event.slice_right),
+        "arc_id": event.arc_id,
+        "label": _surface_label_name(event.label),
+        "event_type": event.event_type,
+        "severity": event.severity,
+        "start_fraction": float(event.start_fraction),
+        "end_fraction": float(event.end_fraction),
+        "start_index": int(event.start_index),
+        "end_index": int(event.end_index),
+        "coverage_prev": float(event.coverage_prev),
+        "coverage_next": float(event.coverage_next),
+        "cost": "" if event.cost is None else float(event.cost),
+        "reason": event.reason,
+    }
+
+
+def _write_arc_graph_qc_tables(qc: Dict[str, List[Dict]], output_dir: str | Path) -> None:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _write_csv_rows(
+        output_dir / "arc_matches.csv",
+        qc.get("arc_matches", []),
+        fieldnames=[
+            "slice_left",
+            "slice_right",
+            "prev_arc_id",
+            "next_arc_id",
+            "label",
+            "event_type",
+            "confidence",
+            "cost",
+            "coverage_prev",
+            "coverage_next",
+            "prev_fraction_start",
+            "prev_fraction_end",
+            "next_fraction_start",
+            "next_fraction_end",
+            "mean_distance",
+            "max_distance",
+            "length_ratio",
+            "direction",
+            "accepted",
+            "reason",
+        ],
+    )
+    _write_csv_rows(
+        output_dir / "topology_events.csv",
+        qc.get("topology_events", []),
+        fieldnames=[
+            "slice_left",
+            "slice_right",
+            "arc_id",
+            "label",
+            "event_type",
+            "severity",
+            "start_fraction",
+            "end_fraction",
+            "start_index",
+            "end_index",
+            "coverage_prev",
+            "coverage_next",
+            "cost",
+            "reason",
+        ],
+    )
+    _write_csv_rows(
+        output_dir / "face_quality.csv",
+        qc.get("face_quality", []),
+        fieldnames=[
+            "mesh_label",
+            "slice_left",
+            "slice_right",
+            "match_id",
+            "face_local_id",
+            "max_edge",
+            "aspect_ratio",
+            "area",
+            "status",
+            "reason",
+        ],
+    )
+    _write_csv_rows(
+        output_dir / "open_edges.csv",
+        qc.get("open_edges", []),
+        fieldnames=[
+            "mesh_label",
+            "slice_left",
+            "slice_right",
+            "match_id",
+            "edge_start_x",
+            "edge_start_y",
+            "edge_start_z",
+            "edge_end_x",
+            "edge_end_y",
+            "edge_end_z",
+            "source",
+            "reason",
+        ],
+    )
+
+
+def arc_graph_surface_patches(
+    boundaries: Sequence[BoundarySlice],
+    contours: Sequence[Contour2D],
+    resample_points: int = 80,
+    spacing: Optional[np.ndarray] = None,
+) -> Tuple[Dict[str, SurfaceMesh], Dict[str, List[Dict]]]:
+    del contours, resample_points  # Current v0.1 builds from propagated boundary arcs.
+    spacing = np.asarray(spacing if spacing is not None else np.ones(3), dtype=float)
+    arcs_by_slice = build_labeled_arcs(boundaries, spacing)
+    all_arcs = [arc for arcs in arcs_by_slice.values() for arc in arcs]
+    arc_by_id = {arc.arc_id: arc for arc in all_arcs}
+    mesh_builders = {
+        BOUNDARY_OUTER: _MeshBuilder("outer"),
+        BOUNDARY_INNER: _MeshBuilder("inner"),
+        BOUNDARY_LATERAL: _MeshBuilder("lateral"),
+    }
+    all_match_rows: List[Dict] = []
+    topology_events: List[TopologyEvent] = []
+    face_quality_rows: List[Dict] = []
+    open_edge_rows: List[Dict] = []
+
+    slice_ids = sorted(arcs_by_slice)
+    for slice_left, slice_right in zip(slice_ids[:-1], slice_ids[1:]):
+        left_arcs = arcs_by_slice.get(slice_left, [])
+        right_arcs = arcs_by_slice.get(slice_right, [])
+        if slice_right - slice_left != 1:
+            for arc in left_arcs + right_arcs:
+                open_edge_rows.append(
+                    _open_edge_row_from_arc(
+                        arc,
+                        slice_left,
+                        slice_right,
+                        0.0,
+                        1.0,
+                        "gap_between_slices",
+                        "non-adjacent boundary slices",
+                    )
+                )
+            continue
+
+        candidates = generate_arc_match_candidates(left_arcs, right_arcs, spacing)
+        scored = [score_arc_match(left, right, spacing) for left, right in candidates]
+        accepted, events = solve_arc_assignment(left_arcs, right_arcs, scored)
+        topology_events.extend(events)
+        usage = ArcUsageMap(left_arcs + right_arcs)
+        for match in accepted:
+            usage.add_used_range(match.prev_arc_id, match.prev_fraction_start, match.prev_fraction_end)
+            usage.add_used_range(match.next_arc_id, match.next_fraction_start, match.next_fraction_end)
+        range_events, range_edges = emit_unmatched_range_events(
+            usage,
+            left_arcs,
+            right_arcs,
+            slice_left,
+            slice_right,
+        )
+        topology_events.extend(range_events)
+        open_edge_rows.extend(range_edges)
+        all_match_rows.extend(_match_to_row(match, slice_left, slice_right) for match in scored)
+
+        for match in accepted:
+            mesh_name = _label_mesh_name(match.label)
+            if mesh_name is None:
+                continue
+            left_arc = arc_by_id[match.prev_arc_id]
+            right_arc = arc_by_id[match.next_arc_id]
+            left_points = extract_polyline_range(
+                left_arc.points,
+                match.prev_fraction_start,
+                match.prev_fraction_end,
+                closed=left_arc.is_closed,
+            )
+            right_points = extract_polyline_range(
+                right_arc.points,
+                match.next_fraction_start,
+                match.next_fraction_end,
+                closed=right_arc.is_closed,
+            )
+            if match.direction < 0:
+                right_points = right_points[::-1]
+            vertices, faces = _build_arc_strip(left_points, right_points)
+            match_id = f"{match.prev_arc_id}->{match.next_arc_id}"
+            faces, quality_rows, rejected_open_edges = filter_mesh_faces_by_quality(
+                vertices,
+                faces,
+                spacing,
+                mesh_name,
+                slice_left,
+                slice_right,
+                match_id,
+            )
+            face_quality_rows.extend(quality_rows)
+            open_edge_rows.extend(rejected_open_edges)
+            mesh_builders[match.label].add_patch(vertices, faces)
+
+    meshes: Dict[str, SurfaceMesh] = {}
+    for label, builder in mesh_builders.items():
+        if builder.has_faces():
+            mesh = builder.to_mesh()
+            if len(mesh.faces) > 0:
+                meshes[builder.name] = mesh
+
+    if "outer" not in meshes or "inner" not in meshes:
+        missing = ", ".join(name for name in ("outer", "inner") if name not in meshes)
+        raise ValueError(f"Arc-graph surface build produced no {missing} mesh")
+
+    qc = {
+        "arc_matches": all_match_rows,
+        "topology_events": [_event_to_row(event) for event in topology_events],
+        "face_quality": face_quality_rows,
+        "open_edges": open_edge_rows,
+    }
+    return meshes, qc
+
+
 def contour_shell_surface_patches(
     boundaries: Sequence[BoundarySlice],
     contours: Sequence[Contour2D],
     resample_points: int = 80,
+    max_bridge_distance: float = 30.0,
 ) -> Dict[str, SurfaceMesh]:
     """Build outer/inner/lateral patches on the real mask contour shell.
 
@@ -2546,6 +6618,10 @@ def contour_shell_surface_patches(
     ring_points = min(240, max(96, int(resample_points) * 2))
     contour_by_key = {(contour.slice_index, contour.contour_id): contour for contour in contours}
     contours_by_index = contours_by_slice(contours)
+    endpoint_slices = {
+        min(contour.slice_index for contour in contours),
+        max(contour.slice_index for contour in contours),
+    }
 
     entries: List[Tuple[BoundarySlice, np.ndarray, np.ndarray]] = []
     previous_ring: Optional[np.ndarray] = None
@@ -2564,23 +6640,23 @@ def contour_shell_surface_patches(
         previous_ring = ring
 
     if len(entries) < 2:
-        raise ValueError("Need at least two mask contour rings to build mask-constrained surfaces")
+        raise ValueError("Need at least two mask contour rings to build contour-shell surfaces")
 
     base_vertices = np.vstack([entry[1] for entry in entries]).astype(float)
     vertex_labels = np.concatenate([entry[2] for entry in entries]).astype(np.uint8)
     extra_vertices: List[np.ndarray] = []
     extra_labels: List[int] = []
 
-    def add_vertex(point: np.ndarray, label: int) -> int:
-        extra_vertices.append(np.asarray(point, dtype=float))
-        extra_labels.append(int(label))
-        return len(base_vertices) + len(extra_vertices) - 1
-
     faces_by_label: Dict[int, List[List[int]]] = {
         BOUNDARY_OUTER: [],
         BOUNDARY_INNER: [],
         BOUNDARY_LATERAL: [],
     }
+
+    def add_vertex(point: np.ndarray, label: int) -> int:
+        extra_vertices.append(np.asarray(point, dtype=float))
+        extra_labels.append(int(label))
+        return len(base_vertices) + len(extra_vertices) - 1
 
     def vertex_label(index: int) -> int:
         if index < len(vertex_labels):
@@ -2593,32 +6669,113 @@ def contour_shell_surface_patches(
         if label in faces_by_label:
             faces_by_label[int(label)].append([int(index) for index in face])
 
-    for entry_index, (left, right) in enumerate(zip(entries[:-1], entries[1:])):
-        left_boundary, _left_ring, _left_labels = left
-        right_boundary, _right_ring, _right_labels = right
-        if right_boundary.slice_index - left_boundary.slice_index > 1:
-            continue
-        base = entry_index * ring_points
-        next_base = (entry_index + 1) * ring_points
+    def add_stable_triangle(face: Sequence[int], prefer_real_surface: bool = False) -> None:
+        labels = [vertex_label(index) for index in face]
+        label = (
+            _real_surface_preferred_label(labels)
+            if prefer_real_surface
+            else _majority_surface_label(labels)
+        )
+        if label not in faces_by_label:
+            return
+        add_face(face, label)
+
+    def add_bridge_faces(
+        left_indices: Sequence[int],
+        right_indices: Sequence[int],
+        prefer_real_surface: bool,
+    ) -> None:
+        for point_index in range(ring_points):
+            next_point = (point_index + 1) % ring_points
+            a = int(left_indices[point_index])
+            b = int(left_indices[next_point])
+            c = int(right_indices[point_index])
+            d = int(right_indices[next_point])
+            add_stable_triangle([a, c, b], prefer_real_surface=prefer_real_surface)
+            add_stable_triangle([b, c, d], prefer_real_surface=prefer_real_surface)
+
+    def add_intermediate_ring(
+        left_ring: np.ndarray,
+        right_ring: np.ndarray,
+        left_labels: np.ndarray,
+        right_labels: np.ndarray,
+        t: float,
+    ) -> List[int]:
+        ring = (1.0 - t) * left_ring + t * right_ring
+        labels = np.where(t < 0.5, left_labels, right_labels)
+        return [add_vertex(point, int(label)) for point, label in zip(ring, labels)]
+
+    def endpoint_cap_label(boundary: BoundarySlice) -> Optional[int]:
+        if boundary.slice_index not in endpoint_slices:
+            return None
+        mode = normalize_surface_mode(boundary.surface_mode)
+        if mode == SURFACE_MODE_OUTER_ONLY:
+            return BOUNDARY_OUTER
+        if mode == SURFACE_MODE_INNER_ONLY:
+            return BOUNDARY_INNER
+        return None
+
+    def add_endpoint_cap(
+        entry: Tuple[BoundarySlice, np.ndarray, np.ndarray],
+        base: int,
+        reverse: bool,
+    ) -> None:
+        boundary, ring, _labels = entry
+        label = endpoint_cap_label(boundary)
+        if label is None:
+            return
+        center_index = add_vertex(np.asarray(ring, dtype=float).mean(axis=0), label)
         for point_index in range(ring_points):
             next_point = (point_index + 1) % ring_points
             a = base + point_index
             b = base + next_point
-            c = next_base + point_index
-            d = next_base + next_point
-            add_face([a, c, b])
-            add_face([b, c, d])
+            if reverse:
+                add_face([center_index, b, a], label)
+            else:
+                add_face([center_index, a, b], label)
 
-    _add_mask_shell_cap(entries[0], 0, ring_points, add_vertex, add_face, reverse=True)
+    for entry_index, (left, right) in enumerate(zip(entries[:-1], entries[1:])):
+        left_boundary, left_ring, left_labels = left
+        right_boundary, right_ring, right_labels = right
+        if right_boundary.slice_index - left_boundary.slice_index > 1:
+            continue
+        base = entry_index * ring_points
+        next_base = (entry_index + 1) * ring_points
+        left_indices = list(range(base, base + ring_points))
+        right_indices = list(range(next_base, next_base + ring_points))
+        max_distance = float(np.linalg.norm(left_ring - right_ring, axis=1).max())
+        mean_distance = float(np.linalg.norm(left_ring - right_ring, axis=1).mean())
+        centroid_distance = float(np.linalg.norm(left_ring.mean(axis=0) - right_ring.mean(axis=0)))
+        prefer_real_surface = (
+            mean_distance > 30.0
+            and centroid_distance > 25.0
+            and np.any(left_labels != right_labels)
+        )
+        bridge_steps = max(1, int(math.ceil(max_distance / max(1.0, max_bridge_distance))))
+        bridge_rings: List[List[int]] = [left_indices]
+        for step in range(1, bridge_steps):
+            bridge_rings.append(
+                add_intermediate_ring(
+                    left_ring,
+                    right_ring,
+                    left_labels,
+                    right_labels,
+                    step / float(bridge_steps),
+                )
+            )
+        bridge_rings.append(right_indices)
+        for current, following in zip(bridge_rings[:-1], bridge_rings[1:]):
+            add_bridge_faces(current, following, prefer_real_surface=prefer_real_surface)
+
+    add_endpoint_cap(entries[0], 0, reverse=True)
     last_base = (len(entries) - 1) * ring_points
-    _add_mask_shell_cap(entries[-1], last_base, ring_points, add_vertex, add_face, reverse=False)
+    add_endpoint_cap(entries[-1], last_base, reverse=False)
 
     vertices = (
         np.vstack([base_vertices, np.vstack(extra_vertices)]).astype(float)
         if extra_vertices
         else base_vertices
     )
-
     meshes: Dict[str, SurfaceMesh] = {}
     for label, name in (
         (BOUNDARY_OUTER, "outer"),
@@ -2631,7 +6788,7 @@ def contour_shell_surface_patches(
 
     if "outer" not in meshes or "inner" not in meshes:
         missing = ", ".join(name for name in ("outer", "inner") if name not in meshes)
-        raise ValueError(f"Mask-constrained surface build produced no {missing} mesh")
+        raise ValueError(f"Contour-shell surface build produced no {missing} mesh")
     return meshes
 
 
@@ -2725,26 +6882,24 @@ def _majority_surface_label(labels: Sequence[int]) -> int:
     return max(counts, key=lambda label: (counts[label], label == BOUNDARY_LATERAL))
 
 
-def _add_mask_shell_cap(
-    entry: Tuple[BoundarySlice, np.ndarray, np.ndarray],
-    base: int,
-    ring_points: int,
-    add_vertex: Callable[[np.ndarray, int], int],
-    add_face: Callable[[Sequence[int], Optional[int]], None],
-    reverse: bool,
-) -> None:
-    _boundary, ring, labels = entry
-    center_label = _majority_surface_label(labels)
-    center_index = add_vertex(np.asarray(ring, dtype=float).mean(axis=0), center_label)
-    for point_index in range(ring_points):
-        next_point = (point_index + 1) % ring_points
-        a = base + point_index
-        b = base + next_point
-        label = int(labels[point_index]) if labels[point_index] == labels[next_point] else None
-        if reverse:
-            add_face([center_index, b, a], label)
-        else:
-            add_face([center_index, a, b], label)
+def _real_surface_preferred_label(labels: Sequence[int]) -> int:
+    counts = {
+        BOUNDARY_OUTER: 0,
+        BOUNDARY_INNER: 0,
+        BOUNDARY_LATERAL: 0,
+    }
+    for label in labels:
+        if int(label) in counts:
+            counts[int(label)] += 1
+
+    real_counts = {
+        label: count
+        for label, count in counts.items()
+        if label != BOUNDARY_LATERAL and count > 0
+    }
+    if real_counts:
+        return max(real_counts, key=lambda label: (real_counts[label], label == BOUNDARY_OUTER))
+    return BOUNDARY_LATERAL
 
 
 def _compact_surface_mesh(name: str, vertices: np.ndarray, faces: np.ndarray) -> SurfaceMesh:
@@ -2798,6 +6953,244 @@ def make_boundary_label_volume(
     labels[region & outer] = BOUNDARY_OUTER
     labels[region & inner] = BOUNDARY_INNER
     return labels
+
+
+def _read_obj_vertices(path: str | Path) -> Tuple[np.ndarray, int]:
+    path = _resolve_existing_input_path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"OBJ surface file does not exist: {path}")
+
+    vertices: List[Tuple[float, float, float]] = []
+    face_count = 0
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("v "):
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            elif line.startswith("f "):
+                face_count += 1
+
+    if not vertices:
+        raise ValueError(f"OBJ surface has no vertices: {path}")
+    return np.asarray(vertices, dtype=np.float32), face_count
+
+
+def _mask_shell_voxels(mask: np.ndarray) -> np.ndarray:
+    region = _as_bool_mask(mask)
+    if not np.any(region):
+        raise ValueError("Mask is empty; cannot build depth labels from surface meshes")
+    structure = ndimage.generate_binary_structure(3, 1)
+    eroded = ndimage.binary_erosion(region, structure=structure, border_value=0)
+    shell = region & ~eroded
+    coords = np.argwhere(shell)
+    if len(coords) == 0:
+        coords = np.argwhere(region)
+    return coords.astype(np.float32, copy=False)
+
+
+def _mask_bounding_slices(mask: np.ndarray, padding: int = 0) -> Tuple[slice, slice, slice]:
+    region = _as_bool_mask(mask)
+    if not np.any(region):
+        raise ValueError("Mask is empty; cannot crop depth volume")
+
+    slices: List[slice] = []
+    for axis in range(3):
+        other_axes = tuple(idx for idx in range(3) if idx != axis)
+        occupied = np.any(region, axis=other_axes)
+        indices = np.flatnonzero(occupied)
+        start = max(0, int(indices[0]) - int(padding))
+        stop = min(region.shape[axis], int(indices[-1]) + int(padding) + 1)
+        slices.append(slice(start, stop))
+    return slices[0], slices[1], slices[2]
+
+
+def _slice_origin(slices: Sequence[slice]) -> np.ndarray:
+    return np.asarray([int(item.start or 0) for item in slices], dtype=float)
+
+
+def _surface_vertices_to_shell_mask(
+    mask: np.ndarray,
+    vertices: np.ndarray,
+    *,
+    max_snap_distance: float = 3.0,
+    chunk_size: int = 200_000,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    shell_coords = _mask_shell_voxels(mask)
+    tree = cKDTree(shell_coords)
+    vertices = np.asarray(vertices, dtype=np.float32).reshape(-1, 3)
+
+    chosen_indices: List[np.ndarray] = []
+    accepted_distances: List[np.ndarray] = []
+    nearest_distances: List[np.ndarray] = []
+    for start in range(0, len(vertices), int(chunk_size)):
+        chunk = vertices[start : start + int(chunk_size)]
+        try:
+            distances, indices = tree.query(chunk, k=1, workers=-1)
+        except TypeError:
+            distances, indices = tree.query(chunk, k=1)
+        distances = np.asarray(distances, dtype=np.float32)
+        indices = np.asarray(indices, dtype=np.int64)
+        nearest_distances.append(distances)
+        keep = distances <= float(max_snap_distance)
+        if np.any(keep):
+            chosen_indices.append(indices[keep])
+            accepted_distances.append(distances[keep])
+
+    if not chosen_indices:
+        all_distances = np.concatenate(nearest_distances) if nearest_distances else np.empty(0, dtype=np.float32)
+        nearest = float(np.nanmin(all_distances)) if len(all_distances) else math.nan
+        raise ValueError(
+            "Surface mesh could not be snapped to the mask shell. "
+            f"Nearest vertex distance was {nearest:.3f} voxel(s). "
+            "Use the same mask that produced the 3D surface build."
+        )
+
+    selected = np.unique(np.concatenate(chosen_indices))
+    selected_coords = shell_coords[selected].astype(np.int64, copy=False)
+    surface_mask = np.zeros(mask.shape, dtype=bool)
+    surface_mask[selected_coords[:, 0], selected_coords[:, 1], selected_coords[:, 2]] = True
+    accepted = np.concatenate(accepted_distances)
+    stats = {
+        "input_vertices": float(len(vertices)),
+        "labeled_voxels": float(np.count_nonzero(surface_mask)),
+        "mean_snap_distance": float(np.mean(accepted)) if len(accepted) else math.nan,
+        "max_snap_distance": float(np.max(accepted)) if len(accepted) else math.nan,
+    }
+    return surface_mask, stats
+
+
+def make_boundary_label_volume_from_surface_meshes(
+    mask: np.ndarray,
+    outer_surface_path: str | Path,
+    inner_surface_path: str | Path,
+    dilation_iterations: int = 1,
+    max_snap_distance: float = 3.0,
+    coordinate_origin: Optional[Sequence[float]] = None,
+) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    """Paint outer/inner OBJ surfaces back onto the mask shell as depth labels."""
+
+    labels = np.zeros(mask.shape, dtype=np.uint8)
+    region = _as_bool_mask(mask)
+    labels[region] = BOUNDARY_REGION
+    origin = (
+        np.asarray(coordinate_origin, dtype=np.float32).reshape(1, 3)
+        if coordinate_origin is not None
+        else None
+    )
+
+    summaries: List[Dict[str, object]] = []
+    surface_masks: Dict[int, np.ndarray] = {}
+    for label, role, path in (
+        (BOUNDARY_OUTER, "outer", outer_surface_path),
+        (BOUNDARY_INNER, "inner", inner_surface_path),
+    ):
+        vertices, face_count = _read_obj_vertices(path)
+        if origin is not None:
+            vertices = vertices - origin
+        surface_mask, stats = _surface_vertices_to_shell_mask(
+            region,
+            vertices,
+            max_snap_distance=max_snap_distance,
+        )
+        surface_masks[label] = surface_mask
+        summaries.append(
+            {
+                "surface": role,
+                "path": str(_resolve_existing_input_path(path)),
+                "vertices": int(stats["input_vertices"]),
+                "faces": int(face_count),
+                "labeled_voxels": int(stats["labeled_voxels"]),
+                "mean_snap_distance": float(stats["mean_snap_distance"]),
+                "max_snap_distance": float(stats["max_snap_distance"]),
+            }
+        )
+
+    if dilation_iterations > 0:
+        structure = ndimage.generate_binary_structure(3, 1)
+        for label in (BOUNDARY_OUTER, BOUNDARY_INNER):
+            surface_masks[label] = ndimage.binary_dilation(
+                surface_masks[label],
+                structure=structure,
+                iterations=int(dilation_iterations),
+            )
+
+    labels[region & surface_masks[BOUNDARY_OUTER]] = BOUNDARY_OUTER
+    labels[region & surface_masks[BOUNDARY_INNER]] = BOUNDARY_INNER
+    outer_count = int(np.count_nonzero(labels == BOUNDARY_OUTER))
+    inner_count = int(np.count_nonzero(labels == BOUNDARY_INNER))
+    if outer_count == 0 or inner_count == 0:
+        raise ValueError(
+            "Surface meshes did not create usable boundary labels. "
+            f"outer voxels={outer_count}, inner voxels={inner_count}."
+        )
+    return labels, summaries
+
+
+def _surface_output_for_role(config: Dict[str, object], role: str) -> Optional[Path]:
+    outputs = config.get("surface_outputs")
+    if not isinstance(outputs, dict):
+        return None
+
+    role_text = str(role).strip().lower()
+    names = config.get("surface_names")
+    candidates: List[str] = []
+    if isinstance(names, list):
+        for index, raw_name in enumerate(names, start=1):
+            name = str(raw_name)
+            normalized = safe_surface_name(name, fallback=f"surface_{index}").lower()
+            words = re.split(r"[^a-z0-9]+", normalized)
+            if role_text in words or normalized == role_text:
+                candidates.extend(
+                    [
+                        f"{normalized}_surface_obj",
+                        f"{normalized}_surface",
+                    ]
+                )
+
+    candidates.extend(
+        [
+            f"{role_text}_surface_obj",
+            f"{role_text}_surface",
+            f"{role_text}_surface_surface_obj",
+            f"{role_text}_surface_surface",
+        ]
+    )
+    for key in candidates:
+        value = outputs.get(key)
+        if value:
+            path = _resolve_existing_input_path(value)
+            if path.exists():
+                return path
+
+    for key, value in outputs.items():
+        key_text = str(key).lower()
+        if role_text in re.split(r"[^a-z0-9]+", key_text) and key_text.endswith("_obj"):
+            path = _resolve_existing_input_path(value)
+            if path.exists():
+                return path
+    return None
+
+
+def resolve_3d_surface_depth_inputs(project_config: str | Path) -> Tuple[Path, Path]:
+    """Return outer and inner OBJ paths from a 3D surface build config."""
+
+    config_path = _resolve_existing_input_path(project_config)
+    if not config_path.exists():
+        raise FileNotFoundError(f"3D project config does not exist: {config_path}")
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+
+    outer_path = _surface_output_for_role(config, "outer")
+    inner_path = _surface_output_for_role(config, "inner")
+    if outer_path is None or inner_path is None:
+        names = config.get("surface_names") or []
+        raise ValueError(
+            "Could not find both outer and inner surface OBJ files in project_config.json. "
+            f"Found surface names: {names}. Name the two depth surfaces with outer and inner."
+        )
+    return outer_path, inner_path
 
 
 def _distance_depth(mask: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -3003,6 +7396,7 @@ def write_cell_depth_table(
     depth: np.ndarray,
     normals: np.ndarray,
     labels: np.ndarray,
+    coordinate_origin: Optional[Sequence[float]] = None,
 ) -> List[Dict]:
     with Path(cell_csv).open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -3018,6 +7412,8 @@ def write_cell_depth_table(
         [[float(row[x_col]), float(row[y_col]), float(row[z_col])] for row in rows],
         dtype=float,
     )
+    if coordinate_origin is not None:
+        points = points - np.asarray(coordinate_origin, dtype=float).reshape(1, 3)
     distance_outer = _distance_to_label(labels, BOUNDARY_OUTER)
     distance_inner = _distance_to_label(labels, BOUNDARY_INNER)
 
@@ -3070,8 +7466,14 @@ def summarize_dendrite_depth(
     normals: np.ndarray,
     output_csv: str | Path,
     dendrite_types: Sequence[int] = (3, 4),
+    coordinate_origin: Optional[Sequence[float]] = None,
 ) -> List[Dict]:
     rows: List[Dict] = []
+    origin = (
+        np.asarray(coordinate_origin, dtype=float).reshape(3)
+        if coordinate_origin is not None
+        else np.zeros(3, dtype=float)
+    )
     for swc_path in swc_paths:
         swc = _read_swc_array(swc_path)
         if len(swc) == 0:
@@ -3103,7 +7505,7 @@ def summarize_dendrite_depth(
             length = float(np.linalg.norm(segment))
             if length <= 0:
                 continue
-            midpoint = (p0 + p1) * 0.5
+            midpoint = (p0 + p1) * 0.5 - origin
             sampled_depth = float(_sample_nearest(depth, midpoint[None, :])[0])
             if not np.isfinite(sampled_depth):
                 continue
@@ -3483,10 +7885,21 @@ def _write_surfaces(
     resample_points: int,
     surface_method: str,
     slice_axis: int | str,
+    spacing: Optional[np.ndarray] = None,
+    shell_backend: str = "voxel",
+    cut_curve_json: Optional[str | Path] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, SurfaceMesh]:
     surface_dir = output_dir / "surfaces"
     surface_dir.mkdir(parents=True, exist_ok=True)
     surface_method = normalize_surface_build_method(surface_method)
+    shell_backend = normalize_shell_backend(shell_backend)
+    _emit_progress(
+        progress_callback,
+        0,
+        "Building surface mesh",
+        f"Method: {surface_method.replace('_', ' ')}",
+    )
 
     if surface_method == SURFACE_BUILD_FAST_LOFT:
         meshes = _loft_surface_patches(boundaries, resample_points=resample_points)
@@ -3495,6 +7908,34 @@ def _write_surfaces(
             boundaries,
             contours,
             resample_points=resample_points,
+        )
+    elif surface_method == SURFACE_BUILD_ARC_GRAPH:
+        meshes, qc = arc_graph_surface_patches(
+            boundaries,
+            contours,
+            resample_points=resample_points,
+            spacing=spacing,
+        )
+        _write_arc_graph_qc_tables(qc, output_dir / "qc")
+    elif surface_method == SURFACE_BUILD_SHELL_CUT:
+        cut_curves: Optional[List[SurfaceCutCurve]] = None
+        patch_seeds: Optional[List[SurfacePatchSeed]] = None
+        input_warnings: List[Dict] = []
+        if cut_curve_json is not None:
+            cut_curves, patch_seeds, input_warnings = read_shell_cut_json_with_qc(
+                cut_curve_json,
+                contours=contours,
+            )
+        meshes, _qc = shell_cut_surface_patches(
+            mask,
+            boundaries,
+            cut_curves=cut_curves,
+            patch_seeds=patch_seeds if patch_seeds else None,
+            spacing=spacing,
+            shell_backend=shell_backend,
+            output_qc_dir=output_dir / "qc",
+            input_warnings=input_warnings,
+            progress_callback=_progress_range(progress_callback, 5, 75),
         )
     else:
         meshes = _mask_constrained_surface_patches_with_fallback(
@@ -3505,6 +7946,7 @@ def _write_surfaces(
             slice_axis=slice_axis,
         )
 
+    _emit_progress(progress_callback, 78, "Writing surface files", f"{len(meshes)} surface file set(s)")
     for name, mesh in meshes.items():
         if name == "lateral":
             write_ply(surface_dir / "target_lateral_boundary.ply", mesh)
@@ -3512,7 +7954,28 @@ def _write_surfaces(
         else:
             write_ply(surface_dir / f"target_{name}_surface.ply", mesh)
             write_obj(surface_dir / f"target_{name}_surface.obj", mesh)
+    _emit_progress(progress_callback, 100, "Surface files written", str(surface_dir))
     return meshes
+
+
+def _write_named_surface_outputs(
+    meshes: Dict[str, SurfaceMesh],
+    output_dir: Path,
+) -> Dict[str, Path]:
+    surface_dir = output_dir / "surfaces"
+    surface_dir.mkdir(parents=True, exist_ok=True)
+    outputs: Dict[str, Path] = {}
+    used_names: set[str] = set()
+    for index, (name, mesh) in enumerate(meshes.items(), start=1):
+        safe_name = _unique_surface_name(name, used_names, fallback=f"surface_{index}")
+        mesh.name = safe_name
+        ply_path = surface_dir / f"target_{safe_name}_surface.ply"
+        obj_path = surface_dir / f"target_{safe_name}_surface.obj"
+        write_ply(ply_path, mesh)
+        write_obj(obj_path, mesh)
+        outputs[f"{safe_name}_surface"] = ply_path
+        outputs[f"{safe_name}_surface_obj"] = obj_path
+    return outputs
 
 
 def _mask_constrained_surface_patches_with_fallback(
@@ -3585,6 +8048,68 @@ def _loft_surface_patches(
     return meshes
 
 
+def run_3d_shell_patch_pipeline(
+    mask_path: str | Path,
+    cut_curve_json: str | Path,
+    output_dir: str | Path,
+    shell_backend: str = SHELL_BACKEND_MARCHING_CUBES,
+    max_surface_quads: int = 1_500_000,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Path]:
+    """Build user-named shell patches from direct 3D closed-curve annotations."""
+
+    output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir = output_dir / "qc"
+    qc_dir.mkdir(parents=True, exist_ok=True)
+
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
+    mask_volume = load_volume(mask_path)
+    mask = _as_bool_mask(mask_volume.data)
+    spacing = _voxel_spacing_from_volume(mask_volume)
+    _emit_progress(progress_callback, 18, "Reading 3D cut curves", str(cut_curve_json))
+    curves, patch_seeds, input_warnings = read_shell_cut_json_with_qc(
+        cut_curve_json,
+        contours=None,
+    )
+    meshes, _qc = named_shell_cut_surface_patches(
+        mask,
+        curves,
+        patch_seeds,
+        spacing=spacing,
+        shell_backend=shell_backend,
+        output_qc_dir=qc_dir,
+        max_surface_quads=max_surface_quads,
+        input_warnings=input_warnings,
+        progress_callback=_progress_range(progress_callback, 25, 82),
+    )
+    _emit_progress(progress_callback, 86, "Writing selected surface files", str(output_dir / "surfaces"))
+    surface_outputs = _write_named_surface_outputs(meshes, output_dir)
+    config = {
+        "mask_path": str(mask_path),
+        "cut_curve_json": str(cut_curve_json),
+        "surface_method": "manual_3d_shell_patch",
+        "shell_backend": normalize_shell_backend(shell_backend),
+        "spacing": [float(value) for value in spacing],
+        "surface_names": list(meshes.keys()),
+        "surface_outputs": {key: str(value) for key, value in surface_outputs.items()},
+    }
+    _emit_progress(progress_callback, 96, "Writing project config", str(output_dir / "project_config.json"))
+    with (output_dir / "project_config.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+
+    outputs: Dict[str, Path] = {
+        "output_dir": output_dir,
+        "annotations": Path(cut_curve_json),
+        "qc": qc_dir,
+        "project_config": output_dir / "project_config.json",
+    }
+    outputs.update(surface_outputs)
+    _emit_progress(progress_callback, 100, "3D surface build finished", str(output_dir))
+    return outputs
+
+
 def run_laminar_boundary_pipeline(
     mask_path: str | Path,
     manual_csv: str | Path,
@@ -3596,27 +8121,37 @@ def run_laminar_boundary_pipeline(
     min_area: float = 20.0,
     largest_only: bool = True,
     resample_points: int = 80,
-    surface_method: str = SURFACE_BUILD_MASK_CONSTRAINED,
+    surface_method: str = SURFACE_BUILD_CONTOUR_SHELL,
+    shell_backend: str = "voxel",
+    cut_curve_json: Optional[str | Path] = None,
     depth_method: str = "auto",
     max_laplace_voxels: int = 250_000,
     boundary_dilation: int = 1,
     qc_every: int = 10,
     volume_format: str = "nrrd",
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Path]:
     """Run the full MVP pipeline from mask and manual landmarks."""
 
     output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
     output_dir.mkdir(parents=True, exist_ok=True)
     surface_method = normalize_surface_build_method(surface_method)
+    shell_backend = normalize_shell_backend(shell_backend)
     volumes_dir = output_dir / "volumes"
     tables_dir = output_dir / "tables"
     qc_dir = output_dir / "qc"
     volumes_dir.mkdir(parents=True, exist_ok=True)
     tables_dir.mkdir(parents=True, exist_ok=True)
     qc_dir.mkdir(parents=True, exist_ok=True)
+    surface_registry_path = qc_dir / "surface_method_registry.csv"
+    write_surface_method_registry(surface_registry_path)
 
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
     mask_volume = load_volume(mask_path)
     mask = _as_bool_mask(mask_volume.data)
+    spacing = _voxel_spacing_from_volume(mask_volume)
+    _emit_progress(progress_callback, 15, "Extracting slice contours", f"Axis: {slice_axis}")
     contours = extract_slice_contours(
         mask,
         slice_axis=slice_axis,
@@ -3625,16 +8160,26 @@ def run_laminar_boundary_pipeline(
     )
     if not contours:
         raise ValueError("No usable contours were extracted from the mask")
+    _emit_progress(progress_callback, 24, "Writing contour tables", f"{len(contours)} contour(s)")
     save_contours_json(contours, output_dir / "contours.json")
     write_contour_index_table(contours, output_dir / "contour_index.csv")
     write_contour_points_table(contours, output_dir / "contour_points.csv")
 
+    _emit_progress(progress_callback, 32, "Reading manual annotations", str(manual_csv))
     manual_rows = read_manual_landmarks(manual_csv)
+    _emit_progress(progress_callback, 40, "Propagating boundary curves", f"{len(manual_rows)} manual row(s)")
     manual_boundaries = build_manual_boundaries(contours, manual_rows, resample_points)
+    validate_endpoint_annotations(contours, manual_boundaries)
     boundaries = propagate_boundaries(contours, manual_boundaries, resample_points=resample_points)
     save_boundaries_json(boundaries, output_dir / "boundary_annotations.json")
     write_boundary_summary(boundaries, tables_dir / "boundary_summary.csv")
+    _emit_progress(progress_callback, 48, "Preparing annotated target mask", f"{len(boundaries)} boundary slice(s)")
     target_mask = _mask_for_annotated_components(mask, boundaries)
+    effective_cut_curve_json = _resolve_shell_cut_json_path(
+        output_dir,
+        surface_method,
+        cut_curve_json,
+    )
 
     _write_surfaces(
         target_mask,
@@ -3644,6 +8189,10 @@ def run_laminar_boundary_pipeline(
         resample_points=resample_points,
         surface_method=surface_method,
         slice_axis=slice_axis,
+        spacing=spacing,
+        shell_backend=shell_backend,
+        cut_curve_json=effective_cut_curve_json,
+        progress_callback=_progress_range(progress_callback, 52, 76),
     )
     surface_outputs = {
         "outer_surface": output_dir / "surfaces" / "target_outer_surface.ply",
@@ -3652,6 +8201,7 @@ def run_laminar_boundary_pipeline(
     }
 
     if _surface_only_build_requested(depth_method):
+        _emit_progress(progress_callback, 84, "Writing QC tables", str(qc_dir))
         write_qc_tables(boundaries, qc_dir)
         config = {
             "mask_path": str(mask_path),
@@ -3662,6 +8212,9 @@ def run_laminar_boundary_pipeline(
             "slice_axis": _slice_axis_to_int(slice_axis),
             "resample_points": resample_points,
             "surface_method": surface_method,
+            "surface_method_category": surface_build_method_category(surface_method),
+            "legacy_surface_method": surface_method in SURFACE_BUILD_LEGACY_METHODS,
+            "surface_method_registry": surface_method_registry(),
             "depth_method": "surfaces only",
             "mask_component_selection": "annotation_connected",
             "target_mask_voxels": int(np.count_nonzero(target_mask)),
@@ -3676,8 +8229,29 @@ def run_laminar_boundary_pipeline(
                 "lateral": BOUNDARY_LATERAL,
             },
         }
+        if surface_method == SURFACE_BUILD_ARC_GRAPH:
+            config["arc_graph"] = {
+                "normal_threshold": 2.5,
+                "partial_threshold": 4.0,
+                "min_confidence": 0.10,
+                "max_interval_overlap": 0.20,
+                "ambiguous_relative_margin": 0.10,
+                "min_reference_span_fraction": 0.15,
+                "spacing": [float(value) for value in spacing],
+            }
+        if surface_method == SURFACE_BUILD_SHELL_CUT:
+            config["shell_cut"] = {
+                "shell_backend": shell_backend,
+                "cut_curve_json": str(effective_cut_curve_json) if effective_cut_curve_json else None,
+                "cut_curve_source": shell_cut_json_source(effective_cut_curve_json)
+                if effective_cut_curve_json
+                else "annotation_derived",
+                "spacing": [float(value) for value in spacing],
+            }
+        _emit_progress(progress_callback, 96, "Writing project config", str(output_dir / "project_config.json"))
         with (output_dir / "project_config.json").open("w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)
+        _emit_progress(progress_callback, 100, "Surface build finished", str(output_dir))
         return {
             "output_dir": output_dir,
             "contours": output_dir / "contours.json",
@@ -3687,15 +8261,19 @@ def run_laminar_boundary_pipeline(
             "inner_surface": surface_outputs["inner_surface"],
             "lateral_surface": surface_outputs["lateral_surface"],
             "qc": qc_dir,
+            "surface_method_registry": surface_registry_path,
         }
 
+    _emit_progress(progress_callback, 78, "Building boundary label volume", f"Dilation: {boundary_dilation}")
     labels = make_boundary_label_volume(target_mask, boundaries, dilation_iterations=boundary_dilation)
+    _emit_progress(progress_callback, 82, "Computing laminar depth", f"Method: {depth_method}")
     depth = compute_laminar_depth(
         target_mask,
         labels,
         method=depth_method,
         max_laplace_voxels=max_laplace_voxels,
     )
+    _emit_progress(progress_callback, 88, "Computing layer normals", "Sampling depth gradient")
     normals = compute_layer_normals(depth, target_mask)
 
     volume_format = volume_format.lower().lstrip(".")
@@ -3705,6 +8283,7 @@ def run_laminar_boundary_pipeline(
     def volume_path(name: str) -> Path:
         return volumes_dir / f"{name}.{volume_format}"
 
+    _emit_progress(progress_callback, 91, "Writing volume outputs", str(volumes_dir))
     save_volume(volume_path("target_mask"), target_mask.astype(np.uint8), reference=mask_volume)
     save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
     save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
@@ -3713,6 +8292,7 @@ def run_laminar_boundary_pipeline(
     save_volume(volume_path("layer_normal_z"), normals[..., 2], reference=mask_volume)
 
     if cell_csv is not None:
+        _emit_progress(progress_callback, 93, "Writing cell depth table", str(cell_csv))
         write_cell_depth_table(
             cell_csv,
             tables_dir / "cell_laminar_depth.csv",
@@ -3722,6 +8302,7 @@ def run_laminar_boundary_pipeline(
         )
 
     if swc_paths:
+        _emit_progress(progress_callback, 94, "Summarizing dendrite depth", f"{len(swc_paths)} SWC file(s)")
         summarize_dendrite_depth(
             swc_paths,
             depth,
@@ -3729,6 +8310,7 @@ def run_laminar_boundary_pipeline(
             tables_dir / "dendrite_laminar_depth.csv",
         )
 
+    _emit_progress(progress_callback, 95, "Writing QC tables", str(qc_dir))
     template = load_volume(template_path).data if template_path else None
     write_qc_tables(boundaries, qc_dir)
     write_qc_slice_overlays(
@@ -3749,6 +8331,9 @@ def run_laminar_boundary_pipeline(
         "slice_axis": _slice_axis_to_int(slice_axis),
         "resample_points": resample_points,
         "surface_method": surface_method,
+        "surface_method_category": surface_build_method_category(surface_method),
+        "legacy_surface_method": surface_method in SURFACE_BUILD_LEGACY_METHODS,
+        "surface_method_registry": surface_method_registry(),
         "mask_component_selection": "annotation_connected",
         "target_mask_voxels": int(np.count_nonzero(target_mask)),
         "depth_method": depth_method,
@@ -3762,9 +8347,30 @@ def run_laminar_boundary_pipeline(
             "lateral": BOUNDARY_LATERAL,
         },
     }
+    if surface_method == SURFACE_BUILD_ARC_GRAPH:
+        config["arc_graph"] = {
+            "normal_threshold": 2.5,
+            "partial_threshold": 4.0,
+            "min_confidence": 0.10,
+            "max_interval_overlap": 0.20,
+            "ambiguous_relative_margin": 0.10,
+            "min_reference_span_fraction": 0.15,
+            "spacing": [float(value) for value in spacing],
+        }
+    if surface_method == SURFACE_BUILD_SHELL_CUT:
+        config["shell_cut"] = {
+            "shell_backend": shell_backend,
+            "cut_curve_json": str(effective_cut_curve_json) if effective_cut_curve_json else None,
+            "cut_curve_source": shell_cut_json_source(effective_cut_curve_json)
+            if effective_cut_curve_json
+            else "annotation_derived",
+            "spacing": [float(value) for value in spacing],
+        }
+    _emit_progress(progress_callback, 98, "Writing project config", str(output_dir / "project_config.json"))
     with (output_dir / "project_config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
 
+    _emit_progress(progress_callback, 100, "Build finished", str(output_dir))
     return {
         "output_dir": output_dir,
         "contours": output_dir / "contours.json",
@@ -3776,6 +8382,7 @@ def run_laminar_boundary_pipeline(
         "laminar_depth": volume_path("laminar_depth"),
         "boundary_labels": volume_path("boundary_label_volume"),
         "qc": qc_dir,
+        "surface_method_registry": surface_registry_path,
     }
 
 
@@ -3792,10 +8399,12 @@ def run_laminar_depth_pipeline(
     boundary_dilation: int = 1,
     qc_every: int = 10,
     volume_format: str = "nrrd",
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Dict[str, Path]:
     """Compute laminar depth from a saved boundary_annotations.json file."""
 
     output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
     volumes_dir = output_dir / "volumes"
     tables_dir = output_dir / "tables"
     qc_dir = output_dir / "qc"
@@ -3803,19 +8412,24 @@ def run_laminar_depth_pipeline(
     tables_dir.mkdir(parents=True, exist_ok=True)
     qc_dir.mkdir(parents=True, exist_ok=True)
 
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
     mask_volume = load_volume(mask_path)
     mask = _as_bool_mask(mask_volume.data)
+    _emit_progress(progress_callback, 18, "Reading boundary JSON", str(boundaries_json))
     boundaries = read_boundaries_json(boundaries_json)
     if not boundaries:
         raise ValueError("No boundaries found in boundary_annotations.json")
 
+    _emit_progress(progress_callback, 30, "Building boundary label volume", f"Dilation: {boundary_dilation}")
     labels = make_boundary_label_volume(mask, boundaries, dilation_iterations=boundary_dilation)
+    _emit_progress(progress_callback, 42, "Computing laminar depth", f"Method: {depth_method}")
     depth = compute_laminar_depth(
         mask,
         labels,
         method=depth_method,
         max_laplace_voxels=max_laplace_voxels,
     )
+    _emit_progress(progress_callback, 68, "Computing layer normals", "Sampling depth gradient")
     normals = compute_layer_normals(depth, mask)
 
     volume_format = volume_format.lower().lstrip(".")
@@ -3825,6 +8439,7 @@ def run_laminar_depth_pipeline(
     def volume_path(name: str) -> Path:
         return volumes_dir / f"{name}.{volume_format}"
 
+    _emit_progress(progress_callback, 76, "Writing volume outputs", str(volumes_dir))
     save_volume(volume_path("target_mask"), mask.astype(np.uint8), reference=mask_volume)
     save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
     save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
@@ -3833,6 +8448,7 @@ def run_laminar_depth_pipeline(
     save_volume(volume_path("layer_normal_z"), normals[..., 2], reference=mask_volume)
 
     if cell_csv is not None:
+        _emit_progress(progress_callback, 84, "Writing cell depth table", str(cell_csv))
         write_cell_depth_table(
             cell_csv,
             tables_dir / "cell_laminar_depth.csv",
@@ -3842,6 +8458,7 @@ def run_laminar_depth_pipeline(
         )
 
     if swc_paths:
+        _emit_progress(progress_callback, 88, "Summarizing dendrite depth", f"{len(swc_paths)} SWC file(s)")
         summarize_dendrite_depth(
             swc_paths,
             depth,
@@ -3849,6 +8466,7 @@ def run_laminar_depth_pipeline(
             tables_dir / "dendrite_laminar_depth.csv",
         )
 
+    _emit_progress(progress_callback, 92, "Writing QC tables", str(qc_dir))
     template = load_volume(template_path).data if template_path else None
     write_qc_tables(boundaries, qc_dir)
     write_qc_slice_overlays(
@@ -3878,13 +8496,165 @@ def run_laminar_depth_pipeline(
             "lateral": BOUNDARY_LATERAL,
         },
     }
+    _emit_progress(progress_callback, 98, "Writing depth config", str(output_dir / "depth_config.json"))
     with (output_dir / "depth_config.json").open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
 
+    _emit_progress(progress_callback, 100, "Depth volume finished", str(output_dir))
     return {
         "output_dir": output_dir,
         "laminar_depth": volume_path("laminar_depth"),
         "boundary_labels": volume_path("boundary_label_volume"),
+        "qc": qc_dir,
+    }
+
+
+def run_3d_surface_depth_pipeline(
+    mask_path: str | Path,
+    project_config: str | Path,
+    output_dir: str | Path,
+    template_path: Optional[str | Path] = None,
+    cell_csv: Optional[str | Path] = None,
+    swc_paths: Optional[Sequence[str | Path]] = None,
+    depth_method: str = "auto",
+    max_laplace_voxels: int = 250_000,
+    boundary_dilation: int = 1,
+    volume_format: str = "nrrd",
+    progress_callback: Optional[ProgressCallback] = None,
+) -> Dict[str, Path]:
+    """Compute laminar depth from a 3D build folder with outer/inner OBJ surfaces."""
+
+    output_dir = Path(output_dir)
+    _emit_progress(progress_callback, 2, "Preparing output folder", str(output_dir))
+    volumes_dir = output_dir / "volumes"
+    tables_dir = output_dir / "tables"
+    qc_dir = output_dir / "qc"
+    volumes_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    qc_dir.mkdir(parents=True, exist_ok=True)
+
+    _emit_progress(progress_callback, 8, "Reading mask", str(mask_path))
+    mask_volume = load_volume(mask_path)
+    mask = _as_bool_mask(mask_volume.data)
+    crop_slices = _mask_bounding_slices(mask, padding=max(3, int(boundary_dilation) + 3))
+    crop_origin = _slice_origin(crop_slices)
+    crop_stop = [int(item.stop or mask.shape[index]) for index, item in enumerate(crop_slices)]
+    cropped_mask = mask[crop_slices]
+
+    _emit_progress(progress_callback, 16, "Reading 3D surface build", str(project_config))
+    project_config = _resolve_existing_input_path(project_config)
+    outer_surface, inner_surface = resolve_3d_surface_depth_inputs(project_config)
+
+    _emit_progress(
+        progress_callback,
+        28,
+        "Building boundary labels from OBJ surfaces",
+        f"Crop origin: {[int(value) for value in crop_origin]}",
+    )
+    labels, surface_summaries = make_boundary_label_volume_from_surface_meshes(
+        cropped_mask,
+        outer_surface,
+        inner_surface,
+        dilation_iterations=boundary_dilation,
+        coordinate_origin=crop_origin,
+    )
+    _emit_progress(progress_callback, 46, "Computing laminar depth", f"Method: {depth_method}")
+    depth = compute_laminar_depth(
+        cropped_mask,
+        labels,
+        method=depth_method,
+        max_laplace_voxels=max_laplace_voxels,
+    )
+    _emit_progress(progress_callback, 70, "Computing layer normals", "Sampling depth gradient")
+    normals = compute_layer_normals(depth, cropped_mask)
+
+    volume_format = volume_format.lower().lstrip(".")
+    if volume_format not in ("nrrd", "npy", "nii", "nii.gz"):
+        raise ValueError("volume_format must be nrrd, npy, nii, or nii.gz")
+
+    def volume_path(name: str) -> Path:
+        return volumes_dir / f"{name}.{volume_format}"
+
+    _emit_progress(progress_callback, 78, "Writing cropped volume outputs", str(volumes_dir))
+    save_volume(volume_path("target_mask"), cropped_mask.astype(np.uint8), reference=mask_volume)
+    save_volume(volume_path("boundary_label_volume"), labels, reference=mask_volume)
+    save_volume(volume_path("laminar_depth"), depth, reference=mask_volume)
+    save_volume(volume_path("layer_normal_x"), normals[..., 0], reference=mask_volume)
+    save_volume(volume_path("layer_normal_y"), normals[..., 1], reference=mask_volume)
+    save_volume(volume_path("layer_normal_z"), normals[..., 2], reference=mask_volume)
+
+    if cell_csv is not None:
+        _emit_progress(progress_callback, 86, "Writing cell depth table", str(cell_csv))
+        write_cell_depth_table(
+            cell_csv,
+            tables_dir / "cell_laminar_depth.csv",
+            depth,
+            normals,
+            labels,
+            coordinate_origin=crop_origin,
+        )
+
+    if swc_paths:
+        _emit_progress(progress_callback, 90, "Summarizing dendrite depth", f"{len(swc_paths)} SWC file(s)")
+        summarize_dendrite_depth(
+            swc_paths,
+            depth,
+            normals,
+            tables_dir / "dendrite_laminar_depth.csv",
+            coordinate_origin=crop_origin,
+        )
+
+    _emit_progress(progress_callback, 94, "Writing 3D depth QC", str(qc_dir))
+    with (qc_dir / "surface_mesh_depth_sources.csv").open("w", encoding="utf-8", newline="") as handle:
+        fieldnames = [
+            "surface",
+            "path",
+            "vertices",
+            "faces",
+            "labeled_voxels",
+            "mean_snap_distance",
+            "max_snap_distance",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in surface_summaries:
+            writer.writerow(row)
+
+    config = {
+        "mask_path": str(mask_path),
+        "project_config": str(project_config),
+        "outer_surface_obj": str(outer_surface),
+        "inner_surface_obj": str(inner_surface),
+        "template_path": str(template_path) if template_path else None,
+        "cell_csv": str(cell_csv) if cell_csv else None,
+        "swc_paths": [str(path) for path in swc_paths] if swc_paths else [],
+        "depth_method": depth_method,
+        "depth_source": "3d_surface_obj",
+        "volume_coordinate_space": "cropped_original_index",
+        "full_shape": [int(value) for value in mask.shape],
+        "crop_origin": [int(value) for value in crop_origin],
+        "crop_stop": crop_stop,
+        "volume_format": volume_format,
+        "max_laplace_voxels": max_laplace_voxels,
+        "boundary_dilation": boundary_dilation,
+        "boundary_label_values": {
+            "background": BOUNDARY_BACKGROUND,
+            "region": BOUNDARY_REGION,
+            "outer": BOUNDARY_OUTER,
+            "inner": BOUNDARY_INNER,
+            "lateral": BOUNDARY_LATERAL,
+        },
+    }
+    _emit_progress(progress_callback, 98, "Writing depth config", str(output_dir / "depth_config.json"))
+    with (output_dir / "depth_config.json").open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+
+    _emit_progress(progress_callback, 100, "Depth volume finished", str(output_dir))
+    return {
+        "output_dir": output_dir,
+        "laminar_depth": volume_path("laminar_depth"),
+        "boundary_labels": volume_path("boundary_label_volume"),
+        "surface_depth_qc": qc_dir / "surface_mesh_depth_sources.csv",
         "qc": qc_dir,
     }
 
@@ -3957,7 +8727,7 @@ def write_demo_project(output_dir: str | Path) -> Tuple[Path, Path]:
     nrrd.write(str(mask_path), mask)
 
     contours = extract_slice_contours(mask, slice_axis=0, min_area=20.0, largest_only=True)
-    selected_slices = [contours[2], contours[len(contours) // 2], contours[-3]]
+    selected_slices = [contours[0], contours[len(contours) // 2], contours[-1]]
     rows = [_demo_landmark_row(contour) for contour in selected_slices]
     manual_csv = output_dir / "demo_manual_landmarks.csv"
     with manual_csv.open("w", encoding="utf-8", newline="") as handle:

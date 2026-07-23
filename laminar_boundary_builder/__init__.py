@@ -1,12 +1,12 @@
-"""Self-contained package for building laminar boundaries and depth fields."""
+"""Self-contained package for 3D laminar surface depth workflows."""
 
 
-def run_laminar_boundary_pipeline(*args, **kwargs):
+def run_3d_surface_depth_pipeline(*args, **kwargs):
     """Lazy package-level shortcut that keeps GUI startup light."""
 
-    from .core import run_laminar_boundary_pipeline as _run_laminar_boundary_pipeline
+    from .core import run_3d_surface_depth_pipeline as _run_3d_surface_depth_pipeline
 
-    return _run_laminar_boundary_pipeline(*args, **kwargs)
+    return _run_3d_surface_depth_pipeline(*args, **kwargs)
 
 
-__all__ = ["run_laminar_boundary_pipeline"]
+__all__ = ["run_3d_surface_depth_pipeline"]
